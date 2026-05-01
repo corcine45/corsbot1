@@ -309,7 +309,20 @@ async def on_message(message):
         return
 
     is_dm = isinstance(message.channel, discord.DMChannel)
-    should_reply = is_dm or (client.user in message.mentions)
+    
+    # Only reply if bot is directly addressed:
+    # - DM, OR
+    # - Bot mention is at the start of the message (direct address)
+    # - Not just mentioned in passing mid-sentence
+    raw = message.content.strip()
+    bot_mention = f"<@{client.user.id}>"
+    bot_mention_nick = f"<@!{client.user.id}>"
+    
+    directly_addressed = (
+        raw.startswith(bot_mention) or
+        raw.startswith(bot_mention_nick)
+    )
+    should_reply = is_dm or directly_addressed
 
     content = message.content.strip()
     if not should_reply or not content:
@@ -342,7 +355,10 @@ async def on_message(message):
     )
 
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, store_message, thread_id, "user", content)
+
+    # Prefix message with sender name so AI never confuses sender with mentioned users
+    attributed_content = f"[{message.author.display_name}]: {content}"
+    await loop.run_in_executor(executor, store_message, thread_id, "user", attributed_content)
 
     # Quick replies
     quick = get_quick_reply(content)
@@ -355,7 +371,7 @@ async def on_message(message):
     uid_str = str(message.author.id)
     if should_extract(uid_str):
         await loop.run_in_executor(executor, extract_memory, message.author.id, content)
-        await loop.run_in_executor(executor, extract_relationships, message.author.id, content)
+        await loop.run_in_executor(executor, extract_relationships, message.author.id, attributed_content)
 
     memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content)
     relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
