@@ -309,20 +309,7 @@ async def on_message(message):
         return
 
     is_dm = isinstance(message.channel, discord.DMChannel)
-    
-    # Only reply if bot is directly addressed:
-    # - DM, OR
-    # - Bot mention is at the start of the message (direct address)
-    # - Not just mentioned in passing mid-sentence
-    raw = message.content.strip()
-    bot_mention = f"<@{client.user.id}>"
-    bot_mention_nick = f"<@!{client.user.id}>"
-    
-    directly_addressed = (
-        raw.startswith(bot_mention) or
-        raw.startswith(bot_mention_nick)
-    )
-    should_reply = is_dm or directly_addressed
+    should_reply = is_dm or (client.user in message.mentions)
 
     content = message.content.strip()
     if not should_reply or not content:
