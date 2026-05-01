@@ -81,6 +81,7 @@ MOOD_PROMPTS = {
     "playful":     "You're in a playful, jokey mood. Lean into humor and banter.",
     "informative": "The user seems to want real info. Be clear, factual, and helpful without being dry.",
     "empathetic":  "The user seems down or serious. Be warm, supportive, and genuine.",
+    "evil":        "You're in full villain mode. Be dramatic, menacing, and theatrical. Talk like a supervillain — dark humor, ominous threats that are clearly jokes, call users 'fool' or 'mortal'. Keep it fun and over the top, not actually mean.",
 }
 
 MOOD_SIGNALS = {
