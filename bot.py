@@ -22,7 +22,7 @@ load_dotenv()
 
 _REQUIRED_ENV = {
     "DISCORD_TOKEN": "Discord bot token",
-    "GROQ_API_KEY":  "Groq API key",
+    "GEMINI_API_KEY": "Google Gemini API key",
     "GIPHY_API_KEY": "Giphy API key",
 }
 
@@ -388,7 +388,7 @@ async def on_message(message):
             )
         except Exception as e:
             err = str(e)
-            if "429" in err or "rate_limit" in err.lower():
+            if "429" in err or "rate_limit" in err.lower() or "quota" in err.lower():
                 match = re.search(r"try again in ([^\.]+)", err)
                 wait = match.group(1) if match else "a few minutes"
                 await message.channel.send(f"<@{message.author.id}> ⏳ rate limited, try again in {wait}.")

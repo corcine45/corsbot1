@@ -1,9 +1,13 @@
 import time
 import random
-from groq import Groq
 import os
+import google.generativeai as genai
 
-client_ai = Groq(api_key=os.getenv("GROQ_API_KEY"))
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Use Flash for chat (generous limits), Flash-8B for lightweight tasks
+CHAT_MODEL = "gemini-1.5-flash"
+FAST_MODEL = "gemini-1.5-flash-8b"
 
 FALLBACK_RESPONSES = [
     "my brain's a bit fried rn, try again in a sec",
@@ -31,35 +35,83 @@ _INJECTION_PATTERNS = [
 ]
 
 def is_prompt_injection(text: str) -> bool:
-    """Returns True if the message looks like a prompt injection attempt."""
     lower = text.lower()
     return any(pattern in lower for pattern in _INJECTION_PATTERNS)
 
-def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, timeout: int = 15) -> str:
-    """Groq API wrapper with retry logic, exponential backoff, and timeout."""
+# ---------------- GEMINI CALL ---------------- #
+
+def gemini_call(system: str, history: list, user_message: str,
+                model: str = CHAT_MODEL, max_tokens: int = 512,
+                retries: int = 3) -> str:
+    """Call Gemini with retry logic and exponential backoff."""
+    # Convert OpenAI-style history to Gemini format
+    gemini_history = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        gemini_history.append({"role": role, "parts": [msg["content"]]})
+
     last_err = None
     for attempt in range(retries):
         try:
-            res = client_ai.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                timeout=timeout,
+            client = genai.GenerativeModel(
+                model_name=model,
+                system_instruction=system,
+                generation_config={"max_output_tokens": max_tokens},
             )
-            return res.choices[0].message.content
+            chat = client.start_chat(history=gemini_history)
+            res = chat.send_message(user_message)
+            return res.text
         except Exception as e:
             last_err = e
             err_str = str(e)
-            if "429" in err_str or "rate_limit" in err_str.lower():
+            if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
                 raise
-            if "401" in err_str or "403" in err_str:
+            if "401" in err_str or "403" in err_str or "API_KEY" in err_str:
                 raise
             if attempt < retries - 1:
                 wait = 2 ** attempt
-                print(f"[groq_call] attempt {attempt + 1} failed: {e} — retrying in {wait}s")
+                print(f"[gemini_call] attempt {attempt + 1} failed: {e} — retrying in {wait}s")
                 time.sleep(wait)
     raise last_err
 
+def gemini_simple(system: str, prompt: str, model: str = FAST_MODEL,
+                  max_tokens: int = 100, retries: int = 2) -> str:
+    """Single-turn call for lightweight tasks like memory extraction and emotion."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            client = genai.GenerativeModel(
+                model_name=model,
+                system_instruction=system,
+                generation_config={"max_output_tokens": max_tokens},
+            )
+            res = client.generate_content(prompt)
+            return res.text
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "429" in err_str or "quota" in err_str.lower():
+                raise
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    raise last_err
+
+# Keep groq_call as an alias so memory.py and emotion.py don't break
+def groq_call(model: str, messages: list, max_tokens: int,
+              retries: int = 2, timeout: int = 10) -> str:
+    """Compatibility shim — routes lightweight calls to gemini_simple."""
+    # Extract system and user message from OpenAI-style messages
+    system = ""
+    user_msg = ""
+    for m in messages:
+        if m["role"] == "system":
+            system = m["content"]
+        elif m["role"] == "user":
+            user_msg = m["content"]
+    return gemini_simple(system, user_msg, model=FAST_MODEL,
+                         max_tokens=max_tokens, retries=retries)
+
+# ---------------- PERSONALITY ---------------- #
 
 SYSTEM_PROMPT = (
     "You are Corsbot, a chill Discord bot made by Corcine. "
@@ -93,7 +145,7 @@ MOOD_SIGNALS = {
 }
 
 _user_moods: dict = {}
-_auto_mode: set = set()  # user_ids in auto mode (no manual override)
+_auto_mode: set = set()
 
 def detect_mood(user_id: str, recent_messages: list) -> str:
     from collections import defaultdict
@@ -112,7 +164,6 @@ def detect_mood(user_id: str, recent_messages: list) -> str:
     existing_mood, existing_score, last_updated = _user_moods.get(user_id, ("chill", 0, 0))
     age = time.time() - last_updated
 
-    # Auto mode: lower inertia so it switches more freely
     if user_id in _auto_mode:
         inertia_threshold = 1
     else:
@@ -127,7 +178,6 @@ def set_mood(user_id: str, mood: str):
     uid = str(user_id)
     if mood == "auto":
         _auto_mode.add(uid)
-        # Clear manual override so detect_mood takes over immediately
         _user_moods.pop(uid, None)
     else:
         _auto_mode.discard(uid)
@@ -153,22 +203,28 @@ def ai_chat(history, memory, username=None, mood="chill", relationships="", web_
     if relationships:
         system += (
             f"\n\nPeople in this user's life:\n{relationships}"
-            "\nReference these naturally when relevant — e.g. 'oh you and Mike play together right?'"
+            "\nReference these naturally when relevant."
         )
 
     if web_context:
         system += (
-            f"\n\nReal-time web search results for this query:\n{web_context}"
-            "\nUse this information to answer accurately. Mention it's current info when relevant."
+            f"\n\nReal-time web search results:\n{web_context}"
+            "\nUse this to answer accurately."
         )
 
-    messages = [{"role": "system", "content": system}] + history
+    # Split history: all but last message goes as history, last is the current turn
+    if history:
+        chat_history = history[:-1]
+        current = history[-1]["content"]
+    else:
+        chat_history = []
+        current = ""
 
     try:
-        return groq_call("llama-3.3-70b-versatile", messages, max_tokens=512)
+        return gemini_call(system, chat_history, current, max_tokens=512)
     except Exception as e:
         err_str = str(e)
-        if "429" in err_str or "rate_limit" in err_str.lower():
+        if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
             raise
         print(f"[ai_chat failed] {e}")
         return random.choice(FALLBACK_RESPONSES)
