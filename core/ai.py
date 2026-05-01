@@ -92,6 +92,7 @@ MOOD_SIGNALS = {
 }
 
 _user_moods: dict = {}
+_auto_mode: set = set()  # user_ids in auto mode (no manual override)
 
 def detect_mood(user_id: str, recent_messages: list) -> str:
     from collections import defaultdict
@@ -109,7 +110,12 @@ def detect_mood(user_id: str, recent_messages: list) -> str:
     top_mood = max(scores, key=scores.get)
     existing_mood, existing_score, last_updated = _user_moods.get(user_id, ("chill", 0, 0))
     age = time.time() - last_updated
-    inertia_threshold = 2 if age < 300 else 1
+
+    # Auto mode: lower inertia so it switches more freely
+    if user_id in _auto_mode:
+        inertia_threshold = 1
+    else:
+        inertia_threshold = 2 if age < 300 else 1
 
     if scores[top_mood] >= inertia_threshold or top_mood == existing_mood:
         _user_moods[user_id] = (top_mood, scores[top_mood], time.time())
@@ -117,10 +123,20 @@ def detect_mood(user_id: str, recent_messages: list) -> str:
     return existing_mood
 
 def set_mood(user_id: str, mood: str):
-    _user_moods[str(user_id)] = (mood, 99, time.time())
+    uid = str(user_id)
+    if mood == "auto":
+        _auto_mode.add(uid)
+        # Clear manual override so detect_mood takes over immediately
+        _user_moods.pop(uid, None)
+    else:
+        _auto_mode.discard(uid)
+        _user_moods[uid] = (mood, 99, time.time())
 
 def get_current_mood(user_id: str) -> str:
-    return _user_moods.get(str(user_id), ("chill", 0, 0))[0]
+    uid = str(user_id)
+    if uid in _auto_mode:
+        return f"{_user_moods.get(uid, ('chill', 0, 0))[0]} (auto)"
+    return _user_moods.get(uid, ("chill", 0, 0))[0]
 
 def ai_chat(history, memory, username=None, mood="chill", relationships="", web_context=""):
     system = SYSTEM_PROMPT

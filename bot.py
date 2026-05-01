@@ -173,10 +173,13 @@ async def slash_forget_all(interaction: discord.Interaction):
 @app_commands.describe(mood="Choose a mood")
 @app_commands.choices(mood=[
     app_commands.Choice(name=m, value=m) for m in VALID_MOODS
-])
+] + [app_commands.Choice(name="🔄 Auto (detect from chat)", value="auto")])
 async def slash_personality(interaction: discord.Interaction, mood: str):
     set_mood(str(interaction.user.id), mood)
-    await interaction.response.send_message(f"Switched to **{mood}** mode. 🎭", ephemeral=True)
+    if mood == "auto":
+        await interaction.response.send_message("Switched to **auto** mode — I'll adapt to the vibe. 🔄", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Switched to **{mood}** mode. 🎭", ephemeral=True)
 
 
 @client.tree.command(name="stats", description="Show conversation and memory stats")
