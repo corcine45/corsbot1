@@ -1,7 +1,9 @@
 import discord
+from discord import app_commands
 import asyncio
 import re
 import random
+import time
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -45,12 +47,22 @@ from core.feedback import (
 # ---------------- CONFIG ---------------- #
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+VALID_MOODS = list(MOOD_PROMPTS.keys())
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-client = discord.Client(intents=intents)
 
+class CorsBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("✅ Slash commands synced.")
+
+client = CorsBot()
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ---------------- QUICK REPLIES ---------------- #
@@ -70,7 +82,7 @@ def get_quick_reply(text: str):
             return random.choice(replies)
     return None
 
-# ---------------- SEND ---------------- #
+# ---------------- HELPERS ---------------- #
 
 async def send_reply(channel, text):
     limit = 2000
@@ -83,8 +95,18 @@ async def send_reply(channel, text):
     if text:
         await channel.send(text)
 
+async def send_interaction(interaction: discord.Interaction, text: str, ephemeral: bool = True):
+    """Send a slash command response, splitting if needed."""
+    if len(text) <= 2000:
+        await interaction.response.send_message(text, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(text[:2000], ephemeral=ephemeral)
+        rest = text[2000:]
+        while rest:
+            await interaction.followup.send(rest[:2000], ephemeral=ephemeral)
+            rest = rest[2000:]
+
 def resolve_mentions_in_reply(reply, guild):
-    """Convert @name text in AI reply to real Discord mentions <@id>."""
     if not guild:
         return reply
     def replace_mention(match):
@@ -95,11 +117,11 @@ def resolve_mentions_in_reply(reply, guild):
         return match.group(0)
     return re.sub(r"@([\w\s]+)", replace_mention, reply)
 
-# ---------------- COMMANDS ---------------- #
+# ---------------- SLASH COMMANDS ---------------- #
 
-VALID_MOODS = list(MOOD_PROMPTS.keys())
-
-async def cmd_memory(message, user_id):
+@client.tree.command(name="memory", description="See everything Corsbot knows about you")
+async def slash_memory(interaction: discord.Interaction):
+    user_id = interaction.user.id
     _, cursor = get_db()
     cursor.execute(
         "SELECT key, value, memory_type, reinforcement, updated_at FROM memory WHERE user_id=? ORDER BY memory_type, key",
@@ -107,45 +129,58 @@ async def cmd_memory(message, user_id):
     )
     rows = cursor.fetchall()
     if not rows:
-        await message.channel.send(f"<@{user_id}> I don't know anything about you yet.")
+        await interaction.response.send_message("I don't know anything about you yet.", ephemeral=True)
         return
-    import time
     lines = ["📋 **What I know about you:**"]
     for key, value, mtype, reinforcement, updated_at in rows:
         age_days = (time.time() - updated_at) / 86400
         icon = {"identity": "🔒", "preference": "⭐", "temporary": "⏳"}.get(mtype or "preference", "•")
         lines.append(f"{icon} `{key}` = {value}  _(seen {reinforcement}x, {age_days:.0f}d ago)_")
-    await send_reply(message.channel, "\n".join(lines))
+    await send_interaction(interaction, "\n".join(lines))
 
-async def cmd_forget(message, user_id, args):
-    if not args:
-        await message.channel.send("Usage: `!forget <key>` — e.g. `!forget likes`")
-        return
-    key = args[0].lower()
+
+@client.tree.command(name="forget", description="Delete a specific memory by key")
+@app_commands.describe(key="The memory key to delete (use /memory to see keys)")
+async def slash_forget(interaction: discord.Interaction, key: str):
+    user_id = interaction.user.id
     conn, cursor = get_db()
-    cursor.execute("DELETE FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
+    cursor.execute("DELETE FROM memory WHERE user_id=? AND key=?", (str(user_id), key.lower()))
     conn.commit()
     if cursor.rowcount:
-        await message.channel.send(f"<@{user_id}> Forgot `{key}`. ✅")
+        await interaction.response.send_message(f"Forgot `{key}`. ✅", ephemeral=True)
     else:
-        await message.channel.send(f"<@{user_id}> Nothing stored under `{key}`.")
+        await interaction.response.send_message(f"Nothing stored under `{key}`.", ephemeral=True)
 
-async def cmd_forget_all(message, user_id):
+
+@client.tree.command(name="forgetall", description="Wipe everything Corsbot knows about you")
+async def slash_forget_all(interaction: discord.Interaction):
+    user_id = interaction.user.id
     conn, cursor = get_db()
     cursor.execute("DELETE FROM memory WHERE user_id=?", (str(user_id),))
     conn.commit()
-    await message.channel.send(f"<@{user_id}> Cleared all your memories. Fresh start. 🧹")
+    await interaction.response.send_message("Cleared all your memories. Fresh start. 🧹", ephemeral=True)
 
-async def cmd_personality(message, user_id, args):
-    if not args or args[0].lower() not in VALID_MOODS:
-        await message.channel.send(f"Available moods: `{'`, `'.join(VALID_MOODS)}`")
-        return
-    mood = args[0].lower()
-    set_mood(str(user_id), mood)
-    await message.channel.send(f"<@{user_id}> Switched to **{mood}** mode. 🎭")
 
-async def cmd_stats(message, thread_id, user_id):
-    import time
+@client.tree.command(name="personality", description="Set Corsbot's mood when talking to you")
+@app_commands.describe(mood="Choose a mood")
+@app_commands.choices(mood=[
+    app_commands.Choice(name=m, value=m) for m in VALID_MOODS
+])
+async def slash_personality(interaction: discord.Interaction, mood: str):
+    set_mood(str(interaction.user.id), mood)
+    await interaction.response.send_message(f"Switched to **{mood}** mode. 🎭", ephemeral=True)
+
+
+@client.tree.command(name="stats", description="Show conversation and memory stats")
+async def slash_stats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    is_dm = isinstance(interaction.channel, discord.DMChannel)
+    thread_id = get_thread_id(
+        user_id,
+        interaction.guild_id if interaction.guild else None,
+        interaction.channel_id,
+        is_dm,
+    )
     _, cursor = get_db()
     cursor.execute("SELECT COUNT(*) FROM messages WHERE thread_id=?", (thread_id,))
     msg_count = cursor.fetchone()[0]
@@ -161,10 +196,12 @@ async def cmd_stats(message, thread_id, user_id):
     for count, mtype in mem_rows:
         icon = {"identity": "🔒", "preference": "⭐", "temporary": "⏳"}.get(mtype or "preference", "•")
         lines.append(f"  {icon} {mtype or 'preference'}: **{count}** facts")
-    await message.channel.send("\n".join(lines))
+    await send_interaction(interaction, "\n".join(lines))
 
-async def cmd_relationships(message, user_id):
-    import time
+
+@client.tree.command(name="relationships", description="See people Corsbot knows about in your life")
+async def slash_relationships(interaction: discord.Interaction):
+    user_id = interaction.user.id
     _, cursor = get_db()
     cursor.execute(
         "SELECT related_name, relation, context, strength, updated_at FROM relationships WHERE user_id=? ORDER BY strength DESC",
@@ -172,7 +209,9 @@ async def cmd_relationships(message, user_id):
     )
     rows = cursor.fetchall()
     if not rows:
-        await message.channel.send(f"<@{user_id}> I don't know anyone in your life yet — tell me about your friends!")
+        await interaction.response.send_message(
+            "I don't know anyone in your life yet — tell me about your friends!", ephemeral=True
+        )
         return
     lines = ["👥 **People I know about:**"]
     for name, relation, context, strength, updated_at in rows:
@@ -182,71 +221,70 @@ async def cmd_relationships(message, user_id):
             line += f" — {context}"
         line += f"  _(mentioned {strength}x, {age_days:.0f}d ago)_"
         lines.append(line)
-    await send_reply(message.channel, "\n".join(lines))
+    await send_interaction(interaction, "\n".join(lines))
 
-async def cmd_help(message):
-    lines = [
-        "🤖 **Corsbot Commands**",
-        "`!memory` — see everything I know about you",
-        "`!forget <key>` — delete a specific memory",
-        "`!forgetall` — wipe all your memories",
-        f"`!personality <mood>` — set my mood (`{'`, `'.join(VALID_MOODS)}`)",
-        "`!stats` — conversation and memory stats",
-        "`!relationships` — see who I know about in your life",
-        "`!rate good` / `!rate bad` — rate my last reply",
-        "`!ratings` — see your rating history",
-        "`!help` — show this list",
-    ]
-    await message.channel.send("\n".join(lines))
 
-async def cmd_rate(message, user_id, thread_id, args):
-    if not args or args[0].lower() not in ("good", "bad"):
-        await message.channel.send("Usage: `!rate good` or `!rate bad`")
-        return
-
-    rating = args[0].lower()
+@client.tree.command(name="rate", description="Rate Corsbot's last reply")
+@app_commands.describe(rating="Was the reply good or bad?")
+@app_commands.choices(rating=[
+    app_commands.Choice(name="👍 Good", value="good"),
+    app_commands.Choice(name="👎 Bad",  value="bad"),
+])
+async def slash_rate(interaction: discord.Interaction, rating: str):
+    user_id = interaction.user.id
+    is_dm = isinstance(interaction.channel, discord.DMChannel)
+    thread_id = get_thread_id(
+        user_id,
+        interaction.guild_id if interaction.guild else None,
+        interaction.channel_id,
+        is_dm,
+    )
     entry = get_last_reply(str(user_id))
-
     if not entry:
-        await message.channel.send(f"<@{user_id}> No recent reply to rate — ratings expire after 5 minutes.")
+        await interaction.response.send_message(
+            "No recent reply to rate — ratings expire after 5 minutes.", ephemeral=True
+        )
         return
-
     store_feedback(str(user_id), thread_id, entry["reply"], rating, entry["mood"])
-
     if rating == "good":
         apply_good_rating(str(user_id), entry["mood"], entry["memory_keys"])
-        await message.channel.send(f"<@{user_id}> glad you liked it 🙏")
+        await interaction.response.send_message("glad you liked it 🙏", ephemeral=True)
     else:
         apply_bad_rating(str(user_id), entry["mood"])
-        await message.channel.send(f"<@{user_id}> noted, i'll do better 🫡")
+        await interaction.response.send_message("noted, i'll do better 🫡", ephemeral=True)
 
-async def cmd_ratings(message, user_id):
-    stats = get_feedback_stats(str(user_id))
+
+@client.tree.command(name="ratings", description="See your rating history for Corsbot")
+async def slash_ratings(interaction: discord.Interaction):
+    stats = get_feedback_stats(str(interaction.user.id))
     total = stats["good"] + stats["bad"]
     if total == 0:
-        await message.channel.send(f"<@{user_id}> No ratings yet — use `!rate good` or `!rate bad` after my replies.")
+        await interaction.response.send_message(
+            "No ratings yet — use `/rate` after my replies.", ephemeral=True
+        )
         return
-    pct = int((stats['good'] / total) * 100) if total else 0
-    await message.channel.send(
-        f"<@{user_id}> 📊 Your ratings: ✅ {stats['good']} good · ❌ {stats['bad']} bad · {pct}% satisfaction"
+    pct = int((stats["good"] / total) * 100)
+    await interaction.response.send_message(
+        f"📊 Your ratings: ✅ {stats['good']} good · ❌ {stats['bad']} bad · {pct}% satisfaction",
+        ephemeral=True
     )
 
-async def handle_command(message, content, thread_id):
-    parts = content.strip().split()
-    cmd = parts[0].lower()
-    args = parts[1:]
-    uid = message.author.id
-    if cmd == "!memory":          await cmd_memory(message, uid)
-    elif cmd == "!forget":        await cmd_forget(message, uid, args)
-    elif cmd == "!forgetall":     await cmd_forget_all(message, uid)
-    elif cmd == "!personality":   await cmd_personality(message, uid, args)
-    elif cmd == "!stats":         await cmd_stats(message, thread_id, uid)
-    elif cmd == "!relationships": await cmd_relationships(message, uid)
-    elif cmd == "!rate":          await cmd_rate(message, uid, thread_id, args)
-    elif cmd == "!ratings":       await cmd_ratings(message, uid)
-    elif cmd == "!help":          await cmd_help(message)
-    else:                         return False
-    return True
+
+@client.tree.command(name="help", description="Show all Corsbot commands")
+async def slash_help(interaction: discord.Interaction):
+    lines = [
+        "🤖 **Corsbot Commands**",
+        "`/memory` — see everything I know about you",
+        "`/forget <key>` — delete a specific memory",
+        "`/forgetall` — wipe all your memories",
+        "`/personality <mood>` — set my mood",
+        "`/stats` — conversation and memory stats",
+        "`/relationships` — see who I know about in your life",
+        "`/rate` — rate my last reply",
+        "`/ratings` — see your rating history",
+        "`/help` — show this list",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # ---------------- BOT EVENTS ---------------- #
 
@@ -293,14 +331,7 @@ async def on_message(message):
     )
 
     loop = asyncio.get_event_loop()
-
     await loop.run_in_executor(executor, store_message, thread_id, "user", content)
-
-    # Commands
-    if content.startswith("!"):
-        handled = await handle_command(message, content, thread_id)
-        if handled:
-            return
 
     # Quick replies
     quick = get_quick_reply(content)
@@ -353,8 +384,6 @@ async def on_message(message):
             return
 
     await loop.run_in_executor(executor, store_message, thread_id, "assistant", reply)
-
-    # Store last reply for !rate
     store_last_reply(str(message.author.id), reply, mood, active_keys)
     reply = resolve_mentions_in_reply(reply, message.guild)
 

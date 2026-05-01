@@ -1,0 +1,8 @@
+.env
+brain.db
+brain.index
+brain.index.map
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
