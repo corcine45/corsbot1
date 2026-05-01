@@ -1,13 +1,9 @@
 import time
 import random
+from groq import Groq
 import os
-from google import genai
-from google.genai import types
 
-client_ai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-CHAT_MODEL = "gemini-2.0-flash"
-FAST_MODEL = "gemini-2.0-flash-lite"
+client_ai = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 FALLBACK_RESPONSES = [
     "my brain's a bit fried rn, try again in a sec",
@@ -38,82 +34,31 @@ def is_prompt_injection(text: str) -> bool:
     lower = text.lower()
     return any(pattern in lower for pattern in _INJECTION_PATTERNS)
 
-# ---------------- GEMINI CALL ---------------- #
-
-def gemini_call(system: str, history: list, user_message: str,
-                model: str = CHAT_MODEL, max_tokens: int = 512,
-                retries: int = 3) -> str:
-    """Call Gemini with retry logic and exponential backoff."""
-    # Convert OpenAI-style history to Gemini format
-    gemini_history = []
-    for msg in history:
-        role = "user" if msg["role"] == "user" else "model"
-        gemini_history.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
-
+def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, timeout: int = 15) -> str:
+    """Groq API wrapper with retry logic, exponential backoff, and timeout."""
     last_err = None
     for attempt in range(retries):
         try:
-            chat = client_ai.chats.create(
+            res = client_ai.chat.completions.create(
                 model=model,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    max_output_tokens=max_tokens,
-                ),
-                history=gemini_history,
+                messages=messages,
+                max_tokens=max_tokens,
+                timeout=timeout,
             )
-            res = chat.send_message(user_message)
-            return res.text
+            return res.choices[0].message.content
         except Exception as e:
             last_err = e
             err_str = str(e)
-            if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+            if "429" in err_str or "rate_limit" in err_str.lower():
                 raise
-            if "401" in err_str or "403" in err_str or "API_KEY" in err_str:
+            if "401" in err_str or "403" in err_str:
                 raise
             if attempt < retries - 1:
                 wait = 2 ** attempt
-                print(f"[gemini_call] attempt {attempt + 1} failed: {e} — retrying in {wait}s")
+                print(f"[groq_call] attempt {attempt + 1} failed: {e} — retrying in {wait}s")
                 time.sleep(wait)
     raise last_err
 
-def gemini_simple(system: str, prompt: str, model: str = FAST_MODEL,
-                  max_tokens: int = 100, retries: int = 2) -> str:
-    """Single-turn call for lightweight tasks."""
-    last_err = None
-    for attempt in range(retries):
-        try:
-            res = client_ai.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    max_output_tokens=max_tokens,
-                ),
-            )
-            return res.text
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            if "429" in err_str or "quota" in err_str.lower():
-                raise
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-    raise last_err
-
-def groq_call(model: str, messages: list, max_tokens: int,
-              retries: int = 2, timeout: int = 10) -> str:
-    """Compatibility shim — routes lightweight calls to gemini_simple."""
-    system = ""
-    user_msg = ""
-    for m in messages:
-        if m["role"] == "system":
-            system = m["content"]
-        elif m["role"] == "user":
-            user_msg = m["content"]
-    return gemini_simple(system, user_msg, model=FAST_MODEL,
-                         max_tokens=max_tokens, retries=retries)
-
-# ---------------- PERSONALITY ---------------- #
 
 SYSTEM_PROMPT = (
     "You are Corsbot, a chill Discord bot made by Corcine. "
@@ -205,29 +150,22 @@ def ai_chat(history, memory, username=None, mood="chill", relationships="", web_
     if relationships:
         system += (
             f"\n\nPeople in this user's life:\n{relationships}"
-            "\nReference these naturally when relevant."
+            "\nReference these naturally when relevant — e.g. 'oh you and Mike play together right?'"
         )
 
     if web_context:
         system += (
-            f"\n\nReal-time web search results:\n{web_context}"
-            "\nUse this to answer accurately."
+            f"\n\nReal-time web search results for this query:\n{web_context}"
+            "\nUse this information to answer accurately. Mention it's current info when relevant."
         )
 
-    # Split history: all but last message goes as history, last is the current turn
-    if history:
-        chat_history = history[:-1]
-        current = history[-1]["content"]
-    else:
-        chat_history = []
-        current = ""
+    messages = [{"role": "system", "content": system}] + history
 
     try:
-        return gemini_call(system, chat_history, current, max_tokens=512)
+        return groq_call("llama-3.3-70b-versatile", messages, max_tokens=512)
     except Exception as e:
         err_str = str(e)
-        print(f"[ai_chat error] {type(e).__name__}: {err_str}")
-        if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+        if "429" in err_str or "rate_limit" in err_str.lower():
             raise
         print(f"[ai_chat failed] {e}")
         return random.choice(FALLBACK_RESPONSES)
