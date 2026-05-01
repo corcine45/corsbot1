@@ -1,11 +1,3 @@
-import subprocess
-import sys
-
-# Auto-install dependencies on first run (for Railway)
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-r",
-    __import__("os").path.join(__import__("os").path.dirname(__file__), "requirements.txt"),
-    "--quiet"])
-
 import discord
 from discord import app_commands
 import asyncio
