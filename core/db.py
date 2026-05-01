@@ -4,7 +4,7 @@ import time
 import os
 
 # Use /app for Railway persistent volume, fall back to local for dev
-DATA_DIR = "/app" if os.path.exists("/app") else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = "/data" if os.path.exists("/data") else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(DATA_DIR, "brain.db")
 
 _local = threading.local()
