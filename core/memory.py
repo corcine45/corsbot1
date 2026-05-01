@@ -8,7 +8,7 @@ import faiss
 from functools import lru_cache
 from sentence_transformers import SentenceTransformer
 
-from .db import get_db
+from .db import get_db, DATA_DIR
 from .ai import groq_call
 
 # ---------------- EMBEDDER ---------------- #
@@ -27,8 +27,8 @@ def _embed(text: str) -> bytes:
 
 # ---------------- FAISS ---------------- #
 
-FAISS_INDEX_PATH = "brain.index"
-FAISS_MAP_PATH   = "brain.index.map"
+FAISS_INDEX_PATH = os.path.join(DATA_DIR, "brain.index")
+FAISS_MAP_PATH   = os.path.join(DATA_DIR, "brain.index.map")
 
 _faiss_lock = threading.Lock()
 _faiss_index: faiss.IndexFlatIP = None
