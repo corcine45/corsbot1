@@ -56,6 +56,7 @@ def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, tim
             if attempt < retries - 1:
                 wait = 2 ** attempt
                 print(f"[groq_call] attempt {attempt + 1} failed: {e} — retrying in {wait}s")
+                print(f"[groq_call] error type: {type(e).__name__}, details: {repr(e)}")
                 time.sleep(wait)
     raise last_err
 
