@@ -1,13 +1,13 @@
 import time
 import random
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+client_ai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Use Flash for chat (generous limits), Flash-8B for lightweight tasks
-CHAT_MODEL = "gemini-1.5-flash"
-FAST_MODEL = "gemini-1.5-flash-8b"
+CHAT_MODEL = "gemini-2.0-flash"
+FAST_MODEL = "gemini-2.0-flash-lite"
 
 FALLBACK_RESPONSES = [
     "my brain's a bit fried rn, try again in a sec",
@@ -48,17 +48,19 @@ def gemini_call(system: str, history: list, user_message: str,
     gemini_history = []
     for msg in history:
         role = "user" if msg["role"] == "user" else "model"
-        gemini_history.append({"role": role, "parts": [msg["content"]]})
+        gemini_history.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
 
     last_err = None
     for attempt in range(retries):
         try:
-            client = genai.GenerativeModel(
-                model_name=model,
-                system_instruction=system,
-                generation_config={"max_output_tokens": max_tokens},
+            chat = client_ai.chats.create(
+                model=model,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=max_tokens,
+                ),
+                history=gemini_history,
             )
-            chat = client.start_chat(history=gemini_history)
             res = chat.send_message(user_message)
             return res.text
         except Exception as e:
@@ -76,16 +78,18 @@ def gemini_call(system: str, history: list, user_message: str,
 
 def gemini_simple(system: str, prompt: str, model: str = FAST_MODEL,
                   max_tokens: int = 100, retries: int = 2) -> str:
-    """Single-turn call for lightweight tasks like memory extraction and emotion."""
+    """Single-turn call for lightweight tasks."""
     last_err = None
     for attempt in range(retries):
         try:
-            client = genai.GenerativeModel(
-                model_name=model,
-                system_instruction=system,
-                generation_config={"max_output_tokens": max_tokens},
+            res = client_ai.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=max_tokens,
+                ),
             )
-            res = client.generate_content(prompt)
             return res.text
         except Exception as e:
             last_err = e
@@ -96,11 +100,9 @@ def gemini_simple(system: str, prompt: str, model: str = FAST_MODEL,
                 time.sleep(2 ** attempt)
     raise last_err
 
-# Keep groq_call as an alias so memory.py and emotion.py don't break
 def groq_call(model: str, messages: list, max_tokens: int,
               retries: int = 2, timeout: int = 10) -> str:
     """Compatibility shim — routes lightweight calls to gemini_simple."""
-    # Extract system and user message from OpenAI-style messages
     system = ""
     user_msg = ""
     for m in messages:
@@ -224,6 +226,7 @@ def ai_chat(history, memory, username=None, mood="chill", relationships="", web_
         return gemini_call(system, chat_history, current, max_tokens=512)
     except Exception as e:
         err_str = str(e)
+        print(f"[ai_chat error] {type(e).__name__}: {err_str}")
         if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
             raise
         print(f"[ai_chat failed] {e}")
