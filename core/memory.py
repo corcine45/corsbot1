@@ -131,6 +131,11 @@ def _classify_key(key: str) -> str:
         return "temporary"
     return "preference"
 
+
+def _resolve_memory_type(key: str, memory_type: str | None) -> str:
+    return memory_type or _classify_key(key)
+
+
 def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> float:
     half_life = DECAY.get(memory_type)
     if half_life is None:
@@ -143,6 +148,8 @@ def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> flo
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
 MEMORY_EXTRACT_EVERY = 3
+MEMORY_SIMILARITY_THRESHOLD = 0.80
+MAX_MEMORY_FACTS = 3
 _msg_counter: dict = {}
 
 def should_extract(user_id: str) -> bool:
@@ -213,7 +220,8 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
     now = time.time()
     fact_lookup = {}
     for key, value, memory_type, updated_at, reinforcement in rows:
-        fact_lookup[key] = (value, memory_type or "preference", updated_at, reinforcement or 1)
+        resolved_type = _resolve_memory_type(key, memory_type)
+        fact_lookup[key] = (value, resolved_type, updated_at, reinforcement or 1)
 
     non_identity = {}
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
@@ -235,7 +243,7 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
 
     scored_facts.sort(reverse=True)
-    result = [f"{k}={v}" for _, k, v in scored_facts[:top_k]]
+    result = [f"{k}={v}" for _, k, v in scored_facts[:MAX_MEMORY_FACTS]]
     return "\n".join(result)
 
 
@@ -253,17 +261,15 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
     now = time.time()
     fact_lookup = {}
     for key, value, memory_type, updated_at, reinforcement in rows:
-        fact_lookup[key] = (value, memory_type or "preference", updated_at, reinforcement or 1)
+        resolved_type = _resolve_memory_type(key, memory_type)
+        fact_lookup[key] = (value, resolved_type, updated_at, reinforcement or 1)
 
-    identity_facts, non_identity = [], {}
+    non_identity = {}
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue
-        if memory_type == "identity":
-            non_identity[key] = (value, memory_type, updated_at, reinforcement)  # treat identity same as others
-        else:
-            non_identity[key] = (value, memory_type, updated_at, reinforcement)
+        non_identity[key] = (value, memory_type, updated_at, reinforcement)
 
     scored_facts = []
     if query and non_identity:
@@ -271,8 +277,7 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
         for sim, key in faiss_search(str(user_id), query_vec, top_k=len(non_identity)):
             if key not in non_identity:
                 continue
-            # Only include facts with meaningful similarity to the current message
-            if sim < 0.5:
+            if sim < MEMORY_SIMILARITY_THRESHOLD:
                 continue
             value, memory_type, updated_at, reinforcement = non_identity[key]
             scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement), key, value))
@@ -281,7 +286,7 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
 
     scored_facts.sort(reverse=True)
-    top_scored = scored_facts[:3]  # max 3 facts, keep it tight
+    top_scored = scored_facts[:MAX_MEMORY_FACTS]
     active_keys = [k for _, k, _ in top_scored]
 
     result = [f"{k}={v}" for _, k, v in top_scored]
@@ -304,6 +309,12 @@ def store_user_name(user_id, display_name):
 # ---------------- RELATIONSHIPS ---------------- #
 
 def extract_relationships(user_id, message):
+    # Only bother if message mentions someone by name (has @ or common relationship words)
+    lower = message.lower()
+    relationship_hints = ("my friend", "my brother", "my sister", "my mom", "my dad", "my girlfriend",
+                          "my boyfriend", "my wife", "my husband", "my teammate", "my coworker", "@")
+    if not any(hint in lower for hint in relationship_hints):
+        return
     if len(message.split()) < 4:
         return
     try:

@@ -2,96 +2,167 @@ import sqlite3
 import threading
 import time
 import os
+import shutil
+from pathlib import Path
 
 # Use /app for Railway persistent volume, fall back to local for dev
-DATA_DIR = "/data" if os.path.exists("/data") else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(DATA_DIR, "brain.db")
+DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parents[1]
+DB_PATH = DATA_DIR / "brain.db"
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_RETENTION = 5
+SCHEMA_VERSION = 3
+
+IDENTITY_KEYS = {"name", "age", "location", "job", "display_name", "birthday", "gender", "nationality"}
+TEMPORARY_KEYS = {"mood", "currently", "doing", "feeling", "status", "playing_now", "watching_now"}
 
 _local = threading.local()
+_backup_done = False
 
-def get_db():
-    if not hasattr(_local, "conn"):
-        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.cursor = _local.conn.cursor()
 
-        _local.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT,
-                role TEXT,
-                content TEXT,
-                timestamp REAL
-            )
-        """)
+def ensure_data_dir():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-        _local.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS memory (
+
+def backup_db():
+    global _backup_done
+    if _backup_done or not DB_PATH.exists():
+        return
+
+    ensure_data_dir()
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    backup_path = BACKUP_DIR / f"brain-{timestamp}.db.bak"
+    try:
+        shutil.copy2(DB_PATH, backup_path)
+        backups = sorted(BACKUP_DIR.glob("brain-*.db.bak"), key=os.path.getmtime)
+        for old_backup in backups[:-BACKUP_RETENTION]:
+            old_backup.unlink()
+        print(f"[db] backup created: {backup_path}")
+    except Exception as e:
+        print(f"[db] backup failed: {e}")
+    _backup_done = True
+
+
+def connect_db():
+    ensure_data_dir()
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    return conn, cursor
+
+
+def initialize_schema(cursor):
+    cursor.execute("PRAGMA user_version")
+    version = cursor.fetchone()[0] or 0
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            user_id TEXT,
+            key TEXT,
+            value TEXT,
+            updated_at REAL,
+            embedding BLOB,
+            memory_type TEXT DEFAULT 'preference',
+            reinforcement INTEGER DEFAULT 1,
+            PRIMARY KEY (user_id, key)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS relationships (
+            user_id TEXT,
+            related_name TEXT,
+            relation TEXT,
+            context TEXT,
+            strength INTEGER DEFAULT 1,
+            updated_at REAL,
+            PRIMARY KEY (user_id, related_name)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            thread_id TEXT,
+            reply_snippet TEXT,
+            rating TEXT,
+            mood TEXT,
+            guild_id TEXT,
+            timestamp REAL
+        )
+    """)
+    feedback_cols = [row[1] for row in cursor.execute("PRAGMA table_info(feedback)").fetchall()]
+    if "guild_id" not in feedback_cols:
+        cursor.execute("ALTER TABLE feedback ADD COLUMN guild_id TEXT")
+
+    cols = [row[1] for row in cursor.execute("PRAGMA table_info(memory)").fetchall()]
+    if "key" not in cols and "fact" in cols:
+        cursor.execute("ALTER TABLE memory RENAME TO memory_old")
+        cursor.execute("""
+            CREATE TABLE memory (
                 user_id TEXT,
                 key TEXT,
                 value TEXT,
                 updated_at REAL,
+                embedding BLOB,
+                memory_type TEXT DEFAULT 'preference',
+                reinforcement INTEGER DEFAULT 1,
                 PRIMARY KEY (user_id, key)
             )
         """)
-
-        # Migrate old schema (user_id, fact) -> (user_id, key, value, updated_at)
-        cols = [row[1] for row in _local.cursor.execute("PRAGMA table_info(memory)").fetchall()]
-        if "key" not in cols:
-            _local.cursor.execute("ALTER TABLE memory RENAME TO memory_old")
-            _local.cursor.execute("""
-                CREATE TABLE memory (
-                    user_id TEXT,
-                    key TEXT,
-                    value TEXT,
-                    updated_at REAL,
-                    PRIMARY KEY (user_id, key)
+        old_rows = cursor.execute("SELECT user_id, fact FROM memory_old").fetchall()
+        for user_id, fact in old_rows:
+            if "=" in fact:
+                key, value = fact.split("=", 1)
+                cursor.execute(
+                    "INSERT OR IGNORE INTO memory (user_id, key, value, updated_at) VALUES (?, ?, ?, ?)",
+                    (user_id, key.strip().lower(), value.strip(), time.time())
                 )
-            """)
-            old_rows = _local.cursor.execute("SELECT user_id, fact FROM memory_old").fetchall()
-            for user_id, fact in old_rows:
-                if "=" in fact:
-                    k, v = fact.split("=", 1)
-                    _local.cursor.execute(
-                        "INSERT OR IGNORE INTO memory (user_id, key, value, updated_at) VALUES (?, ?, ?, ?)",
-                        (user_id, k.strip().lower(), v.strip(), time.time())
-                    )
-            _local.cursor.execute("DROP TABLE memory_old")
+        cursor.execute("DROP TABLE memory_old")
+        cols = [row[1] for row in cursor.execute("PRAGMA table_info(memory)").fetchall()]
 
-        # Add missing columns
-        cols = [row[1] for row in _local.cursor.execute("PRAGMA table_info(memory)").fetchall()]
-        if "embedding" not in cols:
-            _local.cursor.execute("ALTER TABLE memory ADD COLUMN embedding BLOB")
-        if "memory_type" not in cols:
-            _local.cursor.execute("ALTER TABLE memory ADD COLUMN memory_type TEXT DEFAULT 'preference'")
-        if "reinforcement" not in cols:
-            _local.cursor.execute("ALTER TABLE memory ADD COLUMN reinforcement INTEGER DEFAULT 1")
+    if "embedding" not in cols:
+        cursor.execute("ALTER TABLE memory ADD COLUMN embedding BLOB")
+        cols.append("embedding")
+    if "memory_type" not in cols:
+        cursor.execute("ALTER TABLE memory ADD COLUMN memory_type TEXT DEFAULT 'preference'")
+        cols.append("memory_type")
+    if "reinforcement" not in cols:
+        cursor.execute("ALTER TABLE memory ADD COLUMN reinforcement INTEGER DEFAULT 1")
+        cols.append("reinforcement")
 
-        # Relationships table
-        _local.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS relationships (
-                user_id TEXT,
-                related_name TEXT,
-                relation TEXT,
-                context TEXT,
-                strength INTEGER DEFAULT 1,
-                updated_at REAL,
-                PRIMARY KEY (user_id, related_name)
-            )
-        """)
+    cursor.execute(
+        f"UPDATE memory SET memory_type='identity' WHERE (memory_type IS NULL OR memory_type='') AND LOWER(key) IN ({','.join('?' for _ in IDENTITY_KEYS)})",
+        tuple(IDENTITY_KEYS)
+    )
+    cursor.execute(
+        f"UPDATE memory SET memory_type='temporary' WHERE (memory_type IS NULL OR memory_type='') AND LOWER(key) IN ({','.join('?' for _ in TEMPORARY_KEYS)})",
+        tuple(TEMPORARY_KEYS)
+    )
+    cursor.execute("UPDATE memory SET memory_type='preference' WHERE memory_type IS NULL OR memory_type=''")
 
-        # Feedback table
-        _local.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                thread_id TEXT,
-                reply_snippet TEXT,
-                rating TEXT,
-                mood TEXT,
-                timestamp REAL
-            )
-        """)
+    if version < SCHEMA_VERSION:
+        cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
+
+def get_db():
+    if not hasattr(_local, "conn"):
+        backup_db()
+        _local.conn, _local.cursor = connect_db()
+        initialize_schema(_local.cursor)
         _local.conn.commit()
 
     return _local.conn, _local.cursor
@@ -110,11 +181,14 @@ def store_message(thread_id, role, content):
     conn.commit()
 
 
-def get_history(thread_id, limit=10):
+def get_history(thread_id, limit=8):
     _, cursor = get_db()
     cursor.execute(
         "SELECT role, content FROM messages WHERE thread_id=? ORDER BY timestamp DESC LIMIT ?",
         (thread_id, limit),
     )
     rows = cursor.fetchall()[::-1]
-    return [{"role": r, "content": c} for r, c in rows]
+    return [
+        {"role": r, "content": c if len(c) <= 900 else c[:899] + "…"}
+        for r, c in rows
+    ]

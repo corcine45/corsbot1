@@ -3,8 +3,6 @@ import requests
 import re
 import os
 
-from .ai import groq_call
-
 GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
 
 # ---------------- FORCE TRIGGERS ---------------- #

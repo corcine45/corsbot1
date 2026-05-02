@@ -1,10 +1,14 @@
 import discord
 from discord import app_commands
+import aiohttp
 import asyncio
+import base64
+import hashlib
 import re
 import random
 import time
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
@@ -16,6 +20,7 @@ _REQUIRED_ENV = {
     "DISCORD_TOKEN": "Discord bot token",
     "GROQ_API_KEY":  "Groq API key",
     "GIPHY_API_KEY": "Giphy API key",
+    "OCR_SPACE_API_KEY": "OCR.space API key for image text extraction",
 }
 
 _missing = [f"{var} ({desc})" for var, desc in _REQUIRED_ENV.items() if not os.getenv(var)]
@@ -29,10 +34,7 @@ if _missing:
 print("✅ All environment variables loaded.")
 
 from core.db import get_db, get_thread_id, store_message, get_history
-from core.ai import (
-    ai_chat, get_mood, set_mood, get_current_mood, reset_mood,
-    MOOD_PROMPTS, FALLBACK_RESPONSES, is_prompt_injection
-)
+from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection
 from core.memory import (
     extract_memory, get_memory, get_memory_with_keys, store_user_name,
     extract_relationships, get_relationships, should_extract
@@ -41,13 +43,18 @@ from core.emotion import pick_gif_for_message
 from core.search import needs_web_search, web_search, build_search_query
 from core.feedback import (
     store_last_reply, get_last_reply, store_feedback,
-    apply_good_rating, apply_bad_rating, get_feedback_stats
+    apply_good_rating, apply_bad_rating, get_feedback_stats,
+    get_feedback_context,
 )
 
 # ---------------- CONFIG ---------------- #
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-VALID_MOODS = list(MOOD_PROMPTS.keys())
+HISTORY_LIMIT = 20
+COOLDOWN_SECONDS = 3
+RESPONSE_CACHE_TTL = 300
+_RESPONSE_CACHE: dict[str, tuple[str, float]] = {}
+_user_cooldowns: dict[int, float] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -117,6 +124,91 @@ def resolve_mentions_in_reply(reply, guild):
         return match.group(0)
     return re.sub(r"@([\w\s]+)", replace_mention, reply)
 
+async def extract_attachment_text(attachment: discord.Attachment) -> str:
+    if not attachment.content_type or not attachment.content_type.startswith("image/"):
+        return ""
+
+    api_key = os.getenv("OCR_SPACE_API_KEY")
+    if not api_key:
+        return ""
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(attachment.url) as response:
+            if response.status != 200:
+                return ""
+            data = await response.read()
+
+    b64 = base64.b64encode(data).decode("utf-8")
+    payload = {
+        "apikey": api_key,
+        "language": "eng",
+        "isOverlayRequired": False,
+        "base64Image": f"data:{attachment.content_type};base64,{b64}",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.ocr.space/parse/image", data=payload, timeout=30) as response:
+            if response.status != 200:
+                return ""
+            result = await response.json()
+
+    parsed = result.get("ParsedResults")
+    if not parsed or not isinstance(parsed, list):
+        return ""
+
+    text = parsed[0].get("ParsedText", "")
+    return text.strip()
+
+MEMORY_INJECTION_TRIGGERS = (
+    "remember",
+    "do you remember",
+    "do you know",
+    "what do you know",
+    "what do you remember",
+    "tell me about",
+    "what can you tell me about",
+    "what do you know about",
+    "who am i",
+    "what's my",
+    "what is my",
+    "do you have memory",
+    "do you recall",
+    "recall",
+    "remind me",
+    "about me",
+)
+
+def is_explicit_memory_request(text: str) -> bool:
+    lower = text.lower()
+    return any(trigger in lower for trigger in MEMORY_INJECTION_TRIGGERS)
+
+
+def build_response_cache_key(thread_id, content, memory, relationships, web_context, feedback_context):
+    payload = "\n".join([
+        thread_id,
+        content.strip().lower(),
+        memory or "",
+        relationships or "",
+        web_context or "",
+        feedback_context or "",
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_cached_response(key):
+    entry = _RESPONSE_CACHE.get(key)
+    if not entry:
+        return None
+    reply, ts = entry
+    if time.time() - ts > RESPONSE_CACHE_TTL:
+        _RESPONSE_CACHE.pop(key, None)
+        return None
+    return reply
+
+
+def set_cached_response(key, reply):
+    _RESPONSE_CACHE[key] = (reply, time.time())
+
 # ---------------- SLASH COMMANDS ---------------- #
 
 @client.tree.command(name="memory", description="See everything Corsbot knows about you")
@@ -161,22 +253,6 @@ async def slash_forget_all(interaction: discord.Interaction):
     await interaction.response.send_message("Cleared all your memories. Fresh start. 🧹", ephemeral=True)
 
 
-@client.tree.command(name="personality", description="Set Corsbot's mood when talking to you")
-@app_commands.describe(mood="Choose a mood")
-@app_commands.choices(mood=[
-    app_commands.Choice(name=m, value=m) for m in VALID_MOODS
-])
-async def slash_personality(interaction: discord.Interaction, mood: str):
-    set_mood(str(interaction.user.id), mood)
-    await interaction.response.send_message(f"Switched to **{mood}** mode. 🎭", ephemeral=True)
-
-
-@client.tree.command(name="reset", description="Reset personality to chill")
-async def slash_reset(interaction: discord.Interaction):
-    reset_mood(str(interaction.user.id))
-    await interaction.response.send_message("Reset to **chill** mode. ✨", ephemeral=True)
-
-
 @client.tree.command(name="stats", description="Show conversation and memory stats")
 async def slash_stats(interaction: discord.Interaction):
     user_id = interaction.user.id
@@ -192,11 +268,9 @@ async def slash_stats(interaction: discord.Interaction):
     msg_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*), memory_type FROM memory WHERE user_id=? GROUP BY memory_type", (str(user_id),))
     mem_rows = cursor.fetchall()
-    current_mood = get_current_mood(str(user_id))
     lines = [
         "📊 **Stats**",
         f"💬 Messages in this thread: **{msg_count}**",
-        f"🎭 Current mood: **{current_mood}**",
         "🧠 Memory:",
     ]
     for count, mtype in mem_rows:
@@ -251,7 +325,7 @@ async def slash_rate(interaction: discord.Interaction, rating: str):
             "No recent reply to rate — ratings expire after 5 minutes.", ephemeral=True
         )
         return
-    store_feedback(str(user_id), thread_id, entry["reply"], rating, entry["mood"])
+    store_feedback(str(user_id), thread_id, entry["reply"], rating, entry["mood"], interaction.guild_id if interaction.guild else None)
     if rating == "good":
         apply_good_rating(str(user_id), entry["mood"], entry["memory_keys"])
         await interaction.response.send_message("glad you liked it 🙏", ephemeral=True)
@@ -262,7 +336,8 @@ async def slash_rate(interaction: discord.Interaction, rating: str):
 
 @client.tree.command(name="ratings", description="See your rating history for Corsbot")
 async def slash_ratings(interaction: discord.Interaction):
-    stats = get_feedback_stats(str(interaction.user.id))
+    guild_id = interaction.guild_id if interaction.guild else None
+    stats = get_feedback_stats(str(interaction.user.id), guild_id)
     total = stats["good"] + stats["bad"]
     if total == 0:
         await interaction.response.send_message(
@@ -270,10 +345,61 @@ async def slash_ratings(interaction: discord.Interaction):
         )
         return
     pct = int((stats["good"] / total) * 100)
+    scope = "this server" if guild_id else "this DM"
     await interaction.response.send_message(
-        f"📊 Your ratings: ✅ {stats['good']} good · ❌ {stats['bad']} bad · {pct}% satisfaction",
+        f"📊 Your ratings {scope}: ✅ {stats['good']} good · ❌ {stats['bad']} bad · {pct}% satisfaction",
         ephemeral=True
     )
+
+
+@client.tree.command(name="dashboard", description="Show activity dashboard for the bot")
+async def slash_dashboard(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only 🔒", ephemeral=True)
+        return
+
+    _, cursor = get_db()
+    cursor.execute("SELECT content FROM messages WHERE role='user'")
+    rows = cursor.fetchall()
+
+    user_counts = Counter()
+    for (content,) in rows:
+        match = re.match(r"^\[([^\]]+)\]:", content)
+        if match:
+            user_counts[match.group(1)] += 1
+
+    top_users = user_counts.most_common(5)
+    cursor.execute(
+        "SELECT key, COUNT(*) FROM memory GROUP BY key ORDER BY COUNT(*) DESC LIMIT 5"
+    )
+    top_topics = cursor.fetchall()
+
+    cursor.execute(
+        "SELECT relation, COUNT(*) FROM relationships GROUP BY relation ORDER BY COUNT(*) DESC LIMIT 5"
+    )
+    top_relations = cursor.fetchall()
+
+    lines = ["📊 **Dashboard**"]
+    if top_users:
+        lines.append("**Most active users:**")
+        for name, count in top_users:
+            lines.append(f"• {name}: {count} messages")
+    else:
+        lines.append("No user activity recorded yet.")
+
+    if top_topics:
+        lines.append("\n**Popular topics:**")
+        for key, count in top_topics:
+            lines.append(f"• {key}: {count} facts")
+    else:
+        lines.append("\nNo memory topics recorded yet.")
+
+    if top_relations:
+        lines.append("\n**Common relationships:**")
+        for relation, count in top_relations:
+            lines.append(f"• {relation}: {count} mentions")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @client.tree.command(name="help", description="Show all Corsbot commands")
@@ -283,8 +409,8 @@ async def slash_help(interaction: discord.Interaction):
         "`/memory` — see everything I know about you",
         "`/forget <key>` — delete a specific memory",
         "`/forgetall` — wipe all your memories",
-        "`/personality <mood>` — set my mood",
         "`/stats` — conversation and memory stats",
+        "`/dashboard` — show activity dashboard",
         "`/relationships` — see who I know about in your life",
         "`/rate` — rate my last reply",
         "`/ratings` — see your rating history",
@@ -306,14 +432,36 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     should_reply = is_dm or (client.user in message.mentions)
 
+    # Cooldown — only applies to messages the bot would actually respond to
+    if should_reply:
+        now = time.time()
+        if now - _user_cooldowns.get(message.author.id, 0) < COOLDOWN_SECONDS:
+            return
+        _user_cooldowns[message.author.id] = now
+
     content = message.content.strip()
-    if not should_reply or not content:
+    ocr_text = ""
+    if message.attachments:
+        ocr_parts = []
+        for attachment in message.attachments:
+            extracted = await extract_attachment_text(attachment)
+            if extracted:
+                ocr_parts.append(extracted)
+        if ocr_parts:
+            ocr_text = "\n\n".join(ocr_parts).strip()
+
+    if not should_reply or (not content and not ocr_text):
         return
 
     # Strip bot mention
     content = content.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "").strip()
-    if not content:
+    if not content and not ocr_text:
         return
+
+    if ocr_text and content:
+        content = f"{ocr_text}\n\n{content}"
+    elif ocr_text:
+        content = ocr_text
 
     # Prompt injection guard
     if is_prompt_injection(content):
@@ -336,7 +484,7 @@ async def on_message(message):
         is_dm,
     )
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # Prefix message with sender name so AI never confuses sender with mentioned users
     attributed_content = f"[{message.author.display_name}]: {content}"
@@ -392,29 +540,46 @@ async def on_message(message):
         if should_extract(str(uid)):
             await loop.run_in_executor(executor, extract_memory, uid, content)
 
-    history = await loop.run_in_executor(executor, get_history, thread_id)
-    mood = get_mood(uid_str)
+    history = await loop.run_in_executor(executor, get_history, thread_id, HISTORY_LIMIT)
     channel_name = message.channel.name if hasattr(message.channel, "name") else "dm"
+    feedback_context = await loop.run_in_executor(
+        executor,
+        get_feedback_context,
+        str(message.author.id),
+        message.guild.id if message.guild else None,
+    )
 
-    async with message.channel.typing():
-        try:
-            reply = await loop.run_in_executor(
-                executor, ai_chat, history, memory,
-                message.author.display_name, mood, relationships, web_context, impersonation_context, channel_name
-            )
-        except Exception as e:
-            err = str(e)
-            if "429" in err or "rate_limit" in err.lower():
-                match = re.search(r"try again in ([^\.]+)", err)
-                wait = match.group(1) if match else "a few minutes"
-                await message.channel.send(f"<@{message.author.id}> ⏳ rate limited, try again in {wait}.")
-            else:
-                await message.channel.send(f"<@{message.author.id}> {random.choice(FALLBACK_RESPONSES)}")
-                print(f"[on_message error] {e}")
-            return
+    cache_key = build_response_cache_key(
+        thread_id,
+        content,
+        memory,
+        relationships,
+        web_context,
+        feedback_context,
+    )
+    reply = get_cached_response(cache_key)
+    if reply is None:
+        async with message.channel.typing():
+            try:
+                reply = await loop.run_in_executor(
+                    executor, ai_chat, history, memory,
+                    message.author.display_name, message.author.id, relationships,
+                    web_context, impersonation_context, feedback_context, channel_name
+                )
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "rate_limit" in err.lower():
+                    match = re.search(r"try again in ([^\.]+)", err)
+                    wait = match.group(1) if match else "a few minutes"
+                    await message.channel.send(f"<@{message.author.id}> ⏳ rate limited, try again in {wait}.")
+                else:
+                    await message.channel.send(f"<@{message.author.id}> {random.choice(FALLBACK_RESPONSES)}")
+                    print(f"[on_message error] {e}")
+                return
+        set_cached_response(cache_key, reply)
 
     await loop.run_in_executor(executor, store_message, thread_id, "assistant", reply)
-    store_last_reply(str(message.author.id), reply, mood, active_keys)
+    store_last_reply(str(message.author.id), reply, "default", active_keys)
     reply = resolve_mentions_in_reply(reply, message.guild)
 
     gif_url, emotion = await loop.run_in_executor(executor, pick_gif_for_message, content, reply)
