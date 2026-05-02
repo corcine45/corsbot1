@@ -358,7 +358,7 @@ async def on_message(message):
     memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content)
     relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
 
-    # If impersonating a mentioned user, fetch their memory and inject it
+    # If impersonating a mentioned user, fetch their memory and skip the requester's memory
     impersonation_context = ""
     impersonate_keywords = ("pretend", "act as", "be ", "impersonate", "roleplay as", "talk like", "speak as")
     lower_content = content.lower()
@@ -368,6 +368,8 @@ async def on_message(message):
         target_memory = await loop.run_in_executor(executor, get_memory, target_id)
         if target_memory:
             impersonation_context = f"Facts about {target_name} to help you impersonate them:\n{target_memory}"
+        memory = ""  # don't inject the requester's own memory during impersonation
+        active_keys = []
 
     # Web search if message needs real-time info
     web_context = ""
