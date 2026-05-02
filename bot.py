@@ -20,7 +20,6 @@ _REQUIRED_ENV = {
     "DISCORD_TOKEN": "Discord bot token",
     "GROQ_API_KEY":  "Groq API key",
     "GIPHY_API_KEY": "Giphy API key",
-    "OCR_SPACE_API_KEY": "OCR.space API key for image text extraction",
 }
 
 _missing = [f"{var} ({desc})" for var, desc in _REQUIRED_ENV.items() if not os.getenv(var)]
@@ -34,7 +33,7 @@ if _missing:
 print("✅ All environment variables loaded.")
 
 from core.db import get_db, get_thread_id, store_message, get_history
-from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection
+from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, groq_call
 from core.memory import (
     extract_memory, get_memory, get_memory_with_keys, store_user_name,
     extract_relationships, get_relationships, should_extract
@@ -125,39 +124,47 @@ def resolve_mentions_in_reply(reply, guild):
     return re.sub(r"@([\w\s]+)", replace_mention, reply)
 
 async def extract_attachment_text(attachment: discord.Attachment) -> str:
+    """Use Groq vision to describe/read the image instead of OCR."""
     if not attachment.content_type or not attachment.content_type.startswith("image/"):
         return ""
 
-    api_key = os.getenv("OCR_SPACE_API_KEY")
-    if not api_key:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(attachment.url) as response:
+                if response.status != 200:
+                    return ""
+                data = await response.read()
+
+        b64 = base64.b64encode(data).decode("utf-8")
+        data_url = f"data:{attachment.content_type};base64,{b64}"
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            executor,
+            lambda: groq_call(
+                "meta-llama/llama-4-scout-17b-16e-instruct",
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                            },
+                            {
+                                "type": "text",
+                                "text": "Describe this image concisely. If it contains text, include it. If it's a meme, explain it.",
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=300,
+            )
+        )
+        return f"[Image: {result}]" if result else ""
+    except Exception as e:
+        print(f"[vision] failed: {e}")
         return ""
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(attachment.url) as response:
-            if response.status != 200:
-                return ""
-            data = await response.read()
-
-    b64 = base64.b64encode(data).decode("utf-8")
-    payload = {
-        "apikey": api_key,
-        "language": "eng",
-        "isOverlayRequired": False,
-        "base64Image": f"data:{attachment.content_type};base64,{b64}",
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://api.ocr.space/parse/image", data=payload, timeout=30) as response:
-            if response.status != 200:
-                return ""
-            result = await response.json()
-
-    parsed = result.get("ParsedResults")
-    if not parsed or not isinstance(parsed, list):
-        return ""
-
-    text = parsed[0].get("ParsedText", "")
-    return text.strip()
 
 MEMORY_INJECTION_TRIGGERS = (
     "remember",
