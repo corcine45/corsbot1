@@ -30,7 +30,7 @@ print("✅ All environment variables loaded.")
 
 from core.db import get_db, get_thread_id, store_message, get_history
 from core.ai import (
-    ai_chat, detect_mood, set_mood, get_current_mood,
+    ai_chat, get_mood, set_mood, get_current_mood,
     MOOD_PROMPTS, FALLBACK_RESPONSES, is_prompt_injection
 )
 from core.memory import (
@@ -165,13 +165,10 @@ async def slash_forget_all(interaction: discord.Interaction):
 @app_commands.describe(mood="Choose a mood")
 @app_commands.choices(mood=[
     app_commands.Choice(name=m, value=m) for m in VALID_MOODS
-] + [app_commands.Choice(name="🔄 Auto (detect from chat)", value="auto")])
+])
 async def slash_personality(interaction: discord.Interaction, mood: str):
     set_mood(str(interaction.user.id), mood)
-    if mood == "auto":
-        await interaction.response.send_message("Switched to **auto** mode — I'll adapt to the vibe. 🔄", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"Switched to **{mood}** mode. 🎭", ephemeral=True)
+    await interaction.response.send_message(f"Switched to **{mood}** mode. 🎭", ephemeral=True)
 
 
 @client.tree.command(name="stats", description="Show conversation and memory stats")
@@ -370,7 +367,7 @@ async def on_message(message):
             await loop.run_in_executor(executor, extract_memory, uid, content)
 
     history = await loop.run_in_executor(executor, get_history, thread_id)
-    mood = detect_mood(uid_str, history)
+    mood = get_mood(uid_str)
 
     async with message.channel.typing():
         try:

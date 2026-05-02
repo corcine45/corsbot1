@@ -1,7 +1,4 @@
-import re
-import time
 import random
-from collections import defaultdict
 from groq import Groq
 import os
 
@@ -75,91 +72,28 @@ If a user shares something personal, acknowledge that you'll remember it.
 You can discuss serious, historical, or controversial topics — answer them normally, informative and neutral, no dodging."""
 
 MOOD_PROMPTS = {
-    "chill":       "Relaxed and laid-back. Casual tone, easy-going, balanced — concise but not clipped.",
-    "hyped":       "High energy and enthusiastic. Occasional caps, hype emojis fine. Still coherent and on point.",
-    "playful":     "Jokey and bantery. Lean into humor, light teasing is fine. Keep it sharp, not rambling.",
-    "sarcastic":   "Dry and witty. Light roasts welcome, keep it fun not mean. Deadpan delivery.",
+    "chill":       "Relaxed and laid-back. Casual tone, easy-going, lowercase is fine. Never use all-caps words. Concise but not clipped.",
+    "hyped":       "High energy and enthusiastic. You can capitalize ONE word max per message for emphasis (e.g. 'that's WILD'). No shouting entire sentences. Still coherent and on point.",
+    "playful":     "Jokey and bantery. Lean into humor, light teasing is fine. Keep it sharp, not rambling. No all-caps.",
+    "sarcastic":   "Dry and witty. Light roasts welcome, keep it fun not mean. Deadpan delivery. No all-caps.",
     "informative": "Clear and factual. Helpful without being dry or robotic. Concise, complete, easy to follow.",
     "empathetic":  "Warm and genuine. User seems down or serious — be supportive and thoughtful, not dismissive.",
     "evil":        "Full villain mode. Dramatic, theatrical, dark humor. Ominous jokes, call users 'fool' or 'mortal'. Over the top but clearly joking.",
 }
 
-# Signals used in auto mood detection — keep these specific to avoid false positives
-MOOD_SIGNALS = {
-    "hyped":       {"hype", "lets go", "let's go", "yoo", "🔥", "🚀", "goat", "sheesh", "no cap", "bussin"},
-    "playful":     {"lol", "lmao", "haha", "💀", "😭", "bruh", "ngl", "fr", "joke", "funny", "😂"},
-    "sarcastic":   {"obviously", "sure jan", "totally", "cool story", "ok boomer", "wow thanks", "great job"},
-    "informative": {"how", "why", "what", "explain", "tell me", "when", "who", "where", "does", "can you"},
-    "empathetic":  {"sad", "depressed", "tired", "stressed", "anxious", "lonely", "miss", "hurt", "crying", "😢", "😔"},
-}
-
-# How many signal hits needed to switch mood (recent = stricter)
-_MOOD_THRESHOLD_FRESH = 3   # mood changed < 5 min ago
-_MOOD_THRESHOLD_STALE = 2   # mood is older than 5 min
-
-_user_moods: dict = {}  # uid -> (mood, score, timestamp)
-_auto_mode: set = set() # uids in auto-detect mode
+_user_moods: dict = {}  # uid -> mood string
 
 
-def _signal_matches(text: str, signal: str) -> bool:
-    """Word-boundary match for plain words, substring match for emoji/phrases."""
-    if not signal:
-        return False
-    if signal.isalnum():
-        return bool(re.search(rf"\b{re.escape(signal)}\b", text))
-    return signal in text
-
-
-def detect_mood(user_id: str, recent_messages: list) -> str:
-    """Return the current mood for a user. In auto mode, infer from recent messages."""
-    if user_id not in _auto_mode:
-        return _user_moods.get(user_id, ("chill", 0, 0))[0]
-
-    scores: dict = defaultdict(float)
-    for msg in recent_messages[-5:]:
-        if isinstance(msg, dict):
-            if msg.get("role") != "user":
-                continue
-            text = msg.get("content", "").lower()
-        else:
-            text = str(msg).lower()
-
-        for mood, signals in MOOD_SIGNALS.items():
-            for signal in signals:
-                if _signal_matches(text, signal):
-                    scores[mood] += 1
-
-    if not scores:
-        return _user_moods.get(user_id, ("chill", 0, 0))[0]
-
-    top_mood = max(scores, key=scores.get)
-    existing_mood, _, last_updated = _user_moods.get(user_id, ("chill", 0, 0))
-    age = time.time() - last_updated
-    threshold = _MOOD_THRESHOLD_FRESH if age < 300 else _MOOD_THRESHOLD_STALE
-
-    if scores[top_mood] >= threshold:
-        _user_moods[user_id] = (top_mood, scores[top_mood], time.time())
-        return top_mood
-
-    return existing_mood
+def get_mood(user_id: str) -> str:
+    return _user_moods.get(str(user_id), "chill")
 
 
 def set_mood(user_id: str, mood: str):
-    uid = str(user_id)
-    if mood == "auto":
-        _auto_mode.add(uid)
-        _user_moods.pop(uid, None)
-    else:
-        _auto_mode.discard(uid)
-        _user_moods[uid] = (mood, 99, time.time())
+    _user_moods[str(user_id)] = mood
 
 
 def get_current_mood(user_id: str) -> str:
-    uid = str(user_id)
-    if uid in _auto_mode:
-        mood = _user_moods.get(uid, ("chill", 0, 0))[0]
-        return f"{mood} (auto)"
-    return _user_moods.get(uid, ("chill", 0, 0))[0]
+    return _user_moods.get(str(user_id), "chill")
 
 
 # ---------------- CHAT ---------------- #
