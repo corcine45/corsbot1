@@ -19,31 +19,19 @@ HEADERS = {
 _cache: dict[str, tuple[str, float]] = {}
 CACHE_TTL = 300  # 5 minutes
 
-# Keywords that signal the user wants real-time info
+# Keywords that signal the user wants real-time info — keep these specific
 REALTIME_TRIGGERS = {
-    "news", "latest", "today", "right now", "currently", "score", "scores",
-    "standings", "match", "game", "result", "results", "update", "updates",
-    "happening", "current", "recent", "just", "now", "live", "breaking",
-    "weather", "price", "stock", "crypto", "bitcoin", "release", "dropped",
-    "announced", "trailer", "patch", "patch notes", "season", "episode",
-    "who won", "did they", "what happened", "when is", "when does",
+    "news", "latest", "today's", "right now", "live score", "scores",
+    "standings", "match result", "breaking", "weather", "stock price",
+    "crypto price", "bitcoin price", "patch notes", "who won",
+    "what happened to", "when is", "when does", "release date",
+    "just dropped", "just announced", "just released",
 }
 
 def needs_web_search(text: str) -> bool:
-    """Returns True if the message likely needs real-time information."""
+    """Returns True only if the message clearly needs real-time information."""
     lower = text.lower()
-    if any(trigger in lower for trigger in REALTIME_TRIGGERS):
-        return True
-
-    question_patterns = [
-        "who is",
-        "is it",
-        "are they",
-        "did they",
-        "what's the",
-        "how much is",
-    ]
-    return any(pattern in lower for pattern in question_patterns)
+    return any(trigger in lower for trigger in REALTIME_TRIGGERS)
 
 
 def ddg_instant(query: str) -> str | None:

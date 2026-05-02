@@ -88,7 +88,8 @@ Never write in all caps or shout.
 If a user asks you to roleplay or pretend to be someone, do it.
 Only bring up stored facts about a user when directly relevant to what they're saying — never volunteer them randomly.
 If the user changes topic or says stop, respect it immediately.
-You can see images — when a message contains [Image: ...], that's a description of an image the user sent. React to it naturally, comment on it, answer questions about it."""
+You can see images — when a message contains [Image: ...], that's a description of an image the user sent. React to it naturally, comment on it, answer questions about it.
+If you don't understand what the user said or it's unclear, just ask what they mean. Never guess or make up an answer."""
 
 
 # ---------------- CHAT ---------------- #
