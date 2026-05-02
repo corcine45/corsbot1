@@ -132,6 +132,7 @@ async def extract_attachment_text(attachment: discord.Attachment) -> str:
         async with aiohttp.ClientSession() as session:
             async with session.get(attachment.url) as response:
                 if response.status != 200:
+                    print(f"[vision] failed to download image: {response.status}")
                     return ""
                 data = await response.read()
 
@@ -161,6 +162,7 @@ async def extract_attachment_text(attachment: discord.Attachment) -> str:
                 max_tokens=300,
             )
         )
+        print(f"[vision] result: {result[:80] if result else 'empty'}")
         return f"[Image: {result}]" if result else ""
     except Exception as e:
         print(f"[vision] failed: {e}")
@@ -448,6 +450,10 @@ async def on_message(message):
 
     content = message.content.strip()
     ocr_text = ""
+
+    if not should_reply:
+        return
+
     if message.attachments:
         ocr_parts = []
         for attachment in message.attachments:
@@ -457,7 +463,7 @@ async def on_message(message):
         if ocr_parts:
             ocr_text = "\n\n".join(ocr_parts).strip()
 
-    if not should_reply or (not content and not ocr_text):
+    if not content and not ocr_text:
         return
 
     # Strip bot mention
