@@ -271,6 +271,9 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
         for sim, key in faiss_search(str(user_id), query_vec, top_k=len(non_identity)):
             if key not in non_identity:
                 continue
+            # Only include facts with meaningful similarity to the current message
+            if sim < 0.5:
+                continue
             value, memory_type, updated_at, reinforcement = non_identity[key]
             scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement), key, value))
     else:
@@ -278,7 +281,7 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
 
     scored_facts.sort(reverse=True)
-    top_scored = scored_facts[:top_k]
+    top_scored = scored_facts[:3]  # max 3 facts, keep it tight
     active_keys = [k for _, k, _ in top_scored]
 
     result = [f"{k}={v}" for _, k, v in top_scored]

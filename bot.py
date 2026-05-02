@@ -362,13 +362,20 @@ async def on_message(message):
     impersonation_context = ""
     impersonate_keywords = ("pretend", "act as", "be ", "impersonate", "roleplay as", "talk like", "speak as")
     lower_content = content.lower()
-    if any(kw in lower_content for kw in impersonate_keywords) and mentioned_users:
+    is_impersonating = any(kw in lower_content for kw in impersonate_keywords)
+
+    if is_impersonating and mentioned_users:
+        # Impersonating a Discord user — fetch their stored memory
         target_id = next(iter(mentioned_users))
         target_name = mentioned_users[target_id]
         target_memory = await loop.run_in_executor(executor, get_memory, target_id)
         if target_memory:
             impersonation_context = f"Facts about {target_name} to help you impersonate them:\n{target_memory}"
         memory = ""  # don't inject the requester's own memory during impersonation
+        active_keys = []
+    elif is_impersonating:
+        # Impersonating a character (anime, fictional, etc.) — just clear requester memory
+        memory = ""
         active_keys = []
 
     # Web search if message needs real-time info
