@@ -516,7 +516,7 @@ async def on_message(message):
         await loop.run_in_executor(executor, extract_memory, message.author.id, content)
         await loop.run_in_executor(executor, extract_relationships, message.author.id, attributed_content)
 
-    memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content)
+    memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content, 3)
     relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
 
     # If impersonating a mentioned user, fetch their memory and skip the requester's memory

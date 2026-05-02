@@ -14,8 +14,8 @@ from .ai import groq_call
 # ---------------- EMBEDDER ---------------- #
 
 print("Loading embedding model...")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-EMBED_DIM = 384
+embedder = SentenceTransformer("all-mpnet-base-v2")
+EMBED_DIM = 768
 print("Embedding model ready.")
 
 @lru_cache(maxsize=512)
@@ -39,7 +39,12 @@ def _faiss_load():
     global _faiss_index, _faiss_map, _faiss_reverse
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAP_PATH):
         try:
-            _faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+            idx = faiss.read_index(FAISS_INDEX_PATH)
+            # If dimension changed (e.g. model upgrade), rebuild
+            if idx.d != EMBED_DIM:
+                print(f"[faiss] dimension mismatch ({idx.d} vs {EMBED_DIM}) — rebuilding")
+                raise ValueError("dimension mismatch")
+            _faiss_index = idx
             with open(FAISS_MAP_PATH, "rb") as f:
                 _faiss_map = pickle.load(f)
             _faiss_reverse = {v: k for k, v in _faiss_map.items()}
@@ -207,6 +212,13 @@ def extract_memory(user_id, message):
     except Exception as e:
         print(f"[memory extract error] {e}")
 
+def _expand_query(query: str) -> str:
+    """Expand query with key intent words for better semantic matching."""
+    # Strip filler and keep the core intent
+    filler = {"hey", "corsbot", "can you", "do you", "what is", "tell me", "i want", "please"}
+    words = [w for w in query.lower().split() if w not in filler]
+    return " ".join(words[:20])  # cap at 20 words
+
 def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
     _, cursor = get_db()
     cursor.execute(
@@ -232,9 +244,20 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
 
     scored_facts = []
     if query and non_identity:
-        query_vec = _embed_vec(query)
+        expanded = _expand_query(query)
+        # Average embeddings of original + expanded query for better coverage
+        q1 = _embed_vec(query)
+        q2 = _embed_vec(expanded) if expanded != query.lower() else q1
+        query_vec = ((q1 + q2) / 2).astype(np.float32)
+        # Renormalize
+        norm = np.linalg.norm(query_vec)
+        if norm > 0:
+            query_vec = query_vec / norm
+
         for sim, key in faiss_search(str(user_id), query_vec, top_k=len(non_identity)):
             if key not in non_identity:
+                continue
+            if sim < MEMORY_SIMILARITY_THRESHOLD:
                 continue
             value, memory_type, updated_at, reinforcement = non_identity[key]
             scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement), key, value))
@@ -273,7 +296,14 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
 
     scored_facts = []
     if query and non_identity:
-        query_vec = _embed_vec(query)
+        expanded = _expand_query(query)
+        q1 = _embed_vec(query)
+        q2 = _embed_vec(expanded) if expanded != query.lower() else q1
+        query_vec = ((q1 + q2) / 2).astype(np.float32)
+        norm = np.linalg.norm(query_vec)
+        if norm > 0:
+            query_vec = query_vec / norm
+
         for sim, key in faiss_search(str(user_id), query_vec, top_k=len(non_identity)):
             if key not in non_identity:
                 continue
