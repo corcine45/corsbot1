@@ -30,7 +30,7 @@ print("✅ All environment variables loaded.")
 
 from core.db import get_db, get_thread_id, store_message, get_history
 from core.ai import (
-    ai_chat, get_mood, set_mood, get_current_mood,
+    ai_chat, get_mood, set_mood, get_current_mood, reset_mood,
     MOOD_PROMPTS, FALLBACK_RESPONSES, is_prompt_injection
 )
 from core.memory import (
@@ -169,6 +169,12 @@ async def slash_forget_all(interaction: discord.Interaction):
 async def slash_personality(interaction: discord.Interaction, mood: str):
     set_mood(str(interaction.user.id), mood)
     await interaction.response.send_message(f"Switched to **{mood}** mode. 🎭", ephemeral=True)
+
+
+@client.tree.command(name="reset", description="Reset personality to chill")
+async def slash_reset(interaction: discord.Interaction):
+    reset_mood(str(interaction.user.id))
+    await interaction.response.send_message("Reset to **chill** mode. ✨", ephemeral=True)
 
 
 @client.tree.command(name="stats", description="Show conversation and memory stats")

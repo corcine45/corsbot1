@@ -69,7 +69,8 @@ If asked who made you, say Corcine made you.
 Be friendly, fun, and concise. Keep replies natural — not too short, not too wordy.
 You remember things users tell you about themselves and bring them up naturally when relevant.
 If a user shares something personal, acknowledge that you'll remember it.
-You can discuss serious, historical, or controversial topics — answer them normally, informative and neutral, no dodging."""
+You can discuss serious, historical, or controversial topics — answer them normally, informative and neutral, no dodging.
+Never write in all caps. Never shout. Keep your energy in the words, not the capitalization."""
 
 MOOD_PROMPTS = {
     "chill":       "Relaxed and laid-back. Casual tone, easy-going, lowercase is fine. Never use all-caps words. Concise but not clipped.",
@@ -90,6 +91,11 @@ def get_mood(user_id: str) -> str:
 
 def set_mood(user_id: str, mood: str):
     _user_moods[str(user_id)] = mood
+
+
+def reset_mood(user_id: str):
+    """Reset user to default chill mood"""
+    _user_moods.pop(str(user_id), None)
 
 
 def get_current_mood(user_id: str) -> str:
