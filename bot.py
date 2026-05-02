@@ -358,6 +358,17 @@ async def on_message(message):
     memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content)
     relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
 
+    # If impersonating a mentioned user, fetch their memory and inject it
+    impersonation_context = ""
+    impersonate_keywords = ("pretend", "act as", "be ", "impersonate", "roleplay as", "talk like", "speak as")
+    lower_content = content.lower()
+    if any(kw in lower_content for kw in impersonate_keywords) and mentioned_users:
+        target_id = next(iter(mentioned_users))
+        target_name = mentioned_users[target_id]
+        target_memory = await loop.run_in_executor(executor, get_memory, target_id)
+        if target_memory:
+            impersonation_context = f"Facts about {target_name} to help you impersonate them:\n{target_memory}"
+
     # Web search if message needs real-time info
     web_context = ""
     if needs_web_search(content):
@@ -379,7 +390,7 @@ async def on_message(message):
         try:
             reply = await loop.run_in_executor(
                 executor, ai_chat, history, memory,
-                message.author.display_name, mood, relationships, web_context
+                message.author.display_name, mood, relationships, web_context, impersonation_context
             )
         except Exception as e:
             err = str(e)

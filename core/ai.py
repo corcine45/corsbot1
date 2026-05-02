@@ -107,7 +107,7 @@ def get_current_mood(user_id: str) -> str:
 
 # ---------------- CHAT ---------------- #
 
-def _build_system_prompt(username: str | None, mood: str, memory: str, relationships: str, web_context: str) -> str:
+def _build_system_prompt(username: str | None, mood: str, memory: str, relationships: str, web_context: str, impersonation_context: str = "") -> str:
     parts = [SYSTEM_PROMPT]
 
     if username:
@@ -116,7 +116,10 @@ def _build_system_prompt(username: str | None, mood: str, memory: str, relations
     parts.append(f"Current mood/tone: {MOOD_PROMPTS.get(mood, MOOD_PROMPTS['chill'])}")
 
     if memory:
-        parts.append(f"Known facts about this user:\n{memory}\nBring these up naturally when relevant.")
+        parts.append(f"Known facts about this user:\n{memory}\nOnly use these if directly relevant to the current topic.")
+
+    if impersonation_context:
+        parts.append(impersonation_context)
 
     if relationships:
         parts.append(
@@ -133,8 +136,8 @@ def _build_system_prompt(username: str | None, mood: str, memory: str, relations
     return "\n\n".join(parts)
 
 
-def ai_chat(history, memory, username=None, mood="chill", relationships="", web_context=""):
-    system = _build_system_prompt(username, mood, memory, relationships, web_context)
+def ai_chat(history, memory, username=None, mood="chill", relationships="", web_context="", impersonation_context=""):
+    system = _build_system_prompt(username, mood, memory, relationships, web_context, impersonation_context)
     messages = [{"role": "system", "content": system}] + history
 
     try:
