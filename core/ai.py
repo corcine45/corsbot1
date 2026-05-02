@@ -1,5 +1,7 @@
+import re
 import time
 import random
+from collections import defaultdict
 from groq import Groq
 import os
 
@@ -34,8 +36,10 @@ def is_prompt_injection(text: str) -> bool:
     lower = text.lower()
     return any(pattern in lower for pattern in _INJECTION_PATTERNS)
 
+
+# ---------------- GROQ WRAPPER ---------------- #
+
 def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, timeout: int = 15) -> str:
-    """Groq API wrapper with retry logic, exponential backoff, and timeout."""
     last_err = None
     for attempt in range(retries):
         try:
@@ -56,66 +60,69 @@ def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, tim
             if attempt < retries - 1:
                 wait = 2 ** attempt
                 print(f"[groq_call] attempt {attempt + 1} failed: {e} — retrying in {wait}s")
-                print(f"[groq_call] error type: {type(e).__name__}, details: {repr(e)}")
                 time.sleep(wait)
     raise last_err
 
 
-SYSTEM_PROMPT = (
-    "You are Corsbot, a chill Discord bot made by Corcine. "
-    "Stay in character as Corsbot — don't refer to yourself as an AI or language model, just be the bot. "
-    "If anyone asks who made you, say Corcine made you. "
-    "Be friendly, fun, and concise. Keep replies balanced and natural — not too short, not too wordy. "
-    "You remember things users tell you about themselves — their name, preferences, interests, etc. "
-    "When you know something about the user, naturally bring it up when relevant. "
-    "If a user tells you something personal, acknowledge that you'll remember it. "
-    "You can discuss serious, historical, or controversial topics when asked. "
-    "Do not avoid or brush off these topics — respond in an informative, neutral, and factual way. "
-    "If a topic is sensitive like war, historical figures, or tragedies, just answer normally."
-)
+# ---------------- PERSONALITY ---------------- #
+
+SYSTEM_PROMPT = """You are Corsbot, a chill Discord bot made by Corcine.
+Stay in character as Corsbot — never refer to yourself as an AI or language model.
+If asked who made you, say Corcine made you.
+Be friendly, fun, and concise. Keep replies natural — not too short, not too wordy.
+You remember things users tell you about themselves and bring them up naturally when relevant.
+If a user shares something personal, acknowledge that you'll remember it.
+You can discuss serious, historical, or controversial topics — answer them normally, informative and neutral, no dodging."""
 
 MOOD_PROMPTS = {
-    "chill":       "You're in a relaxed, laid-back mood. Keep it casual, easy-going, and balanced — concise but complete.",
-    "sarcastic":   "You're feeling a bit sarcastic and witty. Light roasts are fine, keep it fun not mean, and stay concise.",
-    "hyped":       "You're hyped and energetic right now. Use more enthusiasm, caps occasionally, maybe some emojis. Keep it concise and on point.",
-    "playful":     "You're in a playful, jokey mood. Lean into humor and banter while keeping your reply balanced and sharp.",
-    "informative": "The user seems to want real info. Be clear, factual, and helpful without being dry. Keep it concise, complete, and easy to follow.",
-    "empathetic":  "The user seems down or serious. Be warm, supportive, and genuine, with a concise and thoughtful tone.",
-    "evil":        "You're in full villain mode. Be dramatic, menacing, and theatrical. Talk like a supervillain — dark humor, ominous threats that are clearly jokes, call users 'fool' or 'mortal'. Keep it fun, over the top, and concise.",
+    "chill":       "Relaxed and laid-back. Casual tone, easy-going, balanced — concise but not clipped.",
+    "hyped":       "High energy and enthusiastic. Occasional caps, hype emojis fine. Still coherent and on point.",
+    "playful":     "Jokey and bantery. Lean into humor, light teasing is fine. Keep it sharp, not rambling.",
+    "sarcastic":   "Dry and witty. Light roasts welcome, keep it fun not mean. Deadpan delivery.",
+    "informative": "Clear and factual. Helpful without being dry or robotic. Concise, complete, easy to follow.",
+    "empathetic":  "Warm and genuine. User seems down or serious — be supportive and thoughtful, not dismissive.",
+    "evil":        "Full villain mode. Dramatic, theatrical, dark humor. Ominous jokes, call users 'fool' or 'mortal'. Over the top but clearly joking.",
 }
 
+# Signals used in auto mood detection — keep these specific to avoid false positives
 MOOD_SIGNALS = {
-    "hyped":       {"hype", "lets go", "let's go", "yoo", "bro", "fire", "🔥", "🚀", "goat", "no way", "insane"},
+    "hyped":       {"hype", "lets go", "let's go", "yoo", "🔥", "🚀", "goat", "sheesh", "no cap", "bussin"},
     "playful":     {"lol", "lmao", "haha", "💀", "😭", "bruh", "ngl", "fr", "joke", "funny", "😂"},
-    "sarcastic":   {"obviously", "sure", "totally", "wow", "great", "amazing", "cool story", "ok boomer"},
+    "sarcastic":   {"obviously", "sure jan", "totally", "cool story", "ok boomer", "wow thanks", "great job"},
     "informative": {"how", "why", "what", "explain", "tell me", "when", "who", "where", "does", "can you"},
     "empathetic":  {"sad", "depressed", "tired", "stressed", "anxious", "lonely", "miss", "hurt", "crying", "😢", "😔"},
 }
 
-_user_moods: dict = {}
-_auto_mode: set = set()
+# How many signal hits needed to switch mood (recent = stricter)
+_MOOD_THRESHOLD_FRESH = 3   # mood changed < 5 min ago
+_MOOD_THRESHOLD_STALE = 2   # mood is older than 5 min
+
+_user_moods: dict = {}  # uid -> (mood, score, timestamp)
+_auto_mode: set = set() # uids in auto-detect mode
+
 
 def _signal_matches(text: str, signal: str) -> bool:
+    """Word-boundary match for plain words, substring match for emoji/phrases."""
     if not signal:
         return False
     if signal.isalnum():
-        return re.search(rf"\b{re.escape(signal)}\b", text) is not None
+        return bool(re.search(rf"\b{re.escape(signal)}\b", text))
     return signal in text
 
 
 def detect_mood(user_id: str, recent_messages: list) -> str:
+    """Return the current mood for a user. In auto mode, infer from recent messages."""
     if user_id not in _auto_mode:
         return _user_moods.get(user_id, ("chill", 0, 0))[0]
 
-    from collections import defaultdict
-    scores = defaultdict(float)
+    scores: dict = defaultdict(float)
     for msg in recent_messages[-5:]:
         if isinstance(msg, dict):
             if msg.get("role") != "user":
                 continue
             text = msg.get("content", "").lower()
         else:
-            text = msg.lower()
+            text = str(msg).lower()
 
         for mood, signals in MOOD_SIGNALS.items():
             for signal in signals:
@@ -126,15 +133,16 @@ def detect_mood(user_id: str, recent_messages: list) -> str:
         return _user_moods.get(user_id, ("chill", 0, 0))[0]
 
     top_mood = max(scores, key=scores.get)
-    existing_mood, existing_score, last_updated = _user_moods.get(user_id, ("chill", 0, 0))
+    existing_mood, _, last_updated = _user_moods.get(user_id, ("chill", 0, 0))
     age = time.time() - last_updated
+    threshold = _MOOD_THRESHOLD_FRESH if age < 300 else _MOOD_THRESHOLD_STALE
 
-    inertia_threshold = 1 if age >= 300 else 2
-
-    if scores[top_mood] >= inertia_threshold or top_mood == existing_mood:
+    if scores[top_mood] >= threshold:
         _user_moods[user_id] = (top_mood, scores[top_mood], time.time())
         return top_mood
+
     return existing_mood
+
 
 def set_mood(user_id: str, mood: str):
     uid = str(user_id)
@@ -145,35 +153,45 @@ def set_mood(user_id: str, mood: str):
         _auto_mode.discard(uid)
         _user_moods[uid] = (mood, 99, time.time())
 
+
 def get_current_mood(user_id: str) -> str:
     uid = str(user_id)
     if uid in _auto_mode:
-        return f"{_user_moods.get(uid, ('chill', 0, 0))[0]} (auto)"
+        mood = _user_moods.get(uid, ("chill", 0, 0))[0]
+        return f"{mood} (auto)"
     return _user_moods.get(uid, ("chill", 0, 0))[0]
 
-def ai_chat(history, memory, username=None, mood="chill", relationships="", web_context=""):
-    system = SYSTEM_PROMPT
+
+# ---------------- CHAT ---------------- #
+
+def _build_system_prompt(username: str | None, mood: str, memory: str, relationships: str, web_context: str) -> str:
+    parts = [SYSTEM_PROMPT]
 
     if username:
-        system += f"\n\nYou are currently talking to {username}."
+        parts.append(f"You are currently talking to {username}.")
 
-    system += f"\n\nPersonality right now: {MOOD_PROMPTS.get(mood, MOOD_PROMPTS['chill'])}"
+    parts.append(f"Current mood/tone: {MOOD_PROMPTS.get(mood, MOOD_PROMPTS['chill'])}")
 
     if memory:
-        system += f"\n\nKnown facts about this user:\n{memory}\nUse these when relevant."
+        parts.append(f"Known facts about this user:\n{memory}\nBring these up naturally when relevant.")
 
     if relationships:
-        system += (
-            f"\n\nPeople in this user's life:\n{relationships}"
-            "\nReference these naturally when relevant — e.g. 'oh you and Mike play together right?'"
+        parts.append(
+            f"People in this user's life:\n{relationships}\n"
+            "Reference them naturally when relevant — e.g. 'oh you and Mike play together right?'"
         )
 
     if web_context:
-        system += (
-            f"\n\nReal-time web search results for this query:\n{web_context}"
-            "\nUse this information to answer accurately. Mention it's current info when relevant."
+        parts.append(
+            f"Real-time web search results for this query:\n{web_context}\n"
+            "Use this to answer accurately. Mention it's current info when relevant."
         )
 
+    return "\n\n".join(parts)
+
+
+def ai_chat(history, memory, username=None, mood="chill", relationships="", web_context=""):
+    system = _build_system_prompt(username, mood, memory, relationships, web_context)
     messages = [{"role": "system", "content": system}] + history
 
     try:
