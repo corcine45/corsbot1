@@ -215,15 +215,12 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
     for key, value, memory_type, updated_at, reinforcement in rows:
         fact_lookup[key] = (value, memory_type or "preference", updated_at, reinforcement or 1)
 
-    identity_facts, non_identity = [], {}
+    non_identity = {}
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue
-        if memory_type == "identity":
-            identity_facts.append((key, value))
-        else:
-            non_identity[key] = (value, memory_type, updated_at, reinforcement)
+        non_identity[key] = (value, memory_type, updated_at, reinforcement)
 
     scored_facts = []
     if query and non_identity:
@@ -238,8 +235,7 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
 
     scored_facts.sort(reverse=True)
-    result = [f"{k}={v}" for k, v in identity_facts]
-    result += [f"{k}={v}" for _, k, v in scored_facts[:top_k - len(result)]]
+    result = [f"{k}={v}" for _, k, v in scored_facts[:top_k]]
     return "\n".join(result)
 
 
@@ -265,7 +261,7 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
         if half_life and (now - updated_at) > half_life * 3:
             continue
         if memory_type == "identity":
-            identity_facts.append((key, value))
+            non_identity[key] = (value, memory_type, updated_at, reinforcement)  # treat identity same as others
         else:
             non_identity[key] = (value, memory_type, updated_at, reinforcement)
 
@@ -282,12 +278,10 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
 
     scored_facts.sort(reverse=True)
-    identity_keys = [k for k, _ in identity_facts]
-    top_scored = scored_facts[:top_k - len(identity_facts)]
-    active_keys = identity_keys + [k for _, k, _ in top_scored]
+    top_scored = scored_facts[:top_k]
+    active_keys = [k for _, k, _ in top_scored]
 
-    result = [f"{k}={v}" for k, v in identity_facts]
-    result += [f"{k}={v}" for _, k, v in top_scored]
+    result = [f"{k}={v}" for _, k, v in top_scored]
     return "\n".join(result), active_keys
 
 def store_user_name(user_id, display_name):
