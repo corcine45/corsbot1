@@ -394,12 +394,13 @@ async def on_message(message):
 
     history = await loop.run_in_executor(executor, get_history, thread_id)
     mood = get_mood(uid_str)
+    channel_name = message.channel.name if hasattr(message.channel, "name") else "dm"
 
     async with message.channel.typing():
         try:
             reply = await loop.run_in_executor(
                 executor, ai_chat, history, memory,
-                message.author.display_name, mood, relationships, web_context, impersonation_context
+                message.author.display_name, mood, relationships, web_context, impersonation_context, channel_name
             )
         except Exception as e:
             err = str(e)

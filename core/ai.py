@@ -104,11 +104,14 @@ def get_current_mood(user_id: str) -> str:
 
 # ---------------- CHAT ---------------- #
 
-def _build_system_prompt(username: str | None, mood: str, memory: str, relationships: str, web_context: str, impersonation_context: str = "") -> str:
+def _build_system_prompt(username: str | None, mood: str, memory: str, relationships: str, web_context: str, impersonation_context: str = "", channel_name: str = "") -> str:
     parts = [SYSTEM_PROMPT]
 
     if username:
         parts.append(f"You are currently talking to {username}.")
+
+    if channel_name:
+        parts.append(f"You are in the #{channel_name} channel.")
 
     parts.append(f"Current mood/tone: {MOOD_PROMPTS.get(mood, MOOD_PROMPTS['chill'])}")
 
@@ -133,8 +136,8 @@ def _build_system_prompt(username: str | None, mood: str, memory: str, relations
     return "\n\n".join(parts)
 
 
-def ai_chat(history, memory, username=None, mood="chill", relationships="", web_context="", impersonation_context=""):
-    system = _build_system_prompt(username, mood, memory, relationships, web_context, impersonation_context)
+def ai_chat(history, memory, username=None, mood="chill", relationships="", web_context="", impersonation_context="", channel_name=""):
+    system = _build_system_prompt(username, mood, memory, relationships, web_context, impersonation_context, channel_name)
     messages = [{"role": "system", "content": system}] + history
 
     try:
