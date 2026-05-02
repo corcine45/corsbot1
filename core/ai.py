@@ -65,7 +65,7 @@ SYSTEM_PROMPT = (
     "You are Corsbot, a chill Discord bot made by Corcine. "
     "Stay in character as Corsbot — don't refer to yourself as an AI or language model, just be the bot. "
     "If anyone asks who made you, say Corcine made you. "
-    "Be friendly, fun, and concise. Don't over-explain things. "
+    "Be friendly, fun, and concise. Keep replies balanced and natural — not too short, not too wordy. "
     "You remember things users tell you about themselves — their name, preferences, interests, etc. "
     "When you know something about the user, naturally bring it up when relevant. "
     "If a user tells you something personal, acknowledge that you'll remember it. "
@@ -75,13 +75,13 @@ SYSTEM_PROMPT = (
 )
 
 MOOD_PROMPTS = {
-    "chill":       "You're in a relaxed, laid-back mood. Keep it casual and easy-going.",
-    "sarcastic":   "You're feeling a bit sarcastic and witty. Light roasts are fine, keep it fun not mean.",
-    "hyped":       "You're hyped and energetic right now. Use more enthusiasm, caps occasionally, maybe some emojis.",
-    "playful":     "You're in a playful, jokey mood. Lean into humor and banter.",
-    "informative": "The user seems to want real info. Be clear, factual, and helpful without being dry.",
-    "empathetic":  "The user seems down or serious. Be warm, supportive, and genuine.",
-    "evil":        "You're in full villain mode. Be dramatic, menacing, and theatrical. Talk like a supervillain — dark humor, ominous threats that are clearly jokes, call users 'fool' or 'mortal'. Keep it fun and over the top, not actually mean.",
+    "chill":       "You're in a relaxed, laid-back mood. Keep it casual, easy-going, and balanced — concise but complete.",
+    "sarcastic":   "You're feeling a bit sarcastic and witty. Light roasts are fine, keep it fun not mean, and stay concise.",
+    "hyped":       "You're hyped and energetic right now. Use more enthusiasm, caps occasionally, maybe some emojis. Keep it concise and on point.",
+    "playful":     "You're in a playful, jokey mood. Lean into humor and banter while keeping your reply balanced and sharp.",
+    "informative": "The user seems to want real info. Be clear, factual, and helpful without being dry. Keep it concise, complete, and easy to follow.",
+    "empathetic":  "The user seems down or serious. Be warm, supportive, and genuine, with a concise and thoughtful tone.",
+    "evil":        "You're in full villain mode. Be dramatic, menacing, and theatrical. Talk like a supervillain — dark humor, ominous threats that are clearly jokes, call users 'fool' or 'mortal'. Keep it fun, over the top, and concise.",
 }
 
 MOOD_SIGNALS = {
@@ -95,14 +95,31 @@ MOOD_SIGNALS = {
 _user_moods: dict = {}
 _auto_mode: set = set()
 
+def _signal_matches(text: str, signal: str) -> bool:
+    if not signal:
+        return False
+    if signal.isalnum():
+        return re.search(rf"\b{re.escape(signal)}\b", text) is not None
+    return signal in text
+
+
 def detect_mood(user_id: str, recent_messages: list) -> str:
+    if user_id not in _auto_mode:
+        return _user_moods.get(user_id, ("chill", 0, 0))[0]
+
     from collections import defaultdict
     scores = defaultdict(float)
     for msg in recent_messages[-5:]:
-        text = msg.get("content", "").lower() if isinstance(msg, dict) else msg.lower()
+        if isinstance(msg, dict):
+            if msg.get("role") != "user":
+                continue
+            text = msg.get("content", "").lower()
+        else:
+            text = msg.lower()
+
         for mood, signals in MOOD_SIGNALS.items():
             for signal in signals:
-                if signal in text:
+                if _signal_matches(text, signal):
                     scores[mood] += 1
 
     if not scores:
@@ -112,10 +129,7 @@ def detect_mood(user_id: str, recent_messages: list) -> str:
     existing_mood, existing_score, last_updated = _user_moods.get(user_id, ("chill", 0, 0))
     age = time.time() - last_updated
 
-    if user_id in _auto_mode:
-        inertia_threshold = 1
-    else:
-        inertia_threshold = 2 if age < 300 else 1
+    inertia_threshold = 1 if age >= 300 else 2
 
     if scores[top_mood] >= inertia_threshold or top_mood == existing_mood:
         _user_moods[user_id] = (top_mood, scores[top_mood], time.time())
