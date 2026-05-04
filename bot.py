@@ -258,8 +258,9 @@ async def slash_forget_all(interaction: discord.Interaction):
     user_id = interaction.user.id
     conn, cursor = get_db()
     cursor.execute("DELETE FROM memory WHERE user_id=?", (str(user_id),))
+    cursor.execute("DELETE FROM relationships WHERE user_id=?", (str(user_id),))
     conn.commit()
-    await interaction.response.send_message("Cleared all your memories. Fresh start. 🧹", ephemeral=True)
+    await interaction.response.send_message("Cleared all your memories and relationships. Fresh start. 🧹", ephemeral=True)
 
 
 @client.tree.command(name="stats", description="Show conversation and memory stats")
@@ -517,7 +518,14 @@ async def on_message(message):
         await loop.run_in_executor(executor, extract_relationships, message.author.id, attributed_content)
 
     memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content, 3)
-    relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
+
+    # Only send relationships if the user is explicitly asking about someone
+    relationship_triggers = ("who is", "tell me about", "what about", "how is", "where is", "what's with")
+    content_lower = content.lower()
+    if any(t in content_lower for t in relationship_triggers):
+        relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
+    else:
+        relationships = ""
 
     # If impersonating a mentioned user, fetch their memory and skip the requester's memory
     impersonation_context = ""
