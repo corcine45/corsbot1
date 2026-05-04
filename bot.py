@@ -49,7 +49,7 @@ from core.feedback import (
 # ---------------- CONFIG ---------------- #
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-HISTORY_LIMIT = 20
+HISTORY_LIMIT = 30
 COOLDOWN_SECONDS = 3
 RESPONSE_CACHE_TTL = 300
 _RESPONSE_CACHE: dict[str, tuple[str, float]] = {}
