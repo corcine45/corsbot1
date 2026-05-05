@@ -572,9 +572,9 @@ async def on_message(message):
         memory = ""
         active_keys = []
 
-    # Web search if message needs real-time info
+    # Web search if message needs real-time info — skip if message is about a mentioned user
     web_context = ""
-    if needs_web_search(content):
+    if needs_web_search(content) and not mentioned_users:
         query = build_search_query(content)
         web_context = await loop.run_in_executor(executor, web_search, query) or ""
         if web_context:
