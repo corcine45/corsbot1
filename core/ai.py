@@ -1,9 +1,12 @@
 import random
 import time
+import logging
 from groq import Groq
 import os
 
-AI_MODEL = os.getenv("AI_MODEL") or "meta-llama/llama-4-maverick-17b-128e-instruct"
+log = logging.getLogger("corsbot.ai")
+
+AI_MODEL = os.getenv("AI_MODEL") or "llama-3.3-70b-versatile"
 MAX_HISTORY_MESSAGES = 30
 MAX_MESSAGE_CHARS = 900
 MAX_MEMORY_CHARS = 2000
@@ -74,7 +77,7 @@ def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, tim
                 raise
             if attempt < retries - 1:
                 wait = 2 ** attempt
-                print(f"[groq_call] attempt {attempt + 1} failed: {e} — retrying in {wait}s")
+                log.warning(f"groq_call attempt {attempt + 1} failed: {type(e).__name__}: {e} — retrying in {wait}s")
                 time.sleep(wait)
     raise last_err
 
@@ -146,5 +149,5 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
         err_str = str(e)
         if "429" in err_str or "rate_limit" in err_str.lower():
             raise
-        print(f"[ai_chat failed] {e}")
+        log.error(f"ai_chat failed: {type(e).__name__}: {e}")
         return random.choice(FALLBACK_RESPONSES)

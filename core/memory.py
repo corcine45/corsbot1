@@ -2,11 +2,14 @@ import sqlite3
 import threading
 import time
 import os
+import logging
 import pickle
 import numpy as np
 import faiss
 from functools import lru_cache
 from sentence_transformers import SentenceTransformer
+
+log = logging.getLogger("corsbot.memory")
 
 from .db import get_db, DATA_DIR
 from .ai import groq_call
@@ -16,7 +19,7 @@ from .ai import groq_call
 print("Loading embedding model...")
 embedder = SentenceTransformer("all-mpnet-base-v2")
 EMBED_DIM = 768
-print("Embedding model ready.")
+log.info("Embedding model ready.")
 
 @lru_cache(maxsize=512)
 def _embed_vec(text: str) -> np.ndarray:
@@ -42,20 +45,20 @@ def _faiss_load():
             idx = faiss.read_index(FAISS_INDEX_PATH)
             # If dimension changed (e.g. model upgrade), rebuild
             if idx.d != EMBED_DIM:
-                print(f"[faiss] dimension mismatch ({idx.d} vs {EMBED_DIM}) — rebuilding")
+                log.warning(f"[faiss] dimension mismatch ({idx.d} vs {EMBED_DIM}) — rebuilding")
                 raise ValueError("dimension mismatch")
             _faiss_index = idx
             with open(FAISS_MAP_PATH, "rb") as f:
                 _faiss_map = pickle.load(f)
             _faiss_reverse = {v: k for k, v in _faiss_map.items()}
-            print(f"[faiss] loaded {_faiss_index.ntotal} vectors")
+            log.info(f"[faiss] loaded {_faiss_index.ntotal} vectors")
             return
         except Exception as e:
-            print(f"[faiss] failed to load: {e} — rebuilding")
+            log.error(f"[faiss] failed to load: {e} — rebuilding")
     _faiss_index = faiss.IndexFlatIP(EMBED_DIM)
     _faiss_map = {}
     _faiss_reverse = {}
-    print("[faiss] created fresh index")
+    log.info("[faiss] created fresh index")
 
 def _faiss_save():
     faiss.write_index(_faiss_index, FAISS_INDEX_PATH)
@@ -108,11 +111,11 @@ def faiss_rebuild_from_db():
     missing = [(uid, k, v) for uid, k, v in rows if f"{uid}:{k}" not in _faiss_reverse]
     if not missing:
         return
-    print(f"[faiss] indexing {len(missing)} missing facts...")
+    log.info(f"[faiss] indexing {len(missing)} missing facts...")
     for uid, key, value in missing:
         vec = _embed_vec(f"{key}: {value}")
         faiss_upsert(uid, key, vec)
-    print("[faiss] rebuild complete")
+    log.info("[faiss] rebuild complete")
 
 # Init on import
 _faiss_load()
@@ -152,9 +155,9 @@ def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> flo
 
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
-MEMORY_EXTRACT_EVERY = 3
-MEMORY_SIMILARITY_THRESHOLD = 0.80
-MAX_MEMORY_FACTS = 3
+MEMORY_EXTRACT_EVERY = 1
+MEMORY_SIMILARITY_THRESHOLD = 0.55
+MAX_MEMORY_FACTS = 6
 _msg_counter: dict = {}
 
 def should_extract(user_id: str) -> bool:
@@ -168,7 +171,7 @@ def extract_memory(user_id, message):
         return
     try:
         output = groq_call(
-            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
             [
                 {"role": "system", "content": (
                     "Extract facts about the user from their message. "
@@ -210,7 +213,7 @@ def extract_memory(user_id, message):
             faiss_upsert(str(user_id), key, vec)
         conn.commit()
     except Exception as e:
-        print(f"[memory extract error] {e}")
+        log.error(f"memory extract error: {type(e).__name__}: {e}")
 
 def _expand_query(query: str) -> str:
     """Expand query with key intent words for better semantic matching."""
@@ -349,7 +352,7 @@ def extract_relationships(user_id, message):
         return
     try:
         output = groq_call(
-            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
             [
                 {"role": "system", "content": (
                     "Extract relationships the user mentions about people in their life. "
@@ -388,7 +391,7 @@ def extract_relationships(user_id, message):
             )
         conn.commit()
     except Exception as e:
-        print(f"[relationship extract error] {e}")
+        log.error(f"relationship extract error: {type(e).__name__}: {e}")
 
 def get_relationships(user_id, top_k: int = 6) -> str:
     _, cursor = get_db()

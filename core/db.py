@@ -169,7 +169,7 @@ def get_db():
 
 
 def get_thread_id(user_id, guild_id=None, channel_id=None, is_dm=False):
-    return f"dm:{user_id}" if is_dm else f"guild:{guild_id}"
+    return f"dm:{user_id}" if is_dm else f"guild:{guild_id}:channel:{channel_id}:user:{user_id}"
 
 
 def store_message(thread_id, role, content):

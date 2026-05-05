@@ -30,7 +30,7 @@ def search_gif_tenor(query: str):
         return None
 
 def search_gif(query: str):
-    """Search Giphy first, fall back to Tenor."""
+    """Search Giphy first, fall back to Tenor. No HEAD ping — just return first valid URL."""
     try:
         res = requests.get(
             "https://api.giphy.com/v1/gifs/search",
@@ -45,15 +45,10 @@ def search_gif(query: str):
         data = res.json().get("data", [])
         if data:
             random.shuffle(data)
-            for gif in data:
+            for gif in data[:5]:
                 url = gif["images"]["downsized"]["url"]
                 if url and url.startswith("https"):
-                    try:
-                        head = requests.head(url, timeout=3)
-                        if head.status_code == 200:
-                            return url
-                    except:
-                        continue
+                    return url
     except:
         pass
     return search_gif_tenor(query)

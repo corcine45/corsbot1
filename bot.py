@@ -4,6 +4,7 @@ import aiohttp
 import asyncio
 import base64
 import hashlib
+import logging
 import re
 import random
 import time
@@ -13,6 +14,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+log = logging.getLogger("corsbot")
 
 # ---------------- ENV VALIDATION ---------------- #
 
@@ -412,6 +420,22 @@ async def slash_dashboard(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+@client.tree.command(name="reset", description="Clear your conversation history with Corsbot")
+async def slash_reset(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    is_dm = isinstance(interaction.channel, discord.DMChannel)
+    thread_id = get_thread_id(
+        user_id,
+        interaction.guild_id if interaction.guild else None,
+        interaction.channel_id,
+        is_dm,
+    )
+    conn, cursor = get_db()
+    cursor.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
+    conn.commit()
+    await interaction.response.send_message("fresh start 🧹 i remember nothing from this chat", ephemeral=True)
+
+
 @client.tree.command(name="help", description="Show all Corsbot commands")
 async def slash_help(interaction: discord.Interaction):
     lines = [
@@ -419,6 +443,7 @@ async def slash_help(interaction: discord.Interaction):
         "`/memory` — see everything I know about you",
         "`/forget <key>` — delete a specific memory",
         "`/forgetall` — wipe all your memories",
+        "`/reset` — clear your conversation history",
         "`/stats` — conversation and memory stats",
         "`/dashboard` — show activity dashboard",
         "`/relationships` — see who I know about in your life",
@@ -606,6 +631,21 @@ async def on_message(message):
     gif_url, emotion = await loop.run_in_executor(executor, pick_gif_for_message, content, reply)
 
     await send_reply(message.channel, f"<@{message.author.id}> {reply}")
+
+    # React to the user's message with an emoji based on detected emotion
+    REACTION_MAP = {
+        "laugh":     "😂",
+        "sad":       "😔",
+        "shock":     "😱",
+        "angry":     "😤",
+        "celebrate": "🎉",
+        "happy":     "🥰",
+    }
+    if emotion and emotion in REACTION_MAP:
+        try:
+            await message.add_reaction(REACTION_MAP[emotion])
+        except:
+            pass
 
     if gif_url:
         await message.channel.send(gif_url)
