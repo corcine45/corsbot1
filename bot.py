@@ -557,7 +557,17 @@ async def on_message(message):
             "who declared", "who said they", "who called themselves",
             "who is da", "who da king", "who da boss", "who da goat",
             "who holds", "who owns", "who got the title", "who is titled",
-            "who is known as", "who goes by",
+            "who is known as", "who goes by", "who is called",
+            "who is the king", "who is the boss", "who is the goat",
+            "who is the lord", "who is the queen", "who is the legend",
+            "who is the god", "who is the one", "who is the real",
+            "who is the true", "who is the best", "who is the top",
+            "who is the strongest", "who is the greatest", "who is the og",
+            "who is the main", "who is the head", "who is the leader",
+            "who is the master", "who is the champion", "who is the king of",
+            "who is the lord of", "who is the god of", "who is the ruler",
+            "who got", "who has the", "who earned", "who claimed",
+            "who is number one", "who is #1", "who is no 1",
         )
         if any(t in content_lower for t in title_triggers):
             cross_user = await loop.run_in_executor(executor, search_memory_by_value, content)
