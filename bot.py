@@ -550,11 +550,19 @@ async def on_message(message):
     content_lower = content.lower()
     if any(t in content_lower for t in relationship_triggers):
         relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
-        # Also search across all users' memory for cross-user facts (e.g. "who is king of aura")
-        cross_user = await loop.run_in_executor(executor, search_memory_by_value, content)
-        if cross_user:
-            relationships = (relationships + "\n" + cross_user).strip()
-    else:
+        # Cross-user title search — only for specific title/nickname queries
+        title_triggers = (
+            "who is the", "who is king", "who is lord", "who is boss",
+            "who is queen", "who is god", "who is goat", "who is legend",
+            "who declared", "who said they", "who called themselves",
+            "who is da", "who da king", "who da boss", "who da goat",
+            "who holds", "who owns", "who got the title", "who is titled",
+            "who is known as", "who goes by",
+        )
+        if any(t in content_lower for t in title_triggers):
+            cross_user = await loop.run_in_executor(executor, search_memory_by_value, content)
+            if cross_user:
+                relationships = (relationships + "\n" + cross_user).strip()
     else:
         relationships = ""
 
