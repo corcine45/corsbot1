@@ -156,7 +156,7 @@ def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> flo
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
 MEMORY_EXTRACT_EVERY = 1
-MEMORY_SIMILARITY_THRESHOLD = 0.55
+MEMORY_SIMILARITY_THRESHOLD = 0.35
 MAX_MEMORY_FACTS = 6
 _msg_counter: dict = {}
 
@@ -176,7 +176,8 @@ def extract_memory(user_id, message):
                 {"role": "system", "content": (
                     "Extract facts about the user from their message. "
                     "Reply in key=value format, one per line. "
-                    "Use snake_case keys like: name, age, location, likes, dislikes, favorite_game, job, mood, currently, etc. "
+                    "Use snake_case keys like: name, age, location, likes, dislikes, favorite_game, job, mood, currently, nickname, title, etc. "
+                    "Also capture self-given titles or nicknames (e.g. if they say 'call me king of aura', store title=king of aura). "
                     "Only extract clear personal facts explicitly stated. If none, reply: NONE"
                 )},
                 {"role": "user", "content": message}
@@ -409,4 +410,44 @@ def get_relationships(user_id, top_k: int = 6) -> str:
         if context:
             line += f" — {context}"
         lines.append(line)
+    return "\n".join(lines)
+
+def search_memory_by_value(query: str, top_k: int = 5) -> str:
+    """Search across ALL users' memory for a value matching the query.
+    Used for 'who is X' type questions. Returns clear attribution."""
+    _, cursor = get_db()
+    cursor.execute("SELECT user_id, key, value FROM memory")
+    rows = cursor.fetchall()
+    if not rows or not query:
+        return ""
+
+    query_vec = _embed_vec(query)
+    scored = []
+    for user_id, key, value in rows:
+        fact_text = f"{key}: {value}"
+        fact_vec = _embed_vec(fact_text)
+        sim = float(np.dot(query_vec, fact_vec))
+        if sim > 0.4:
+            scored.append((sim, user_id, key, value))
+
+    scored.sort(reverse=True)
+    if not scored:
+        return ""
+
+    lines = []
+    seen_users = set()
+    for sim, uid, key, value in scored[:top_k]:
+        cursor.execute(
+            "SELECT value FROM memory WHERE user_id=? AND key='display_name'",
+            (uid,)
+        )
+        name_row = cursor.fetchone()
+        username = name_row[0] if name_row else f"user:{uid}"
+
+        if uid in seen_users:
+            continue
+        seen_users.add(uid)
+
+        lines.append(f"{username} (user_id:{uid}) declared: {key}={value}")
+
     return "\n".join(lines)

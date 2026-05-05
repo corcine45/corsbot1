@@ -44,7 +44,8 @@ from core.db import get_db, get_thread_id, store_message, get_history
 from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, groq_call
 from core.memory import (
     extract_memory, get_memory, get_memory_with_keys, store_user_name,
-    extract_relationships, get_relationships, should_extract
+    extract_relationships, get_relationships, should_extract,
+    search_memory_by_value
 )
 from core.emotion import pick_gif_for_message
 from core.search import needs_web_search, web_search, build_search_query
@@ -549,6 +550,11 @@ async def on_message(message):
     content_lower = content.lower()
     if any(t in content_lower for t in relationship_triggers):
         relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
+        # Also search across all users' memory for cross-user facts (e.g. "who is king of aura")
+        cross_user = await loop.run_in_executor(executor, search_memory_by_value, content)
+        if cross_user:
+            relationships = (relationships + "\n" + cross_user).strip()
+    else:
     else:
         relationships = ""
 
