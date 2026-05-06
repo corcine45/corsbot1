@@ -177,7 +177,8 @@ def extract_memory(user_id, message):
                     "Extract facts about the user from their message. "
                     "Reply in key=value format, one per line. "
                     "Use snake_case keys like: name, age, location, likes, dislikes, favorite_game, job, mood, currently, nickname, title, etc. "
-                    "Also capture self-given titles or nicknames (e.g. if they say 'call me king of aura', store title=king of aura). "
+                    "Also capture self-given titles or nicknames — if they say 'call me X', 'I am X', 'I'm the X', 'refer to me as X', store title=X or nickname=X. "
+                    "If they say 'call me king of aura', store title=king of aura. "
                     "Only extract clear personal facts explicitly stated. If none, reply: NONE"
                 )},
                 {"role": "user", "content": message}
@@ -326,8 +327,12 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
     result = [f"{k}={v}" for _, k, v in top_scored]
     return "\n".join(result), active_keys
 
-def store_user_name(user_id, display_name):
+def store_user_name(user_id, display_name, username=None, guild_nick=None):
+    """Store all name variants for a user for better identification."""
     conn, cursor = get_db()
+    now = time.time()
+
+    # Always store display_name
     vec = _embed_vec(f"display_name: {display_name}")
     cursor.execute(
         """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
@@ -335,10 +340,37 @@ def store_user_name(user_id, display_name):
            ON CONFLICT(user_id, key) DO UPDATE SET
                value=excluded.value, updated_at=excluded.updated_at,
                embedding=excluded.embedding, memory_type='identity'""",
-        (str(user_id), display_name, time.time(), vec.tobytes()),
+        (str(user_id), display_name, now, vec.tobytes()),
     )
-    conn.commit()
     faiss_upsert(str(user_id), "display_name", vec)
+
+    # Store username (the @handle) if provided
+    if username:
+        vec2 = _embed_vec(f"username: {username}")
+        cursor.execute(
+            """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
+               VALUES (?, 'username', ?, ?, ?, 'identity', 1)
+               ON CONFLICT(user_id, key) DO UPDATE SET
+                   value=excluded.value, updated_at=excluded.updated_at,
+                   embedding=excluded.embedding, memory_type='identity'""",
+            (str(user_id), username, now, vec2.tobytes()),
+        )
+        faiss_upsert(str(user_id), "username", vec2)
+
+    # Store server nickname if different from display name
+    if guild_nick and guild_nick != display_name:
+        vec3 = _embed_vec(f"server_nickname: {guild_nick}")
+        cursor.execute(
+            """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
+               VALUES (?, 'server_nickname', ?, ?, ?, 'identity', 1)
+               ON CONFLICT(user_id, key) DO UPDATE SET
+                   value=excluded.value, updated_at=excluded.updated_at,
+                   embedding=excluded.embedding, memory_type='identity'""",
+            (str(user_id), guild_nick, now, vec3.tobytes()),
+        )
+        faiss_upsert(str(user_id), "server_nickname", vec3)
+
+    conn.commit()
 
 # ---------------- RELATIONSHIPS ---------------- #
 
@@ -427,7 +459,7 @@ def search_memory_by_value(query: str, top_k: int = 5) -> str:
         fact_text = f"{key}: {value}"
         fact_vec = _embed_vec(fact_text)
         sim = float(np.dot(query_vec, fact_vec))
-        if sim > 0.4:
+        if sim > 0.3:
             scored.append((sim, user_id, key, value))
 
     scored.sort(reverse=True)
@@ -451,3 +483,31 @@ def search_memory_by_value(query: str, top_k: int = 5) -> str:
         lines.append(f"{username} (user_id:{uid}) declared: {key}={value}")
 
     return "\n".join(lines)
+
+def _extract_facts_about(user_id: int, message: str) -> str:
+    """Extract facts claimed about a mentioned user by someone else.
+    Returns the raw claim text for confirmation, or empty string if nothing found."""
+    if len(message.split()) < 3:
+        return ""
+    try:
+        output = groq_call(
+            "llama-3.1-8b-instant",
+            [
+                {"role": "system", "content": (
+                    "Someone is making a claim about another person in this message. "
+                    "Extract only the factual claims being made about the mentioned person (not the speaker). "
+                    "Reply with a short plain-English summary of what's being claimed about them. "
+                    "Example: 'is funny, plays Valorant' or 'is the king of aura'. "
+                    "If no clear claims about another person, reply: NONE"
+                )},
+                {"role": "user", "content": message}
+            ],
+            max_tokens=60, retries=1, timeout=8,
+        )
+        result = output.strip()
+        if result.upper() == "NONE" or not result:
+            return ""
+        return result
+    except Exception as e:
+        log.error(f"_extract_facts_about error: {e}")
+        return ""

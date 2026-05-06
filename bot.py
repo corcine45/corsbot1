@@ -45,9 +45,40 @@ from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, groq_call
 from core.memory import (
     extract_memory, get_memory, get_memory_with_keys, store_user_name,
     extract_relationships, get_relationships, should_extract,
-    search_memory_by_value
+    search_memory_by_value, _extract_facts_about
 )
 from core.emotion import pick_gif_for_message
+
+# ---------------- PENDING CONFIRMATIONS ---------------- #
+# Stores facts waiting for the mentioned user to confirm
+# {message_id: {uid, facts_text, claimer_name}}
+_pending_confirmations: dict = {}
+
+class FactConfirmView(discord.ui.View):
+    def __init__(self, uid: int, facts: str, claimer: str):
+        super().__init__(timeout=300)  # 5 min to respond
+        self.uid = uid
+        self.facts = facts
+        self.claimer = claimer
+
+    @discord.ui.button(label="✅ That's true", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This isn't for you.", ephemeral=True)
+            return
+        from core.memory import extract_memory
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, extract_memory, self.uid, self.facts)
+        await interaction.response.send_message(f"<@{self.uid}> confirmed: **{self.facts}** ✅")
+        self.stop()
+
+    @discord.ui.button(label="❌ That's false", style=discord.ButtonStyle.red)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This isn't for you.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"<@{self.uid}> denied that. ❌")
+        self.stop()
 from core.search import needs_web_search, web_search, build_search_query
 from core.feedback import (
     store_last_reply, get_last_reply, store_feedback,
@@ -530,6 +561,16 @@ async def on_message(message):
     attributed_content = f"[{message.author.display_name}]: {content}"
     await loop.run_in_executor(executor, store_message, thread_id, "user", attributed_content)
 
+    # Store sender's full identity — display name, username, and server nickname
+    guild_nick = message.author.nick if hasattr(message.author, "nick") else None
+    await loop.run_in_executor(
+        executor, store_user_name,
+        message.author.id,
+        message.author.display_name,
+        message.author.name,
+        guild_nick
+    )
+
     # Quick replies
     quick = get_quick_reply(content)
     if quick:
@@ -546,18 +587,22 @@ async def on_message(message):
     memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content, 3)
 
     # Only send relationships if the user is explicitly asking about someone
-    relationship_triggers = ("who is", "tell me about", "what about", "how is", "where is", "what's with")
+    relationship_triggers = (
+        "who is", "tell me about", "what about", "how is", "where is",
+        "what's with", "who's", "whos", "do you know", "what do you know about",
+        "anything about", "info on", "info about", "what can you tell me about",
+        "who tf is", "who da hell is", "who the hell is", "who are they",
+        "what's their deal", "whats their deal", "who even is",
+    )
     content_lower = content.lower()
     if any(t in content_lower for t in relationship_triggers):
         relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
         # Cross-user title search — only for specific title/nickname queries
         title_triggers = (
+            # "who is the X"
             "who is the", "who is king", "who is lord", "who is boss",
             "who is queen", "who is god", "who is goat", "who is legend",
-            "who declared", "who said they", "who called themselves",
-            "who is da", "who da king", "who da boss", "who da goat",
-            "who holds", "who owns", "who got the title", "who is titled",
-            "who is known as", "who goes by", "who is called",
+            "who is da", "who is number one", "who is #1", "who is no 1",
             "who is the king", "who is the boss", "who is the goat",
             "who is the lord", "who is the queen", "who is the legend",
             "who is the god", "who is the one", "who is the real",
@@ -566,8 +611,19 @@ async def on_message(message):
             "who is the main", "who is the head", "who is the leader",
             "who is the master", "who is the champion", "who is the king of",
             "who is the lord of", "who is the god of", "who is the ruler",
+            # "who da X"
+            "who da king", "who da boss", "who da goat", "who da god",
+            "who da best", "who da real", "who da one", "who da legend",
+            "who da lord", "who da queen", "who da top", "who da og",
+            # declarations/claims
+            "who declared", "who said they", "who called themselves",
+            "who holds", "who owns", "who got the title", "who is titled",
+            "who is known as", "who goes by", "who is called",
             "who got", "who has the", "who earned", "who claimed",
-            "who is number one", "who is #1", "who is no 1",
+            # bisaya/informal
+            "kinsa ang", "kinsa si", "kinsa ang king", "kinsa ang boss",
+            "kinsa ang goat", "kinsa ang god", "kinsa ang legend",
+            "who is it", "who's the", "whos the", "who's da", "whos da",
         )
         if any(t in content_lower for t in title_triggers):
             cross_user = await loop.run_in_executor(executor, search_memory_by_value, content)
@@ -604,11 +660,25 @@ async def on_message(message):
         if web_context:
             print(f"[search] fetched context for: {query}")
 
-    # Mentioned users
-    for uid, display in mentioned_users.items():
-        await loop.run_in_executor(executor, store_user_name, uid, display)
-        if should_extract(str(uid)):
-            await loop.run_in_executor(executor, extract_memory, uid, content)
+    # Mentioned users — ask them to confirm facts said about them by others
+    for user in message.mentions:
+        if user == client.user:
+            continue
+        uid = user.id
+        display = user.display_name
+        guild_nick = user.nick if hasattr(user, "nick") else None
+        await loop.run_in_executor(executor, store_user_name, uid, display, user.name, guild_nick)
+        # Extract what was said about this person
+        claimed_facts = await loop.run_in_executor(executor, _extract_facts_about, uid, content)
+        if claimed_facts:
+            try:
+                view = FactConfirmView(uid, claimed_facts, message.author.display_name)
+                await message.channel.send(
+                    f"<@{uid}> **{message.author.display_name}** said this about you:\n> {claimed_facts}\nIs that true?",
+                    view=view
+                )
+            except Exception as e:
+                log.warning(f"Could not send confirmation to {uid}: {e}")
 
     history = await loop.run_in_executor(executor, get_history, thread_id, HISTORY_LIMIT)
     channel_name = message.channel.name if hasattr(message.channel, "name") else "dm"
