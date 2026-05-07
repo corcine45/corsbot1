@@ -21,11 +21,28 @@ CACHE_TTL = 300  # 5 minutes
 
 # Keywords that signal the user wants real-time info — keep these specific
 REALTIME_TRIGGERS = {
+    # News & current events
     "news", "latest", "today's", "right now", "live score", "scores",
-    "standings", "match result", "breaking", "weather", "stock price",
-    "crypto price", "bitcoin price", "patch notes", "who won",
-    "what happened to", "when is", "when does", "release date",
-    "just dropped", "just announced", "just released",
+    "standings", "match result", "breaking", "breaking news", "update",
+    "updates", "what's happening", "whats happening", "current",
+    "recently", "just now", "this week", "this month",
+    # Sports
+    "who won", "game score", "match score", "final score", "highlights",
+    "transfer", "signed", "traded", "injured", "lineup", "roster",
+    # Weather
+    "weather", "temperature", "forecast", "rain", "storm", "typhoon",
+    # Finance
+    "stock price", "stock market", "crypto price", "bitcoin price",
+    "ethereum price", "exchange rate", "usd", "php rate",
+    # Tech/Gaming
+    "patch notes", "update notes", "new update", "new patch", "season",
+    "new season", "new episode", "new chapter", "new release",
+    "just dropped", "just announced", "just released", "just launched",
+    "release date", "coming out", "when does", "when is",
+    # General real-time
+    "what happened to", "what happened with", "what's the latest",
+    "whats the latest", "any news", "did they", "have they",
+    "is it out", "is it available", "is it live",
 }
 
 def needs_web_search(text: str) -> bool:

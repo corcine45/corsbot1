@@ -112,11 +112,64 @@ executor = ThreadPoolExecutor(max_workers=4)
 # ---------------- QUICK REPLIES ---------------- #
 
 QUICK_REPLIES = {
-    frozenset(["hi", "hey", "hello", "sup", "yo", "hiya"]): ["hey!", "yo!", "sup", "heyyy", "what's good"],
-    frozenset(["lol", "lmao", "lmfao", "haha", "hahaha", "😂", "💀"]): ["💀", "lmaooo", "bro 😭", "nah fr 💀"],
-    frozenset(["ok", "okay", "k", "kk", "alright", "aight"]): ["aight", "ok", "cool", "bet"],
-    frozenset(["thanks", "thank you", "ty", "thx"]): ["np!", "anytime", "of course", "👍"],
-    frozenset(["bye", "cya", "see ya", "later", "gtg"]): ["later!", "cya", "peace ✌️", "see ya"],
+    frozenset([
+        "hi", "hey", "hello", "sup", "yo", "hiya", "heya", "wassup", "wsp",
+        "wazzup", "howdy", "ello", "helo", "heyy", "heyyyy", "yoo", "yooo",
+        "oi", "ay", "ayy", "ayyy", "what's up", "whats up", "wuts up",
+    ]): ["hey!", "yo!", "sup", "heyyy", "what's good", "ayy", "yoo", "what's good bro"],
+
+    frozenset([
+        "lol", "lmao", "lmfao", "haha", "hahaha", "hahahaha", "😂", "💀",
+        "lmaoo", "lmaooo", "lmaoooo", "hahah", "hehe", "hihi", "xd", "XD",
+        "💀💀", "😭😭", "dead", "im dead", "i'm dead", "bruh", "bruhhh",
+        "lol lol", "lolol", "lololol", "kekw", "kek",
+    ]): ["💀", "lmaooo", "bro 😭", "nah fr 💀", "bro 💀💀", "dead 😭", "kekw"],
+
+    frozenset([
+        "ok", "okay", "k", "kk", "kkk", "alright", "aight", "aite", "ight",
+        "bet", "gotcha", "got it", "understood", "noted", "copy", "roger",
+        "sure", "yep", "yup", "yeah", "ya", "ye", "yea", "mhm", "mmk",
+    ]): ["aight", "ok", "cool", "bet", "gotcha", "noted", "yep"],
+
+    frozenset([
+        "thanks", "thank you", "ty", "thx", "thnx", "thank u", "thankyou",
+        "tysm", "tyvm", "thanks a lot", "much appreciated", "appreciate it",
+        "appreciate that", "cheers", "gracias", "salamat",
+    ]): ["np!", "anytime", "of course", "👍", "always", "no worries", "salamat din"],
+
+    frozenset([
+        "bye", "cya", "see ya", "later", "gtg", "gotta go", "peace",
+        "goodbye", "good bye", "byebye", "bye bye", "ttyl", "ttys",
+        "take care", "tc", "laters", "adios", "ciao", "see you",
+        "see u", "catch you later", "catch u later", "imma go",
+    ]): ["later!", "cya", "peace ✌️", "see ya", "take care", "adios", "ttyl"],
+
+    frozenset([
+        "gm", "good morning", "morning", "mornin", "rise and shine",
+    ]): ["gm!", "morning 🌅", "rise and grind", "gm gm"],
+
+    frozenset([
+        "gn", "good night", "night", "nite", "goodnight", "sleep well",
+        "going to sleep", "gonna sleep", "imma sleep",
+    ]): ["gn!", "sleep well 🌙", "night night", "rest up"],
+
+    frozenset([
+        "fr", "fr fr", "facts", "real", "no cap", "nocap", "deadass",
+        "on god", "ong", "on gang", "frfr",
+    ]): ["fr fr", "no cap", "facts", "deadass", "ong"],
+
+    frozenset([
+        "nah", "nope", "no", "nah bro", "nah man", "hell nah", "hell no",
+    ]): ["nah?", "aight then", "ok ok", "fair enough"],
+
+    frozenset([
+        "gg", "good game", "ggs",
+    ]): ["gg!", "ggs", "well played", "gg ez"],
+
+    frozenset([
+        "pog", "poggers", "lets go", "let's go", "lesgo", "letsgo", "w",
+        "big w", "dub", "we won", "we cooked",
+    ]): ["LETS GOOO 🔥", "W", "poggers", "big W", "we cooked fr"],
 }
 
 def get_quick_reply(text: str):
@@ -591,6 +644,13 @@ async def on_message(message):
         "anything about", "info on", "info about", "what can you tell me about",
         "who tf is", "who da hell is", "who the hell is", "who are they",
         "what's their deal", "whats their deal", "who even is",
+        "what's up with", "whats up with", "what happened to",
+        "how's", "hows", "where's", "wheres", "what's going on with",
+        "whats going on with", "you know", "you know about",
+        "heard of", "heard about", "know anything about",
+        "what do you think of", "what do you think about",
+        "who dat", "who dat is", "who dis", "who is dis",
+        "kinsa", "kinsa si", "kinsa ang",
     )
     content_lower = content.lower()
     if any(t in content_lower for t in relationship_triggers):

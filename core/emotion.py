@@ -10,12 +10,52 @@ GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
 
 # Exact-match triggers (must be the whole word/phrase)
 FORCE_EMOTION_TRIGGERS = {
-    "laugh":     {"lol", "lmao", "lmfao", "hahaha", "💀", "😂", "😭", "im dead", "i'm dead"},
-    "celebrate": {"congrats", "congratulations", "happy birthday", "hbd", "🎉", "🥳", "🎂"},
-    "sad":       {"rip", "f in chat", "😢", "😔", "💔"},
-    "shock":     {"wtf", "omg", "no way bro", "bro what", "😱", "🤯", "wait what"},
-    "angry":     {"😤", "😡", "🤬"},
-    "happy":     {"yay", "lets gooo", "let's gooo", "poggers", "🥰", "😍"},
+    "laugh": {
+        "lol", "lmao", "lmfao", "hahaha", "hahahaha", "💀", "😂", "😭",
+        "im dead", "i'm dead", "dead", "lmaoo", "lmaooo", "lmaoooo",
+        "kekw", "kek", "lolol", "lololol", "crying laughing", "i cant",
+        "i can't", "bro 💀", "💀💀", "😭😭", "bruh moment", "not me",
+        "i'm crying", "im crying", "this is hilarious", "i'm done",
+        "im done", "i'm weak", "im weak", "sent me", "i'm deceased",
+    },
+    "celebrate": {
+        "congrats", "congratulations", "happy birthday", "hbd", "🎉", "🥳", "🎂",
+        "happy bday", "happy b-day", "feliz cumpleaños", "maligayang bati",
+        "you did it", "we did it", "lets gooo", "let's gooo", "we won",
+        "big w", "dub", "we cooked", "we ate", "we're so back",
+        "we are so back", "he's back", "she's back", "they're back",
+        "🏆", "🥇", "🎊", "🎈", "🎁",
+    },
+    "sad": {
+        "rip", "f in chat", "😢", "😔", "💔", "f", "moment of silence",
+        "that's sad", "thats sad", "that hurts", "ouch", "damn that's rough",
+        "damn thats rough", "L", "big L", "took an L", "😞", "😟",
+        "that's rough", "thats rough", "pour one out", "🪦", "gone too soon",
+        "rest in peace", "rest easy", "we miss you", "miss you",
+    },
+    "shock": {
+        "wtf", "omg", "no way bro", "bro what", "😱", "🤯", "wait what",
+        "no way", "bro no way", "what the", "what the hell", "what the heck",
+        "are you serious", "you serious", "seriously", "no shot", "no cap",
+        "bro stop", "stop it", "shut up", "shut up bro", "no way fr",
+        "wait fr", "wait actually", "hold on", "hold up", "wait wait wait",
+        "WHAT", "NAH", "BRO", "BRUH", "😳", "👀", "👁️👄👁️",
+    },
+    "angry": {
+        "😤", "😡", "🤬", "i'm mad", "im mad", "i'm pissed", "im pissed",
+        "that's annoying", "thats annoying", "so annoying", "bro cmon",
+        "bro come on", "are you kidding", "you kidding me", "unbelievable",
+        "this is trash", "this is garbage", "this sucks", "i hate this",
+        "i hate it", "why tho", "why though",
+    },
+    "happy": {
+        "yay", "lets gooo", "let's gooo", "poggers", "🥰", "😍",
+        "so happy", "i'm happy", "im happy", "this is great", "love this",
+        "love it", "this is amazing", "amazing", "incredible", "goated",
+        "this slaps", "it slaps", "bussin", "bussin fr", "fire", "🔥",
+        "W", "big W", "pog", "gg", "good game", "we won", "🚀",
+        "i'm so excited", "im so excited", "can't wait", "cant wait",
+    },
 }
 
 GIF_MAP = {
