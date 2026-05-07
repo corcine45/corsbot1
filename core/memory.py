@@ -65,7 +65,43 @@ def _faiss_save():
     with open(FAISS_MAP_PATH, "wb") as f:
         pickle.dump(_faiss_map, f)
 
+def faiss_compact():
+    """Rebuild the FAISS index from scratch to remove ghost vectors.
+    Call this periodically to keep the index clean."""
+    global _faiss_index, _faiss_map, _faiss_reverse
+    with _faiss_lock:
+        live_labels = list(_faiss_map.values())
+        if not live_labels:
+            return
+        # Rebuild index with only live vectors
+        new_index = faiss.IndexFlatIP(EMBED_DIM)
+        new_map = {}
+        new_reverse = {}
+        for new_id, label in enumerate(live_labels):
+            uid, key = label.split(":", 1)
+            # Re-embed from DB
+            conn = sqlite3.connect(str(DATA_DIR / "brain.db") if hasattr(DATA_DIR, '__truediv__') else os.path.join(str(DATA_DIR), "brain.db"))
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM memory WHERE user_id=? AND key=?", (uid, key))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                continue  # fact was deleted, skip
+            vec = _embed_vec(f"{key}: {row[0]}")
+            new_index.add(vec.reshape(1, -1).astype(np.float32))
+            new_map[new_id] = label
+            new_reverse[label] = new_id
+        _faiss_index = new_index
+        _faiss_map = new_map
+        _faiss_reverse = new_reverse
+        _faiss_save()
+        log.info(f"[faiss] compacted: {len(live_labels)} → {new_index.ntotal} vectors")
+
+_upsert_count = 0
+_COMPACT_EVERY = 100
+
 def faiss_upsert(user_id: str, key: str, vec: np.ndarray):
+    global _upsert_count
     label = f"{user_id}:{key}"
     with _faiss_lock:
         if label in _faiss_reverse:
@@ -77,6 +113,10 @@ def faiss_upsert(user_id: str, key: str, vec: np.ndarray):
         _faiss_map[new_id] = label
         _faiss_reverse[label] = new_id
         _faiss_save()
+    _upsert_count += 1
+    if _upsert_count % _COMPACT_EVERY == 0:
+        log.info(f"[faiss] auto-compacting after {_upsert_count} upserts")
+        faiss_compact()
 
 def faiss_search(user_id: str, query_vec: np.ndarray, top_k: int = 20) -> list:
     with _faiss_lock:
@@ -156,8 +196,9 @@ def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> flo
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
 MEMORY_EXTRACT_EVERY = 3
-MEMORY_SIMILARITY_THRESHOLD = 0.35
+MEMORY_SIMILARITY_THRESHOLD = 0.48
 MAX_MEMORY_FACTS = 6
+DEDUP_SIMILARITY_THRESHOLD = 0.92  # facts this similar are considered duplicates
 _msg_counter: dict = {}
 
 def should_extract(user_id: str) -> bool:
@@ -200,6 +241,30 @@ def extract_memory(user_id, message):
                 continue
             memory_type = _classify_key(key)
             vec = _embed_vec(f"{key}: {value}")
+
+            # Deduplication: check if a very similar fact already exists under a different key
+            existing_similar = None
+            for sim, existing_key in faiss_search(str(user_id), vec, top_k=3):
+                if sim >= DEDUP_SIMILARITY_THRESHOLD and existing_key != key:
+                    existing_similar = existing_key
+                    break
+
+            if existing_similar:
+                # Update the existing similar fact instead of creating a duplicate
+                log.info(f"[memory] dedup: '{key}={value}' similar to existing '{existing_similar}', updating")
+                cursor.execute(
+                    "UPDATE memory SET value=?, updated_at=?, reinforcement=reinforcement+1 WHERE user_id=? AND key=?",
+                    (value, now, str(user_id), existing_similar)
+                )
+                # Re-embed the updated fact
+                updated_vec = _embed_vec(f"{existing_similar}: {value}")
+                cursor.execute(
+                    "UPDATE memory SET embedding=? WHERE user_id=? AND key=?",
+                    (updated_vec.tobytes(), str(user_id), existing_similar)
+                )
+                faiss_upsert(str(user_id), existing_similar, updated_vec)
+                continue
+
             cursor.execute("SELECT reinforcement FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
             row = cursor.fetchone()
             reinforcement = (row[0] + 1) if row else 1
