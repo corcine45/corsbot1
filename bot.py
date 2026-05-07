@@ -32,13 +32,11 @@ _REQUIRED_ENV = {
 
 _missing = [f"{var} ({desc})" for var, desc in _REQUIRED_ENV.items() if not os.getenv(var)]
 if _missing:
-    print("❌ Missing required environment variables:")
     for m in _missing:
-        print(f"   • {m}")
-    print("Set them in your .env file or as system environment variables.")
+        log.error(f"Missing env var: {m}")
     raise SystemExit(1)
 
-print("✅ All environment variables loaded.")
+log.info("All environment variables loaded.")
 
 from core.db import get_db, get_thread_id, store_message, get_history
 from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, groq_call

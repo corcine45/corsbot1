@@ -2,8 +2,11 @@ import sqlite3
 import threading
 import time
 import os
+import logging
 import shutil
 from pathlib import Path
+
+log = logging.getLogger("corsbot.db")
 
 # Use /app for Railway persistent volume, fall back to local for dev
 DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parents[1]
@@ -37,9 +40,9 @@ def backup_db():
         backups = sorted(BACKUP_DIR.glob("brain-*.db.bak"), key=os.path.getmtime)
         for old_backup in backups[:-BACKUP_RETENTION]:
             old_backup.unlink()
-        print(f"[db] backup created: {backup_path}")
+        log.info(f"[db] backup created: {backup_path}")
     except Exception as e:
-        print(f"[db] backup failed: {e}")
+        log.error(f"[db] backup failed: {e}")
     _backup_done = True
 
 
@@ -156,6 +159,11 @@ def initialize_schema(cursor):
 
     if version < SCHEMA_VERSION:
         cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    # Indexes for performance
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_relationships_user ON relationships(user_id)")
 
 
 def get_db():

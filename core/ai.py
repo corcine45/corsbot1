@@ -49,10 +49,17 @@ def truncate_text(text: str, max_chars: int) -> str:
 
 
 def trim_history(history: list[dict], max_messages: int = MAX_HISTORY_MESSAGES, max_chars: int = MAX_MESSAGE_CHARS) -> list[dict]:
-    return [
-        {"role": e["role"], "content": truncate_text(e["content"], max_chars)}
-        for e in history[-max_messages:]
-    ]
+    trimmed = []
+    for e in history[-max_messages:]:
+        content = e["content"]
+        if len(content) > max_chars:
+            # Truncate at sentence boundary if possible
+            cutoff = content.rfind(". ", 0, max_chars)
+            if cutoff == -1:
+                cutoff = max_chars - 1
+            content = content[:cutoff + 1] + "…"
+        trimmed.append({"role": e["role"], "content": content})
+    return trimmed
 
 
 # ---------------- GROQ WRAPPER ---------------- #
@@ -135,6 +142,16 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
     return "\n\n".join(parts)
 
 
+def _enforce_brevity(text: str, max_sentences: int = 3) -> str:
+    """Trim response to max_sentences if it's too long."""
+    # Split on sentence endings
+    import re as _re
+    sentences = _re.split(r'(?<=[.!?])\s+', text.strip())
+    if len(sentences) <= max_sentences:
+        return text
+    return " ".join(sentences[:max_sentences])
+
+
 def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name=""):
     history = trim_history(history)
     memory = truncate_text(memory, MAX_MEMORY_CHARS)
@@ -146,7 +163,8 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
     messages = [{"role": "system", "content": system}] + history
 
     try:
-        return groq_call(AI_MODEL, messages, max_tokens=512)
+        result = groq_call(AI_MODEL, messages, max_tokens=512)
+        return _enforce_brevity(result)
     except Exception as e:
         err_str = str(e)
         if "429" in err_str or "rate_limit" in err_str.lower():

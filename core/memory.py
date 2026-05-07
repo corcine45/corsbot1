@@ -16,7 +16,7 @@ from .ai import groq_call
 
 # ---------------- EMBEDDER ---------------- #
 
-print("Loading embedding model...")
+log.info("Loading embedding model...")
 embedder = SentenceTransformer("all-mpnet-base-v2")
 EMBED_DIM = 768
 log.info("Embedding model ready.")
@@ -155,7 +155,7 @@ def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> flo
 
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
-MEMORY_EXTRACT_EVERY = 1
+MEMORY_EXTRACT_EVERY = 3
 MEMORY_SIMILARITY_THRESHOLD = 0.35
 MAX_MEMORY_FACTS = 6
 _msg_counter: dict = {}
