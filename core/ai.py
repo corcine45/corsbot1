@@ -435,12 +435,14 @@ def _analyze_intent(message: str, emotion_state: str | None, session_context: st
             _PLAN_MODEL,
             [
                 {"role": "system", "content": (
-                    "Analyze this Discord message and output ONLY these fields:\n"
-                    "intent: <what the user wants — e.g. vent, get advice, ask a question, share news, debate, joke around>\n"
-                    "emotional_weight: <low | medium | high>\n"
-                    "needs_acknowledgment: <yes | no> (yes if they shared something personal/emotional first)\n"
-                    "response_type: <empathy | advice | information | banter | opinion | roleplay>\n"
-                    "One short phrase per field. No explanation."
+                    "Analyze this Discord message from a user talking to a chill Discord bot. "
+                    "Output ONLY these fields:\n"
+                    "intent: <what the user wants — e.g. vent, get advice, ask a question, share news, debate, joke around, just chatting>\n"
+                    "emotional_weight: <low | medium | high> — most casual Discord messages are LOW\n"
+                    "needs_acknowledgment: <yes | no> — only yes if they shared something genuinely personal or upsetting\n"
+                    "response_type: <banter | information | advice | empathy | opinion | roleplay> — default to banter for casual messages\n"
+                    "One short phrase per field. No explanation. "
+                    "IMPORTANT: Do not over-classify casual chat as emotional. Most Discord messages are just people talking."
                 )},
                 {"role": "user", "content": f"Message: {message}{emotion_block}{context_block}"},
             ],
@@ -469,14 +471,15 @@ def _make_plan(analysis: str, emotion_hint: str, reflection: str) -> str:
             _PLAN_MODEL,
             [
                 {"role": "system", "content": (
-                    "Based on this analysis, write a brief response plan for a Discord bot reply.\n"
+                    "Write a brief response plan for a chill Discord bot reply. "
+                    "The bot is a friend, not a therapist. Default to casual and direct. "
                     "Output ONLY:\n"
-                    "tone: <e.g. warm and direct | playful | serious | empathetic | blunt>\n"
-                    "open_with: <e.g. acknowledge their feeling | answer directly | ask a question | match their energy>\n"
+                    "tone: <e.g. casual and direct | playful | blunt | empathetic | dry humor>\n"
+                    "open_with: <e.g. answer directly | match their energy | quick reaction | ask a follow-up>\n"
                     "include: <what to cover — 1 short phrase>\n"
-                    "avoid: <what NOT to do — e.g. don't give unsolicited advice | don't be dismissive | don't over-explain>\n"
+                    "avoid: <what NOT to do — e.g. don't over-explain | don't be preachy | don't be stiff>\n"
                     "length: <1 sentence | 1-2 sentences | 2-3 sentences>\n"
-                    "One short phrase per field. No explanation."
+                    "One short phrase per field. No explanation. Keep it Discord-appropriate."
                 )},
                 {"role": "user", "content": context},
             ],
@@ -622,15 +625,15 @@ _PERSONALITY_MODES: dict[str, str] = {
     ),
     "serious": (
         "Current mode: serious. "
-        "Drop the jokes. Be direct, clear, and thoughtful. "
-        "No slang, no banter. Give a real answer. "
-        "This is a moment that deserves actual attention."
+        "Drop the jokes for this one. Be direct and give a real answer. "
+        "Still sound like yourself — just without the banter. "
+        "Don't be stiff or formal, just focused."
     ),
     "supportive": (
         "Current mode: supportive. "
-        "Be warm, patient, and genuinely present. "
-        "Acknowledge before you advise. Don't rush to fix things. "
-        "Make them feel heard first. Keep it human."
+        "They're going through something — be real with them, not clinical. "
+        "Acknowledge what they said first before anything else. "
+        "Keep it short. Don't lecture. Don't fix. Just be there."
     ),
     "analytical": (
         "Current mode: analytical. "
@@ -658,16 +661,18 @@ _EMOTION_MODE_MAP: dict[str, str] = {
 }
 
 # Keywords that signal analytical or serious content
+# Keep these TIGHT — only fire on unambiguous signals, not common words
 _ANALYTICAL_TRIGGERS = {
-    "explain", "how does", "how do", "why does", "why do", "analyze",
-    "difference between", "compare", "pros and cons", "break down",
-    "what causes", "what happens when", "technically", "in theory",
+    "explain how", "how does", "how do", "why does", "why do", "analyze this",
+    "difference between", "compare", "pros and cons", "break it down",
+    "what causes", "what happens when", "technically speaking", "in theory",
 }
 _SERIOUS_TRIGGERS = {
-    "i need help", "serious question", "genuinely asking", "not joking",
-    "real talk", "fr though", "honestly", "i'm struggling", "im struggling",
-    "this is important", "i'm scared", "im scared", "i don't know what to do",
-    "i dont know what to do",
+    # Must be explicit, unambiguous signals — NOT common words like "honestly"
+    "i need help with", "serious question", "genuinely asking",
+    "not joking around", "real talk though", "i'm actually struggling",
+    "im actually struggling", "this is serious", "i need to talk",
+    "i don't know what to do anymore", "i dont know what to do anymore",
 }
 
 # Per-user conversation temperature: tracks recent mode history to drive drift
