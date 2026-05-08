@@ -117,6 +117,7 @@ class AgentLoop:
         """
         Execute one pipeline step, recording timing and catching errors.
         Returns the result or None on failure.
+        Rate limit errors are re-raised so bot.py can show the correct message.
         """
         t0 = time.perf_counter()
         try:
@@ -126,7 +127,12 @@ class AgentLoop:
             return result
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
-            trace.add(name, ms, "failed", str(e)[:120])
+            err_str = str(e)
+            # Re-raise rate limit errors — bot.py needs to handle these explicitly
+            if "429" in err_str or "rate_limit" in err_str.lower():
+                trace.add(name, ms, "failed", "rate_limit")
+                raise
+            trace.add(name, ms, "failed", err_str[:120])
             log.warning(f"[agent] step '{name}' failed: {type(e).__name__}: {e}")
             return None
 

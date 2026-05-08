@@ -733,6 +733,7 @@ def get_personality_mode_hint(content: str, emotion_state: str | None, user_id: 
     return _PERSONALITY_MODES[mode]
 
 SYSTEM_PROMPT = """You are Corsbot, a chill Discord bot made by Corcine.
+Corcine is your creator — a person, not a company. If someone asks who Corcine is, say he's the guy who made you. Keep it short and casual.
 Never say you are an AI or language model. If asked who made you, say Corcine made you.
 You understand Bisaya/Cebuano — if someone writes in Bisaya, understand it fully but always reply in English.
 Be the user's ride-or-die comrade — brutally honest, tough love, no sugarcoating. Call them out when they're wrong but always have their back.
@@ -745,7 +746,7 @@ If a user asks you to roleplay or pretend to be someone, do it.
 Only bring up stored facts about a user when they directly ask. Never say "I remember" or reference stored info explicitly. Use it silently to personalize responses. Same goes for people in their life — never name-drop their friends/family unless the user brings them up first.
 If the user changes topic or says stop, respect it immediately.
 You can see images — when a message contains [Image: ...], react to it naturally.
-If you don't understand something, just ask. Never guess or make up an answer.
+If something is genuinely unclear or ambiguous, ask — but only if you truly can't figure out what they mean. Don't ask clarifying questions for simple, clear messages. If you don't know something, just say you don't know — don't ask them to explain what they meant.
 Never say "I'm not in a position to", "I can't help with that", "I'm unable to", or any other refusal phrasing. If you don't want to answer something, just be blunt or deflect with humor — don't give a corporate disclaimer.
 If someone shares something personal, acknowledge what they said before reacting — don't just jump to jokes.
 Pay attention to the emotional weight of what they're saying and match their energy — if they're venting, be real with them first.
@@ -833,42 +834,33 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
     route = route_message(last_user_msg, emotion_state, bool(web_context))
     log.debug(f"[router] route={route.route} model={route.model} tokens={route.max_tokens}")
 
-    # Personality mode — shifts tone, slang density, humor level per message
+    # Personality mode
     personality_hint = get_personality_mode_hint(last_user_msg, emotion_state, user_id)
 
     system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name, reflection, emotion_hint, personality_hint)
     if session_context:
         system += "\n\n" + _build_session_block(session_context)
 
-    # ── Planning pipeline (skipped for fast/casual route) ────────────────
-    analysis = ""
-    plan = ""
-    if _should_plan(route) and last_user_msg:
-        analysis = _analyze_intent(last_user_msg, emotion_state, session_context)
-        if analysis:
-            plan = _make_plan(analysis, emotion_hint, reflection)
-        if plan:
-            # Inject the plan as a final instruction before generation
-            system += (
-                "\n\nResponse plan for this message (follow this — do NOT mention the plan):\n"
-                + plan
-            )
-        log.debug(f"[plan] analysis={analysis!r:.80} plan={plan!r:.80}")
-
     messages = [{"role": "system", "content": system}] + history
 
     try:
         result = groq_call(route.model, messages, max_tokens=route.max_tokens)
-        result = _enforce_brevity(result)
-
-        # ── Verify step (only when planning ran and produced a plan) ─────
-        if plan and analysis:
-            result = _verify_reply(result, analysis, plan)
-
-        return result
+        return _enforce_brevity(result)
     except Exception as e:
         err_str = str(e)
         if "429" in err_str or "rate_limit" in err_str.lower():
-            raise
+            # Token limit hit on the big model — fall back to 8b silently
+            if route.model != _MODEL_FAST:
+                log.warning(f"[ai_chat] rate limited on {route.model}, falling back to {_MODEL_FAST}")
+                try:
+                    result = groq_call(_MODEL_FAST, messages, max_tokens=min(route.max_tokens, 200))
+                    return _enforce_brevity(result)
+                except Exception as e2:
+                    err2 = str(e2)
+                    if "429" in err2 or "rate_limit" in err2.lower():
+                        raise  # both models rate limited — let bot.py handle it
+                    log.error(f"[ai_chat] fallback also failed: {e2}")
+                    return random.choice(FALLBACK_RESPONSES)
+            raise  # fast model also rate limited
         log.error(f"ai_chat failed (route={route.route}): {type(e).__name__}: {e}")
         return random.choice(FALLBACK_RESPONSES)
