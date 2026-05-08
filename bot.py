@@ -43,40 +43,10 @@ from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, groq_call
 from core.memory import (
     extract_memory, get_memory, get_memory_with_keys, store_user_name,
     extract_relationships, get_relationships, should_extract,
-    search_memory_by_value, _extract_facts_about
+    search_memory_by_value, check_and_delete_denied_facts
 )
 from core.emotion import pick_gif_for_message
 
-# ---------------- PENDING CONFIRMATIONS ---------------- #
-# Stores facts waiting for the mentioned user to confirm
-# {message_id: {uid, facts_text, claimer_name}}
-_pending_confirmations: dict = {}
-
-class FactConfirmView(discord.ui.View):
-    def __init__(self, uid: int, facts: str, claimer: str):
-        super().__init__(timeout=300)  # 5 min to respond
-        self.uid = uid
-        self.facts = facts
-        self.claimer = claimer
-
-    @discord.ui.button(label="✅ That's true", style=discord.ButtonStyle.green)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.uid:
-            await interaction.response.send_message("This isn't for you.", ephemeral=True)
-            return
-        from core.memory import extract_memory
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(executor, extract_memory, self.uid, self.facts)
-        await interaction.response.send_message(f"<@{self.uid}> confirmed: **{self.facts}** ✅")
-        self.stop()
-
-    @discord.ui.button(label="❌ That's false", style=discord.ButtonStyle.red)
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.uid:
-            await interaction.response.send_message("This isn't for you.", ephemeral=True)
-            return
-        await interaction.response.send_message(f"<@{self.uid}> denied that. ❌")
-        self.stop()
 from core.search import needs_web_search, web_search, build_search_query
 from core.feedback import (
     store_last_reply, get_last_reply, store_feedback,
@@ -631,6 +601,8 @@ async def on_message(message):
 
     # Memory + relationships (batched)
     uid_str = str(message.author.id)
+    # Always check for denials on every message — user might be correcting a stored fact
+    await loop.run_in_executor(executor, check_and_delete_denied_facts, message.author.id, content)
     if should_extract(uid_str):
         await loop.run_in_executor(executor, extract_memory, message.author.id, content)
         await loop.run_in_executor(executor, extract_relationships, message.author.id, attributed_content)
@@ -718,7 +690,7 @@ async def on_message(message):
         if web_context:
             print(f"[search] fetched context for: {query}")
 
-    # Mentioned users — ask them to confirm facts said about them by others
+    # Mentioned users — just store their name info
     for user in message.mentions:
         if user == client.user:
             continue
@@ -726,17 +698,6 @@ async def on_message(message):
         display = user.display_name
         guild_nick = user.nick if hasattr(user, "nick") else None
         await loop.run_in_executor(executor, store_user_name, uid, display, user.name, guild_nick)
-        # Extract what was said about this person
-        claimed_facts = await loop.run_in_executor(executor, _extract_facts_about, uid, content)
-        if claimed_facts:
-            try:
-                view = FactConfirmView(uid, claimed_facts, message.author.display_name)
-                await message.channel.send(
-                    f"<@{uid}> **{message.author.display_name}** said this about you:\n> {claimed_facts}\nIs that true?",
-                    view=view
-                )
-            except Exception as e:
-                log.warning(f"Could not send confirmation to {uid}: {e}")
 
     history = await loop.run_in_executor(executor, get_history, thread_id, HISTORY_LIMIT)
     channel_name = message.channel.name if hasattr(message.channel, "name") else "dm"

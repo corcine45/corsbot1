@@ -207,6 +207,66 @@ def should_extract(user_id: str) -> bool:
     _msg_counter[user_id] += 1
     return _msg_counter[user_id] % MEMORY_EXTRACT_EVERY == 0
 
+def check_and_delete_denied_facts(user_id, message: str):
+    """If user denies a stored fact ('I'm not X', 'I don't X'), delete it from memory."""
+    denial_patterns = [
+        r"i'?m not (.+)",
+        r"i am not (.+)",
+        r"i don'?t (.+)",
+        r"i do not (.+)",
+        r"i never (.+)",
+        r"i'?m no longer (.+)",
+        r"i'?m not a (.+)",
+        r"i'?m not the (.+)",
+        r"that'?s not true",
+        r"that is not true",
+        r"that'?s false",
+        r"that is false",
+        r"that'?s wrong",
+        r"that is wrong",
+        r"delete that",
+        r"forget that",
+        r"that'?s not me",
+        r"that is not me",
+    ]
+    import re as _re
+    lower = message.lower().strip()
+
+    denied_phrase = None
+    for pattern in denial_patterns:
+        match = _re.search(pattern, lower)
+        if match:
+            if match.lastindex:
+                denied_phrase = match.group(1).strip()
+            else:
+                denied_phrase = lower  # generic denial, search broadly
+            break
+
+    if not denied_phrase:
+        return
+
+    # Find facts that semantically match the denied phrase
+    _, cursor = get_db()
+    cursor.execute("SELECT key, value FROM memory WHERE user_id=?", (str(user_id),))
+    rows = cursor.fetchall()
+    if not rows:
+        return
+
+    denied_vec = _embed_vec(denied_phrase)
+    to_delete = []
+    for key, value in rows:
+        fact_vec = _embed_vec(f"{key}: {value}")
+        sim = float(np.dot(denied_vec, fact_vec))
+        if sim > 0.65:  # high threshold — only delete if very confident it matches
+            to_delete.append(key)
+
+    if to_delete:
+        conn, cursor = get_db()
+        for key in to_delete:
+            cursor.execute("DELETE FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
+            log.info(f"[memory] deleted denied fact: user={user_id} key={key}")
+        conn.commit()
+
 def extract_memory(user_id, message):
     if len(message.split()) < 5:
         return
