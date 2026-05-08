@@ -39,17 +39,16 @@ if _missing:
 log.info("All environment variables loaded.")
 
 from core.db import get_db, get_thread_id, store_message, get_history
-from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, groq_call
+from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, is_semantic_jailbreak, sanitize_retrieved_content, groq_call
 from core.memory import (
-    extract_memory, get_memory, get_memory_with_keys, store_user_name,
-    extract_relationships, get_relationships, should_extract,
-    search_memory_by_value, check_and_delete_denied_facts, delete_denied_fact
+    extract_memory, store_user_name,
+    extract_relationships, should_extract,
+    check_and_delete_denied_facts, delete_denied_fact,
+    update_reflection, should_update_reflection,
 )
 from core.emotion import pick_gif_for_message
-
 from core.search import needs_web_search, web_search, build_search_query
-from core.session import add_message, should_refresh, set_context, get_context, get_recent_messages
-
+from core.session import add_message, should_refresh, get_recent_messages, get_state_prompt, analyze_state, set_state
 from core.feedback import (
     store_last_reply, get_last_reply, store_feedback,
     apply_good_rating, apply_bad_rating, get_feedback_stats,
@@ -108,43 +107,6 @@ class CorsBot(discord.Client):
 
 client = CorsBot()
 executor = ThreadPoolExecutor(max_workers=4)
-
-
-SESSION_ANALYZER_MODEL = "llama3-8b-8192"
-
-async def build_session_context(user_message: str, user_id: int):
-    add_message(user_id, user_message)
-
-    if not should_refresh(user_id):
-        return get_context(user_id)
-
-    recent = "\n".join(get_recent_messages(user_id))
-
-    prompt = f"""Analyze this conversation briefly.
-
-Return ONLY:
-topic: ...
-mood: ...
-goal: ...
-activity: ...
-
-Conversation:
-{recent}
-"""
-
-    try:
-        result = groq_call(
-            SESSION_ANALYZER_MODEL,
-            [
-                {"role": "system", "content": "Extract concise conversational state."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=80,
-        )
-        set_context(user_id, result.strip())
-        return result.strip()
-    except Exception:
-        return get_context(user_id)
 
 
 # ---------------- QUICK REPLIES ---------------- #
@@ -608,7 +570,10 @@ async def on_message(message):
             if extracted:
                 ocr_parts.append(extracted)
         if ocr_parts:
-            ocr_text = "\n\n".join(ocr_parts).strip()
+            # Sanitize OCR text — image content is untrusted external input
+            ocr_text = "\n\n".join(
+                sanitize_retrieved_content(part, "ocr") for part in ocr_parts
+            ).strip()
 
     if not content and not ocr_text:
         return
@@ -623,8 +588,8 @@ async def on_message(message):
     elif ocr_text:
         content = ocr_text
 
-    # Prompt injection guard
-    if is_prompt_injection(content):
+    # Prompt injection guard — regex + semantic
+    if is_prompt_injection(content) or is_semantic_jailbreak(content):
         await message.channel.send(f"<@{message.author.id}> nice try 💀")
         return
 
@@ -667,9 +632,10 @@ async def on_message(message):
         await loop.run_in_executor(executor, store_message, thread_id, "assistant", quick)
         return
 
-    # Memory + relationships (batched)
+    # ── Agent loop ───────────────────────────────────────────────────────
     uid_str = str(message.author.id)
-    # Check for denials before extracting — user might be correcting a stored fact
+
+    # Check for denials before running the agent — user might be correcting a stored fact
     denied_matches = await loop.run_in_executor(executor, check_and_delete_denied_facts, message.author.id, content)
     if denied_matches:
         facts_str = ", ".join(f"`{v}`" for _, v in denied_matches)
@@ -678,129 +644,70 @@ async def on_message(message):
             f"<@{message.author.id}> you want me to forget {facts_str}? you sure?",
             view=view
         )
-        return  # don't process further, wait for their response
+        return
+
+    # Background: extract memory + relationships (non-blocking, every N messages)
     if should_extract(uid_str):
-        await loop.run_in_executor(executor, extract_memory, message.author.id, content)
-        await loop.run_in_executor(executor, extract_relationships, message.author.id, attributed_content)
+        loop.run_in_executor(executor, extract_memory, message.author.id, content)
+        loop.run_in_executor(executor, extract_relationships, message.author.id, attributed_content)
 
-    memory, active_keys = await loop.run_in_executor(executor, get_memory_with_keys, message.author.id, content, 3)
+    # Background: update reflection periodically
+    if should_update_reflection(uid_str):
+        async def _bg_reflection():
+            recent_history = await loop.run_in_executor(executor, get_history, thread_id, 20)
+            recent_user_msgs = [e["content"] for e in recent_history if e["role"] == "user"]
+            if recent_user_msgs:
+                await loop.run_in_executor(executor, update_reflection, uid_str, recent_user_msgs)
+        asyncio.ensure_future(_bg_reflection())
 
-    # Only send relationships if the user is explicitly asking about someone
-    relationship_triggers = (
-        "who is", "tell me about", "what about", "how is", "where is",
-        "what's with", "who's", "whos", "do you know", "what do you know about",
-        "anything about", "info on", "info about", "what can you tell me about",
-        "who tf is", "who da hell is", "who the hell is", "who are they",
-        "what's their deal", "whats their deal", "who even is",
-        "what's up with", "whats up with", "what happened to",
-        "how's", "hows", "where's", "wheres", "what's going on with",
-        "whats going on with", "you know", "you know about",
-        "heard of", "heard about", "know anything about",
-        "what do you think of", "what do you think about",
-        "who dat", "who dat is", "who dis", "who is dis",
-        "kinsa", "kinsa si", "kinsa ang",
-    )
-    content_lower = content.lower()
-    if any(t in content_lower for t in relationship_triggers):
-        relationships = await loop.run_in_executor(executor, get_relationships, message.author.id)
-        # Cross-user title search — only for specific title/nickname queries
-        title_triggers = (
-            # "who is the X"
-            "who is the", "who is king", "who is lord", "who is boss",
-            "who is queen", "who is god", "who is goat", "who is legend",
-            "who is da", "who is number one", "who is #1", "who is no 1",
-            "who is the king", "who is the boss", "who is the goat",
-            "who is the lord", "who is the queen", "who is the legend",
-            "who is the god", "who is the one", "who is the real",
-            "who is the true", "who is the best", "who is the top",
-            "who is the strongest", "who is the greatest", "who is the og",
-            "who is the main", "who is the head", "who is the leader",
-            "who is the master", "who is the champion", "who is the king of",
-            "who is the lord of", "who is the god of", "who is the ruler",
-            # "who da X"
-            "who da king", "who da boss", "who da goat", "who da god",
-            "who da best", "who da real", "who da one", "who da legend",
-            "who da lord", "who da queen", "who da top", "who da og",
-            # declarations/claims
-            "who declared", "who said they", "who called themselves",
-            "who holds", "who owns", "who got the title", "who is titled",
-            "who is known as", "who goes by", "who is called",
-            "who got", "who has the", "who earned", "who claimed",
-            # bisaya/informal
-            "kinsa ang", "kinsa si", "kinsa ang king", "kinsa ang boss",
-            "kinsa ang goat", "kinsa ang god", "kinsa ang legend",
-            "who is it", "who's the", "whos the", "who's da", "whos da",
-        )
-        if any(t in content_lower for t in title_triggers):
-            cross_user = await loop.run_in_executor(executor, search_memory_by_value, content)
-            if cross_user:
-                relationships = (relationships + "\n" + cross_user).strip()
-    else:
-        relationships = ""
-
-    # If impersonating a mentioned user, fetch their memory and skip the requester's memory
-    impersonation_context = ""
-    impersonate_keywords = ("pretend", "act as", "be ", "impersonate", "roleplay as", "talk like", "speak as")
-    lower_content = content.lower()
-    is_impersonating = any(kw in lower_content for kw in impersonate_keywords)
-
-    if is_impersonating and mentioned_users:
-        # Impersonating a Discord user — fetch their stored memory
-        target_id = next(iter(mentioned_users))
-        target_name = mentioned_users[target_id]
-        target_memory = await loop.run_in_executor(executor, get_memory, target_id)
-        if target_memory:
-            impersonation_context = f"Facts about {target_name} to help you impersonate them:\n{target_memory}"
-        memory = ""  # don't inject the requester's own memory during impersonation
-        active_keys = []
-    elif is_impersonating:
-        # Impersonating a character (anime, fictional, etc.) — just clear requester memory
-        memory = ""
-        active_keys = []
-
-    # Web search if message needs real-time info — skip if message is about a mentioned user
-    web_context = ""
-    if needs_web_search(content) and not mentioned_users:
-        query = build_search_query(content)
-        web_context = await loop.run_in_executor(executor, web_search, query) or ""
-        if web_context:
-            print(f"[search] fetched context for: {query}")
-
-    # Mentioned users — just store their name info
+    # Store mentioned users' identity info
     for user in message.mentions:
         if user == client.user:
             continue
-        uid = user.id
-        display = user.display_name
-        guild_nick = user.nick if hasattr(user, "nick") else None
-        await loop.run_in_executor(executor, store_user_name, uid, display, user.name, guild_nick)
+        guild_nick_u = user.nick if hasattr(user, "nick") else None
+        loop.run_in_executor(executor, store_user_name, user.id, user.display_name, user.name, guild_nick_u)
 
+    # Detect impersonation intent
+    impersonate_keywords = ("pretend", "act as", "be ", "impersonate", "roleplay as", "talk like", "speak as")
+    is_impersonating = any(kw in content.lower() for kw in impersonate_keywords)
+
+    # Fetch history + feedback context before handing off to agent
     history = await loop.run_in_executor(executor, get_history, thread_id, HISTORY_LIMIT)
     channel_name = message.channel.name if hasattr(message.channel, "name") else "dm"
     feedback_context = await loop.run_in_executor(
-        executor,
-        get_feedback_context,
+        executor, get_feedback_context,
         str(message.author.id),
         message.guild.id if message.guild else None,
     )
 
-    cache_key = build_response_cache_key(
-        thread_id,
-        content,
-        memory,
-        relationships,
-        web_context,
-        feedback_context,
+    # Build agent context
+    from core.agent import AgentContext, AgentLoop
+    ctx = AgentContext(
+        user_id=message.author.id,
+        uid_str=uid_str,
+        content=content,
+        attributed_content=attributed_content,
+        thread_id=thread_id,
+        channel_name=channel_name,
+        username=message.author.display_name,
+        guild_id=message.guild.id if message.guild else None,
+        mentioned_users=mentioned_users,
+        is_impersonating=is_impersonating,
+        history=history,
+        feedback_context=feedback_context,
     )
-    reply = get_cached_response(cache_key)
-    if reply is None:
+
+    # Check cache before running the full agent
+    cache_key = build_response_cache_key(thread_id, content, "", "", "", feedback_context)
+    cached = get_cached_response(cache_key)
+    if cached:
+        reply = cached
+        active_keys = []
+    else:
+        agent = AgentLoop(executor, loop)
         async with message.channel.typing():
             try:
-                reply = await loop.run_in_executor(
-                    executor, ai_chat, history, memory,
-                    message.author.display_name, message.author.id, relationships,
-                    web_context, impersonation_context, feedback_context, channel_name
-                )
+                ctx, trace = await agent.run(ctx)
             except Exception as e:
                 err = str(e)
                 if "429" in err or "rate_limit" in err.lower():
@@ -809,19 +716,24 @@ async def on_message(message):
                     await message.channel.send(f"<@{message.author.id}> ⏳ rate limited, try again in {wait}.")
                 else:
                     await message.channel.send(f"<@{message.author.id}> {random.choice(FALLBACK_RESPONSES)}")
-                    print(f"[on_message error] {e}")
+                    log.error(f"[on_message] agent error: {e}")
                 return
+
+        if not ctx.reply:
+            await message.channel.send(f"<@{message.author.id}> {random.choice(FALLBACK_RESPONSES)}")
+            return
+
+        reply = ctx.reply
+        active_keys = ctx.active_keys
         set_cached_response(cache_key, reply)
 
     await loop.run_in_executor(executor, store_message, thread_id, "assistant", reply)
-    store_last_reply(str(message.author.id), reply, "default", active_keys)
+    store_last_reply(str(message.author.id), reply, getattr(ctx, "emotion_state", None) or "default", active_keys)
     reply = resolve_mentions_in_reply(reply, message.guild)
-
-    gif_url, emotion = await loop.run_in_executor(executor, pick_gif_for_message, content, reply)
 
     await send_reply(message.channel, f"<@{message.author.id}> {reply}")
 
-    # React to the user's message with an emoji based on detected emotion
+    # Emoji reaction based on detected emotion
     REACTION_MAP = {
         "laugh":     "😂",
         "sad":       "😔",
@@ -830,15 +742,17 @@ async def on_message(message):
         "celebrate": "🎉",
         "happy":     "🥰",
     }
-    if emotion and emotion in REACTION_MAP:
+    gif_emotion = getattr(ctx, "gif_emotion", None) if not cached else None
+    if gif_emotion and gif_emotion in REACTION_MAP:
         try:
-            await message.add_reaction(REACTION_MAP[emotion])
-        except:
+            await message.add_reaction(REACTION_MAP[gif_emotion])
+        except Exception:
             pass
 
-    if gif_url:
+    gif_url = getattr(ctx, "gif_url", None)
+    if gif_url and not cached:
         await message.channel.send(gif_url)
-        await loop.run_in_executor(executor, store_message, thread_id, "assistant", f"[GIF: {emotion}]")
+        await loop.run_in_executor(executor, store_message, thread_id, "assistant", f"[GIF: {gif_emotion}]")
 
 # ---------------- RUN ---------------- #
 

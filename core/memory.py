@@ -30,107 +30,195 @@ def _embed(text: str) -> bytes:
 
 # ---------------- FAISS ---------------- #
 
+# ---------------- FAISS ---------------- #
+#
+# Index choice: IndexHNSWFlat
+#   - Approximate nearest-neighbor via navigable small-world graph
+#   - No ghost vectors after compaction (full rebuild produces a clean graph)
+#   - Faster search than IndexFlatIP at scale (sub-linear vs linear)
+#   - Tradeoff: slightly approximate results, but at our vector counts (< 100k)
+#     the accuracy difference is negligible
+#
+# Ghost vector problem with IndexFlatIP:
+#   FAISS cannot remove individual vectors from a flat index. The old approach
+#   deleted the label from the map but left the raw vector in the index, causing
+#   ghost hits during search. HNSW + periodic full rebuild eliminates this.
+#
+# M=32: number of neighbors per node in the HNSW graph.
+#   Higher M → better recall, more memory. 32 is a good default for 768-dim.
+# efConstruction=200: search depth during index build. Higher → better graph quality.
+# efSearch=64: search depth at query time. Higher → better recall, slower search.
+
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "brain.index")
 FAISS_MAP_PATH   = os.path.join(DATA_DIR, "brain.index.map")
 
+HNSW_M               = 32    # neighbors per node
+HNSW_EF_CONSTRUCTION = 200   # build-time search depth
+HNSW_EF_SEARCH       = 64    # query-time search depth
+
 _faiss_lock = threading.Lock()
-_faiss_index: faiss.IndexFlatIP = None
-_faiss_map: dict = {}
-_faiss_reverse: dict = {}
+_faiss_index: faiss.IndexHNSWFlat = None
+_faiss_map: dict = {}       # faiss_id → "user_id:key"
+_faiss_reverse: dict = {}   # "user_id:key" → faiss_id
+_dirty = False              # True when in-memory index differs from disk
+
+
+def _make_hnsw() -> faiss.IndexHNSWFlat:
+    """Create a fresh HNSW index with consistent parameters."""
+    idx = faiss.IndexHNSWFlat(EMBED_DIM, HNSW_M)
+    idx.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+    idx.hnsw.efSearch = HNSW_EF_SEARCH
+    return idx
+
 
 def _faiss_load():
     global _faiss_index, _faiss_map, _faiss_reverse
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAP_PATH):
         try:
             idx = faiss.read_index(FAISS_INDEX_PATH)
-            # If dimension changed (e.g. model upgrade), rebuild
             if idx.d != EMBED_DIM:
                 log.warning(f"[faiss] dimension mismatch ({idx.d} vs {EMBED_DIM}) — rebuilding")
                 raise ValueError("dimension mismatch")
+            # Migrate: if loaded index is the old FlatIP type, force a rebuild
+            if not isinstance(idx, faiss.IndexHNSWFlat):
+                log.info("[faiss] migrating from IndexFlatIP → IndexHNSWFlat")
+                raise ValueError("index type migration")
+            # Restore efSearch (not persisted by faiss.write_index for HNSW)
+            idx.hnsw.efSearch = HNSW_EF_SEARCH
             _faiss_index = idx
             with open(FAISS_MAP_PATH, "rb") as f:
                 _faiss_map = pickle.load(f)
             _faiss_reverse = {v: k for k, v in _faiss_map.items()}
-            log.info(f"[faiss] loaded {_faiss_index.ntotal} vectors")
+            log.info(f"[faiss] loaded {_faiss_index.ntotal} vectors (HNSW)")
             return
         except Exception as e:
             log.error(f"[faiss] failed to load: {e} — rebuilding")
-    _faiss_index = faiss.IndexFlatIP(EMBED_DIM)
+    _faiss_index = _make_hnsw()
     _faiss_map = {}
     _faiss_reverse = {}
-    log.info("[faiss] created fresh index")
+    log.info("[faiss] created fresh HNSW index")
+
 
 def _faiss_save():
+    """Persist index and map to disk. Call only when _dirty is True."""
     faiss.write_index(_faiss_index, FAISS_INDEX_PATH)
     with open(FAISS_MAP_PATH, "wb") as f:
         pickle.dump(_faiss_map, f)
 
+
 def faiss_compact():
-    """Rebuild the FAISS index from scratch to remove ghost vectors.
-    Call this periodically to keep the index clean."""
-    global _faiss_index, _faiss_map, _faiss_reverse
+    """
+    Rebuild the HNSW index from scratch using only live vectors from the DB.
+
+    This eliminates ghost vectors (vectors whose labels were removed from the map
+    but whose raw data still occupies slots in the index). With HNSW, a full
+    rebuild also produces a clean graph with no dangling edges.
+
+    DB access is batched into a single query instead of one connection per vector.
+    """
+    global _faiss_index, _faiss_map, _faiss_reverse, _dirty
+
     with _faiss_lock:
         live_labels = list(_faiss_map.values())
         if not live_labels:
             return
-        # Rebuild index with only live vectors
-        new_index = faiss.IndexFlatIP(EMBED_DIM)
+
+        # Batch-fetch all live facts in one query
+        db_path = str(DATA_DIR / "brain.db") if hasattr(DATA_DIR, "__truediv__") else os.path.join(str(DATA_DIR), "brain.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # Build lookup: (user_id, key) → value
+        cursor.execute("SELECT user_id, key, value FROM memory")
+        db_rows = {(r[0], r[1]): r[2] for r in cursor.fetchall()}
+        conn.close()
+
+        new_index = _make_hnsw()
         new_map = {}
         new_reverse = {}
-        for new_id, label in enumerate(live_labels):
+        skipped = 0
+
+        for label in live_labels:
             uid, key = label.split(":", 1)
-            # Re-embed from DB
-            conn = sqlite3.connect(str(DATA_DIR / "brain.db") if hasattr(DATA_DIR, '__truediv__') else os.path.join(str(DATA_DIR), "brain.db"))
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM memory WHERE user_id=? AND key=?", (uid, key))
-            row = cursor.fetchone()
-            conn.close()
-            if not row:
-                continue  # fact was deleted, skip
-            vec = _embed_vec(f"{key}: {row[0]}")
+            value = db_rows.get((uid, key))
+            if value is None:
+                skipped += 1
+                continue  # deleted from DB — drop the ghost
+            vec = _embed_vec(f"{key}: {value}")
+            new_id = new_index.ntotal
             new_index.add(vec.reshape(1, -1).astype(np.float32))
             new_map[new_id] = label
             new_reverse[label] = new_id
+
         _faiss_index = new_index
         _faiss_map = new_map
         _faiss_reverse = new_reverse
         _faiss_save()
-        log.info(f"[faiss] compacted: {len(live_labels)} → {new_index.ntotal} vectors")
+        _dirty = False
+        log.info(f"[faiss] compacted: {len(live_labels)} labels → {new_index.ntotal} vectors (dropped {skipped} ghosts)")
+
 
 _upsert_count = 0
 _COMPACT_EVERY = 100
+_SAVE_EVERY    = 10   # flush to disk every N upserts, not every single one
+
 
 def faiss_upsert(user_id: str, key: str, vec: np.ndarray):
-    global _upsert_count
+    """
+    Add or update a vector in the index.
+
+    HNSW doesn't support in-place updates, so we:
+    1. Remove the old label from the map (the old vector becomes a ghost)
+    2. Add the new vector and point the label at it
+    3. Periodic compaction (every _COMPACT_EVERY upserts) rebuilds the index
+       cleanly, eliminating all accumulated ghosts at once.
+    """
+    global _upsert_count, _dirty
+
     label = f"{user_id}:{key}"
     with _faiss_lock:
+        # Remove old label from map (vector stays in index as ghost until compaction)
         if label in _faiss_reverse:
             old_id = _faiss_reverse[label]
             del _faiss_map[old_id]
             del _faiss_reverse[label]
+
         new_id = _faiss_index.ntotal
         _faiss_index.add(vec.reshape(1, -1).astype(np.float32))
         _faiss_map[new_id] = label
         _faiss_reverse[label] = new_id
-        _faiss_save()
-    _upsert_count += 1
+        _dirty = True
+
+        _upsert_count += 1
+        # Flush to disk periodically, not on every write
+        if _upsert_count % _SAVE_EVERY == 0:
+            _faiss_save()
+            _dirty = False
+
+    # Compact outside the lock to avoid holding it during the full rebuild
     if _upsert_count % _COMPACT_EVERY == 0:
         log.info(f"[faiss] auto-compacting after {_upsert_count} upserts")
         faiss_compact()
 
+
 def faiss_search(user_id: str, query_vec: np.ndarray, top_k: int = 20) -> list:
+    """
+    Search for the top-k most similar vectors for a given user.
+    Oversamples by 4x to account for ghost vectors and cross-user results,
+    then filters down to the requested user's live labels.
+    """
     with _faiss_lock:
         if _faiss_index.ntotal == 0:
             return []
         k = min(top_k * 4, _faiss_index.ntotal)
         scores, ids = _faiss_index.search(query_vec.reshape(1, -1).astype(np.float32), k)
+
     results = []
     for score, idx in zip(scores[0], ids[0]):
         if idx < 0:
             continue
         label = _faiss_map.get(idx)
         if not label:
-            continue
+            continue  # ghost vector — skip
         uid, key = label.split(":", 1)
         if uid == str(user_id):
             results.append((float(score), key))
@@ -138,8 +226,15 @@ def faiss_search(user_id: str, query_vec: np.ndarray, top_k: int = 20) -> list:
             break
     return results
 
+
 def faiss_rebuild_from_db():
-    conn = sqlite3.connect("brain.db")
+    """
+    Index any facts in the DB that are missing from the FAISS index.
+    Uses DATA_DIR for the DB path (fixes the hardcoded 'brain.db' bug).
+    Batches all missing facts into a single pass.
+    """
+    db_path = str(DATA_DIR / "brain.db") if hasattr(DATA_DIR, "__truediv__") else os.path.join(str(DATA_DIR), "brain.db")
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT user_id, key, value FROM memory")
@@ -148,6 +243,7 @@ def faiss_rebuild_from_db():
         conn.close()
         return
     conn.close()
+
     missing = [(uid, k, v) for uid, k, v in rows if f"{uid}:{k}" not in _faiss_reverse]
     if not missing:
         return
@@ -277,20 +373,195 @@ def delete_denied_fact(user_id, key: str):
     conn.commit()
     log.info(f"[memory] deleted and locked denied fact: user={user_id} key={key}")
 
+# ---------------- DETERMINISTIC EXTRACTION ---------------- #
+# Regex patterns for facts that are always stated explicitly and unambiguously.
+# These run BEFORE the AI call — zero hallucination risk, zero cost.
+
+import re as _re
+
+# Each entry: (key, compiled_pattern, value_group_index)
+# The pattern must capture the value in a named group called `val`.
+_DETERMINISTIC_PATTERNS: list[tuple[str, _re.Pattern]] = [
+    # Identity
+    ("name",        _re.compile(r"\bmy name is (?P<val>[a-z][a-z\s\-']{0,30})", _re.I)),
+    ("name",        _re.compile(r"\bcall me (?P<val>[a-z][a-z\s\-']{0,30})", _re.I)),
+    ("name",        _re.compile(r"\bi(?:'m| am) (?P<val>[A-Z][a-z]{1,20})(?:\s|$|,|\.)", 0)),  # "I'm John"
+    ("age",         _re.compile(r"\bi(?:'m| am) (?P<val>\d{1,2})\s*(?:years?\s*old|yo\b)", _re.I)),
+    ("age",         _re.compile(r"\bmy age is (?P<val>\d{1,2})\b", _re.I)),
+    ("age",         _re.compile(r"\bturned (?P<val>\d{1,2})\b", _re.I)),
+    ("birthday",    _re.compile(r"\bmy birthday is (?P<val>[a-z0-9 ,/\-]+)", _re.I)),
+    ("birthday",    _re.compile(r"\bi was born (?:on )?(?P<val>[a-z0-9 ,/\-]+)", _re.I)),
+    ("gender",      _re.compile(r"\bi(?:'m| am) (?:a\s+)?(?P<val>male|female|non.?binary|trans|guy|girl|boy|woman|man)\b", _re.I)),
+    ("location",    _re.compile(r"\bi(?:'m| am) from (?P<val>[a-z][a-z\s,]{2,40})", _re.I)),
+    ("location",    _re.compile(r"\bi live in (?P<val>[a-z][a-z\s,]{2,40})", _re.I)),
+    ("location",    _re.compile(r"\bfrom (?P<val>[a-z][a-z\s,]{2,30})(?:\s|$|,|\.)", _re.I)),
+    ("nationality", _re.compile(r"\bi(?:'m| am) (?P<val>filipino|american|british|canadian|australian|japanese|korean|chinese|indian|mexican|brazilian|german|french|spanish|italian|russian|thai|vietnamese|indonesian|malaysian|singaporean)\b", _re.I)),
+    ("job",         _re.compile(r"\bi(?:'m| am) (?:a\s+)?(?P<val>student|developer|engineer|designer|teacher|doctor|nurse|lawyer|manager|artist|musician|writer|gamer|streamer|freelancer|programmer|chef|driver|soldier|officer)\b", _re.I)),
+    ("job",         _re.compile(r"\bi work (?:as (?:a\s+)?|at )(?P<val>[a-z][a-z\s]{2,30})", _re.I)),
+    ("job",         _re.compile(r"\bmy job is (?P<val>[a-z][a-z\s]{2,30})", _re.I)),
+    # Preferences
+    ("favorite_game",   _re.compile(r"\bmy (?:fav(?:ou?rite)?\s+)?game is (?P<val>[a-z][a-z0-9\s:]{1,40})", _re.I)),
+    ("favorite_game",   _re.compile(r"\bi (?:love|main|play) (?P<val>[a-z][a-z0-9\s:]{1,30})\s+(?:a lot|all day|everyday|daily|rn|right now)", _re.I)),
+    ("favorite_music",  _re.compile(r"\bmy (?:fav(?:ou?rite)?\s+)?(?:music|song|artist|band) is (?P<val>[a-z][a-z0-9\s,&]{1,40})", _re.I)),
+    ("favorite_food",   _re.compile(r"\bmy (?:fav(?:ou?rite)?\s+)?food is (?P<val>[a-z][a-z\s]{1,30})", _re.I)),
+    ("favorite_show",   _re.compile(r"\bmy (?:fav(?:ou?rite)?\s+)?(?:show|anime|series) is (?P<val>[a-z][a-z0-9\s:]{1,40})", _re.I)),
+    # Temporary state
+    ("mood",        _re.compile(r"\bi(?:'m| am) (?:feeling\s+)?(?P<val>happy|sad|angry|bored|tired|excited|stressed|anxious|depressed|lonely|hyped|nervous|frustrated|mad|upset|fine|okay|good|great|terrible|awful)\b", _re.I)),
+    ("currently",   _re.compile(r"\bi(?:'m| am) (?:currently\s+)?(?P<val>playing|watching|studying|working|gaming|grinding|chilling|sleeping|eating|coding|streaming)\b", _re.I)),
+    ("playing_now", _re.compile(r"\b(?:playing|grinding)\s+(?P<val>[a-z][a-z0-9\s:]{1,30})\s+(?:rn|right now|atm|at the moment)", _re.I)),
+    ("watching_now",_re.compile(r"\bwatching\s+(?P<val>[a-z][a-z0-9\s:]{1,30})\s+(?:rn|right now|atm|at the moment)", _re.I)),
+    # Titles / nicknames
+    ("title",       _re.compile(r"\bi(?:'m| am) the (?P<val>[a-z][a-z\s]{2,40})", _re.I)),
+    ("title",       _re.compile(r"\brefer to me as (?P<val>[a-z][a-z\s]{1,40})", _re.I)),
+    ("nickname",    _re.compile(r"\bpeople call me (?P<val>[a-z][a-z\s\-']{1,30})", _re.I)),
+    ("nickname",    _re.compile(r"\bmy (?:nickname|alias) is (?P<val>[a-z][a-z\s\-']{1,30})", _re.I)),
+]
+
+# Keys that the deterministic pass should NOT overwrite if already set with high reinforcement
+_DETERMINISTIC_PROTECTED = {"display_name", "username", "server_nickname"}
+
+# Keys where the deterministic pass should skip AI extraction (already handled)
+_DETERMINISTIC_COVERED = {
+    "name", "age", "birthday", "gender", "location", "nationality",
+    "job", "mood", "currently", "playing_now", "watching_now",
+    "title", "nickname",
+}
+
+
+def _extract_deterministic(message: str) -> dict[str, str]:
+    """
+    Run regex patterns against the message and return a dict of {key: value}.
+    Zero AI calls. Zero hallucinations.
+    """
+    found: dict[str, str] = {}
+    for key, pattern in _DETERMINISTIC_PATTERNS:
+        if key in found:
+            continue  # first match wins per key
+        m = pattern.search(message)
+        if not m:
+            continue
+        # Handle patterns with named group `val` or fallback to group `val2`
+        try:
+            val = m.group("val")
+        except IndexError:
+            continue
+        if val is None:
+            try:
+                val = m.group("val2")
+            except IndexError:
+                continue
+        if val:
+            val = val.strip().rstrip(".,!?")
+            # Sanity: skip if value is suspiciously long or empty
+            if 1 <= len(val) <= 60:
+                found[key] = val
+    return found
+
+
+def _store_facts(user_id, facts: dict[str, str], conn, cursor, now: float):
+    """
+    Shared fact-storage logic used by both extraction passes.
+    Handles dedup, reinforcement, embedding, and FAISS upsert.
+    """
+    for key, value in facts.items():
+        if not key or not value:
+            continue
+        # Skip denied facts
+        denial_key = f"denied_{key}"
+        cursor.execute("SELECT 1 FROM memory WHERE user_id=? AND key=?", (str(user_id), denial_key))
+        if cursor.fetchone():
+            continue
+
+        memory_type = _classify_key(key)
+        vec = _embed_vec(f"{key}: {value}")
+
+        # Deduplication: check if a very similar fact already exists under a different key
+        existing_similar = None
+        for sim, existing_key in faiss_search(str(user_id), vec, top_k=3):
+            if sim >= DEDUP_SIMILARITY_THRESHOLD and existing_key != key:
+                existing_similar = existing_key
+                break
+
+        if existing_similar:
+            log.info(f"[memory] dedup: '{key}={value}' similar to existing '{existing_similar}', updating")
+            cursor.execute(
+                "UPDATE memory SET value=?, updated_at=?, reinforcement=reinforcement+1 WHERE user_id=? AND key=?",
+                (value, now, str(user_id), existing_similar)
+            )
+            updated_vec = _embed_vec(f"{existing_similar}: {value}")
+            cursor.execute(
+                "UPDATE memory SET embedding=? WHERE user_id=? AND key=?",
+                (updated_vec.tobytes(), str(user_id), existing_similar)
+            )
+            faiss_upsert(str(user_id), existing_similar, updated_vec)
+            continue
+
+        cursor.execute("SELECT reinforcement FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
+        row = cursor.fetchone()
+        reinforcement = (row[0] + 1) if row else 1
+        cursor.execute(
+            """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, key) DO UPDATE SET
+                   value=excluded.value, updated_at=excluded.updated_at,
+                   embedding=excluded.embedding, memory_type=excluded.memory_type,
+                   reinforcement=excluded.reinforcement""",
+            (str(user_id), key, value, now, vec.tobytes(), memory_type, reinforcement),
+        )
+        faiss_upsert(str(user_id), key, vec)
+
+
 def extract_memory(user_id, message):
+    """
+    Two-pass memory extraction:
+
+    Pass 1 — Deterministic (regex):
+        Catches explicit, unambiguous facts like "my name is", "I'm 19",
+        "I live in Manila". Zero AI calls, zero hallucination risk.
+
+    Pass 2 — AI (llama-3.1-8b-instant):
+        Handles nuanced facts the regex can't catch: personality traits,
+        preferences, opinions, self-given titles.
+        Only runs if the message is long enough, and skips keys already
+        covered by the deterministic pass.
+    """
+    if len(message.split()) < 3:
+        return
+
+    conn, cursor = get_db()
+    now = time.time()
+
+    # ── Pass 1: Deterministic ────────────────────────────────────────────
+    det_facts = _extract_deterministic(message)
+    if det_facts:
+        log.debug(f"[memory] deterministic extracted: {det_facts}")
+        _store_facts(user_id, det_facts, conn, cursor, now)
+        conn.commit()
+
+    # ── Pass 2: AI extraction ────────────────────────────────────────────
     if len(message.split()) < 5:
         return
+
+    skip_keys = _DETERMINISTIC_COVERED | set(det_facts.keys())
+    skip_hint = (
+        f"Do NOT extract these keys (already handled): {', '.join(sorted(skip_keys))}. "
+        if skip_keys else ""
+    )
+
     try:
         output = groq_call(
-            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": (
-                    "Extract facts about the user from their message. "
+                    "Extract nuanced personal facts about the user from their message. "
+                    "Focus on: personality traits, preferences, opinions, hobbies, "
+                    "self-given titles or nicknames, and things they like/dislike. "
+                    f"{skip_hint}"
                     "Reply in key=value format, one per line. "
-                    "Use snake_case keys like: name, age, location, likes, dislikes, favorite_game, job, mood, currently, nickname, title, etc. "
-                    "Also capture self-given titles or nicknames — if they say 'call me X', 'I am X', 'I'm the X', 'refer to me as X', store title=X or nickname=X. "
-                    "If they say 'call me king of aura', store title=king of aura. "
-                    "Only extract clear personal facts explicitly stated. If none, reply: NONE"
+                    "Use snake_case keys like: likes, dislikes, favorite_game, hobby, "
+                    "personality, opinion_on, title, nickname, etc. "
+                    "Only extract facts clearly stated or strongly implied. "
+                    "If none, reply: NONE"
                 )},
                 {"role": "user", "content": message}
             ],
@@ -299,58 +570,116 @@ def extract_memory(user_id, message):
         if output.strip().upper() == "NONE":
             return
 
-        conn, cursor = get_db()
-        now = time.time()
+        ai_facts: dict[str, str] = {}
         for line in output.split("\n"):
             line = line.strip()
             if "=" not in line:
                 continue
-            key, value = line.split("=", 1)
+            key, _, value = line.partition("=")
             key, value = key.strip().lower(), value.strip()
             if not key or not value:
                 continue
-            memory_type = _classify_key(key)
-            vec = _embed_vec(f"{key}: {value}")
+            if key in det_facts:
+                continue  # don't let AI overwrite deterministic results
+            ai_facts[key] = value
 
-            # Deduplication: check if a very similar fact already exists under a different key
-            existing_similar = None
-            for sim, existing_key in faiss_search(str(user_id), vec, top_k=3):
-                if sim >= DEDUP_SIMILARITY_THRESHOLD and existing_key != key:
-                    existing_similar = existing_key
-                    break
+        if ai_facts:
+            log.debug(f"[memory] AI extracted: {ai_facts}")
+            _store_facts(user_id, ai_facts, conn, cursor, now)
+            conn.commit()
 
-            if existing_similar:
-                # Update the existing similar fact instead of creating a duplicate
-                log.info(f"[memory] dedup: '{key}={value}' similar to existing '{existing_similar}', updating")
-                cursor.execute(
-                    "UPDATE memory SET value=?, updated_at=?, reinforcement=reinforcement+1 WHERE user_id=? AND key=?",
-                    (value, now, str(user_id), existing_similar)
-                )
-                # Re-embed the updated fact
-                updated_vec = _embed_vec(f"{existing_similar}: {value}")
-                cursor.execute(
-                    "UPDATE memory SET embedding=? WHERE user_id=? AND key=?",
-                    (updated_vec.tobytes(), str(user_id), existing_similar)
-                )
-                faiss_upsert(str(user_id), existing_similar, updated_vec)
-                continue
-
-            cursor.execute("SELECT reinforcement FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
-            row = cursor.fetchone()
-            reinforcement = (row[0] + 1) if row else 1
-            cursor.execute(
-                """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(user_id, key) DO UPDATE SET
-                       value=excluded.value, updated_at=excluded.updated_at,
-                       embedding=excluded.embedding, memory_type=excluded.memory_type,
-                       reinforcement=excluded.reinforcement""",
-                (str(user_id), key, value, now, vec.tobytes(), memory_type, reinforcement),
-            )
-            faiss_upsert(str(user_id), key, vec)
-        conn.commit()
     except Exception as e:
-        log.error(f"memory extract error: {type(e).__name__}: {e}")
+        log.error(f"memory AI extract error: {type(e).__name__}: {e}")
+
+# ---------------- MEMORY SENSITIVITY ---------------- #
+#
+# Sensitive facts are stored normally but filtered at retrieval time.
+# They only surface when the current query is semantically close to the topic —
+# i.e. the user is actively talking about it, not just chatting.
+#
+# Three tiers:
+#   BLOCKED  — never surface automatically (trauma, abuse, self-harm, private confessions)
+#   HIGH     — only surface when query similarity > HIGH_SENSITIVITY_THRESHOLD
+#   NORMAL   — standard retrieval (default)
+#
+# Key-based classification is fast and deterministic.
+# Value-based classification catches things like "trauma=car accident" stored under
+# a generic key.
+
+# Keys that are always blocked from automatic surfacing
+_BLOCKED_KEYS: frozenset[str] = frozenset({
+    "trauma", "abuse", "assault", "rape", "suicide", "self_harm", "self_harm_history",
+    "mental_illness", "diagnosis", "medication", "therapy", "therapist",
+    "addiction", "drug_use", "alcohol_problem", "eating_disorder",
+    "confession", "secret", "private", "dont_share", "do_not_share",
+    "sexual_history", "sexual_preference", "kink", "fetish",
+    "financial_debt", "bankruptcy", "criminal_record", "arrest",
+    "family_abuse", "domestic_violence", "cheating", "affair",
+})
+
+# Keys that are high-sensitivity — only surface when directly relevant
+_HIGH_SENSITIVITY_KEYS: frozenset[str] = frozenset({
+    "depression", "anxiety_disorder", "mental_health", "grief", "loss",
+    "breakup", "divorce", "relationship_status", "ex", "ex_girlfriend",
+    "ex_boyfriend", "ex_wife", "ex_husband", "heartbreak",
+    "death", "died", "passed_away", "funeral", "mourning",
+    "fired", "job_loss", "unemployed", "financial_struggle",
+    "fight_with", "argument_with", "conflict_with",
+    "insecurity", "fear", "phobia", "nightmare",
+    "loneliness", "isolation", "bullying", "harassment",
+})
+
+# Value substrings that flag a fact as high-sensitivity regardless of key
+_SENSITIVE_VALUE_SIGNALS: tuple[str, ...] = (
+    "died", "dead", "passed away", "suicide", "self harm", "self-harm",
+    "abuse", "assault", "trauma", "raped", "molested",
+    "depressed", "depression", "anxiety", "panic attack",
+    "broke up", "breakup", "divorce", "cheated", "affair",
+    "fired", "lost my job", "can't afford", "in debt",
+    "addiction", "overdose", "relapse",
+    "hate myself", "worthless", "want to die",
+)
+
+# Similarity threshold above which a high-sensitivity fact is allowed through
+HIGH_SENSITIVITY_THRESHOLD = 0.72   # query must be very close to the topic
+# Standard threshold (already defined below as MEMORY_SIMILARITY_THRESHOLD = 0.48)
+
+
+def _sensitivity_level(key: str, value: str) -> str:
+    """
+    Returns 'blocked', 'high', or 'normal'.
+    Checks key first (fast), then value substrings (catches generic keys with sensitive values).
+    """
+    key_lower = key.lower()
+    value_lower = value.lower()
+
+    if key_lower in _BLOCKED_KEYS:
+        return "blocked"
+
+    if key_lower in _HIGH_SENSITIVITY_KEYS:
+        return "high"
+
+    # Value-based detection — catches things like "mood=suicidal" or "feeling=depressed"
+    for signal in _SENSITIVE_VALUE_SIGNALS:
+        if signal in value_lower:
+            return "high"
+
+    return "normal"
+
+
+def _is_explicit_memory_query(query: str) -> bool:
+    """
+    Returns True if the user is explicitly asking about their own stored info.
+    In that case, high-sensitivity facts are allowed through at a lower threshold.
+    """
+    triggers = (
+        "do you remember", "what do you know", "what did i tell you",
+        "i told you", "you know about my", "remember when i said",
+        "what do you know about my", "tell me what you know",
+    )
+    lower = query.lower()
+    return any(t in lower for t in triggers)
+
 
 def _expand_query(query: str) -> str:
     """Expand query with key intent words for better semantic matching."""
@@ -358,6 +687,53 @@ def _expand_query(query: str) -> str:
     filler = {"hey", "corsbot", "can you", "do you", "what is", "tell me", "i want", "please"}
     words = [w for w in query.lower().split() if w not in filler]
     return " ".join(words[:20])  # cap at 20 words
+
+
+def _apply_sensitivity_filter(
+    scored_facts: list[tuple],
+    query: str,
+    query_vec,
+) -> list[tuple]:
+    """
+    Filter scored facts through the sensitivity layer before returning to the AI.
+
+    Rules:
+    - BLOCKED facts: never included, regardless of query
+    - HIGH facts: only included when query similarity > HIGH_SENSITIVITY_THRESHOLD
+                  OR the user is explicitly asking about their stored info
+    - NORMAL facts: pass through unchanged
+    """
+    if not scored_facts:
+        return scored_facts
+
+    explicit = _is_explicit_memory_query(query)
+    filtered = []
+
+    for score, key, value in scored_facts:
+        level = _sensitivity_level(key, value)
+
+        if level == "blocked":
+            log.debug(f"[memory] blocked sensitive fact: key={key!r}")
+            continue
+
+        if level == "high":
+            if explicit:
+                log.debug(f"[memory] high-sensitivity fact allowed (explicit query): key={key!r}")
+                filtered.append((score, key, value))
+                continue
+            if query_vec is not None:
+                fact_vec = _embed_vec(f"{key}: {value}")
+                sim = float(np.dot(query_vec, fact_vec))
+                if sim >= HIGH_SENSITIVITY_THRESHOLD:
+                    log.debug(f"[memory] high-sensitivity fact allowed (sim={sim:.3f}): key={key!r}")
+                    filtered.append((score, key, value))
+                else:
+                    log.debug(f"[memory] high-sensitivity fact suppressed (sim={sim:.3f}): key={key!r}")
+            continue
+
+        filtered.append((score, key, value))
+
+    return filtered
 
 def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
     _, cursor = get_db()
@@ -402,10 +778,12 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
             value, memory_type, updated_at, reinforcement = non_identity[key]
             scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement), key, value))
     else:
+        query_vec = None
         for key, (value, memory_type, updated_at, reinforcement) in non_identity.items():
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
 
     scored_facts.sort(reverse=True)
+    scored_facts = _apply_sensitivity_filter(scored_facts, query, query_vec if query else None)
     result = [f"{k}={v}" for _, k, v in scored_facts[:MAX_MEMORY_FACTS]]
     return "\n".join(result)
 
@@ -452,10 +830,12 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
             value, memory_type, updated_at, reinforcement = non_identity[key]
             scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement), key, value))
     else:
+        query_vec = None
         for key, (value, memory_type, updated_at, reinforcement) in non_identity.items():
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
 
     scored_facts.sort(reverse=True)
+    scored_facts = _apply_sensitivity_filter(scored_facts, query, query_vec if query else None)
     top_scored = scored_facts[:MAX_MEMORY_FACTS]
     active_keys = [k for _, k, _ in top_scored]
 
@@ -520,7 +900,7 @@ def extract_relationships(user_id, message):
         return
     try:
         output = groq_call(
-            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": (
                     "Extract relationships the user mentions about people in their life. "
@@ -618,6 +998,79 @@ def search_memory_by_value(query: str, top_k: int = 5) -> str:
         lines.append(f"{username} (user_id:{uid}) declared: {key}={value}")
 
     return "\n".join(lines)
+
+# ---------------- REFLECTION MEMORY ---------------- #
+
+REFLECTION_UPDATE_EVERY = 10   # update reflection every N messages
+REFLECTION_MIN_MESSAGES = 5    # don't bother until user has at least this many messages
+_reflection_counter: dict = {}
+
+def should_update_reflection(user_id: str) -> bool:
+    _reflection_counter.setdefault(user_id, 0)
+    _reflection_counter[user_id] += 1
+    return _reflection_counter[user_id] % REFLECTION_UPDATE_EVERY == 0
+
+
+def update_reflection(user_id: str, recent_messages: list[str]):
+    """
+    Generate and store a behavioral/personality summary for the user
+    based on their recent messages. This is the 'reflection' — a high-level
+    insight like 'User struggles with confidence but responds well to direct encouragement.'
+    """
+    if len(recent_messages) < REFLECTION_MIN_MESSAGES:
+        return
+    try:
+        conversation = "\n".join(f"- {m}" for m in recent_messages[-20:])
+        output = groq_call(
+            "llama-3.1-8b-instant",
+            [
+                {"role": "system", "content": (
+                    "You are analyzing a user's recent messages to a Discord bot. "
+                    "Write a single concise behavioral/personality insight about this user — "
+                    "something genuinely useful for personalizing future responses. "
+                    "Focus on: communication style, emotional patterns, what they respond well to, "
+                    "recurring themes, humor style, or how they handle topics. "
+                    "Write it as a third-person observation, 1-2 sentences max. "
+                    "Examples:\n"
+                    "- 'User is self-deprecating but responds well to direct encouragement and humor.'\n"
+                    "- 'User tends to vent before asking for advice — acknowledge feelings first.'\n"
+                    "- 'User is very competitive and loves banter; match their energy.'\n"
+                    "- 'User gets anxious about decisions; short, confident answers work best.'\n"
+                    "Only output the insight. No labels, no preamble."
+                )},
+                {"role": "user", "content": f"Recent messages:\n{conversation}"}
+            ],
+            max_tokens=80, retries=2, timeout=12,
+        )
+        insight = output.strip()
+        if not insight or len(insight) < 10:
+            return
+
+        conn, cursor = get_db()
+        now = time.time()
+        cursor.execute(
+            """INSERT INTO reflections (user_id, insight, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   insight=excluded.insight, updated_at=excluded.updated_at""",
+            (str(user_id), insight, now)
+        )
+        conn.commit()
+        log.info(f"[reflection] updated for user={user_id}: {insight[:60]}...")
+    except Exception as e:
+        log.error(f"[reflection] update error: {type(e).__name__}: {e}")
+
+
+def get_reflection(user_id: str) -> str:
+    """Return the stored behavioral reflection for a user, or empty string."""
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT insight FROM reflections WHERE user_id=?",
+        (str(user_id),)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else ""
+
 
 def _extract_facts_about(user_id: int, message: str) -> str:
     """Extract facts claimed about a mentioned user by someone else.

@@ -13,7 +13,7 @@ DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve()
 DB_PATH = DATA_DIR / "brain.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_RETENTION = 5
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 IDENTITY_KEYS = {"name", "age", "location", "job", "display_name", "birthday", "gender", "nationality"}
 TEMPORARY_KEYS = {"mood", "currently", "doing", "feeling", "status", "playing_now", "watching_now"}
@@ -96,6 +96,14 @@ def initialize_schema(cursor):
     """)
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reflections (
+            user_id TEXT PRIMARY KEY,
+            insight TEXT,
+            updated_at REAL
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
@@ -146,6 +154,9 @@ def initialize_schema(cursor):
     if "reinforcement" not in cols:
         cursor.execute("ALTER TABLE memory ADD COLUMN reinforcement INTEGER DEFAULT 1")
         cols.append("reinforcement")
+    if "sensitivity" not in cols:
+        cursor.execute("ALTER TABLE memory ADD COLUMN sensitivity TEXT DEFAULT 'normal'")
+        cols.append("sensitivity")
 
     cursor.execute(
         f"UPDATE memory SET memory_type='identity' WHERE (memory_type IS NULL OR memory_type='') AND LOWER(key) IN ({','.join('?' for _ in IDENTITY_KEYS)})",
