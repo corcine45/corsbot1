@@ -43,16 +43,46 @@ from core.ai import ai_chat, FALLBACK_RESPONSES, is_prompt_injection, groq_call
 from core.memory import (
     extract_memory, get_memory, get_memory_with_keys, store_user_name,
     extract_relationships, get_relationships, should_extract,
-    search_memory_by_value, check_and_delete_denied_facts
+    search_memory_by_value, check_and_delete_denied_facts, delete_denied_fact
 )
 from core.emotion import pick_gif_for_message
 
 from core.search import needs_web_search, web_search, build_search_query
+from core.session import add_message, should_refresh, set_context, get_context, get_recent_messages
+
 from core.feedback import (
     store_last_reply, get_last_reply, store_feedback,
     apply_good_rating, apply_bad_rating, get_feedback_stats,
     get_feedback_context,
 )
+
+# ---------------- DENIAL CONFIRMATION ---------------- #
+
+class DenialConfirmView(discord.ui.View):
+    def __init__(self, user_id: int, facts: list):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.facts = facts  # list of (key, value)
+
+    @discord.ui.button(label="Yeah delete it", style=discord.ButtonStyle.red)
+    async def confirm_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Not for you.", ephemeral=True)
+            return
+        loop = asyncio.get_running_loop()
+        for key, value in self.facts:
+            await loop.run_in_executor(executor, delete_denied_fact, self.user_id, key)
+        deleted = ", ".join(f"`{v}`" for _, v in self.facts)
+        await interaction.response.send_message(f"Gone. Won't remember {deleted} about you anymore.", ephemeral=False)
+        self.stop()
+
+    @discord.ui.button(label="Nah keep it", style=discord.ButtonStyle.grey)
+    async def cancel_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Not for you.", ephemeral=True)
+            return
+        await interaction.response.send_message("Aight, keeping it.", ephemeral=False)
+        self.stop()
 
 # ---------------- CONFIG ---------------- #
 
@@ -78,6 +108,44 @@ class CorsBot(discord.Client):
 
 client = CorsBot()
 executor = ThreadPoolExecutor(max_workers=4)
+
+
+SESSION_ANALYZER_MODEL = "llama3-8b-8192"
+
+async def build_session_context(user_message: str, user_id: int):
+    add_message(user_id, user_message)
+
+    if not should_refresh(user_id):
+        return get_context(user_id)
+
+    recent = "\n".join(get_recent_messages(user_id))
+
+    prompt = f"""Analyze this conversation briefly.
+
+Return ONLY:
+topic: ...
+mood: ...
+goal: ...
+activity: ...
+
+Conversation:
+{recent}
+"""
+
+    try:
+        result = groq_call(
+            SESSION_ANALYZER_MODEL,
+            [
+                {"role": "system", "content": "Extract concise conversational state."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=80,
+        )
+        set_context(user_id, result.strip())
+        return result.strip()
+    except Exception:
+        return get_context(user_id)
+
 
 # ---------------- QUICK REPLIES ---------------- #
 
@@ -601,8 +669,16 @@ async def on_message(message):
 
     # Memory + relationships (batched)
     uid_str = str(message.author.id)
-    # Always check for denials on every message — user might be correcting a stored fact
-    await loop.run_in_executor(executor, check_and_delete_denied_facts, message.author.id, content)
+    # Check for denials before extracting — user might be correcting a stored fact
+    denied_matches = await loop.run_in_executor(executor, check_and_delete_denied_facts, message.author.id, content)
+    if denied_matches:
+        facts_str = ", ".join(f"`{v}`" for _, v in denied_matches)
+        view = DenialConfirmView(message.author.id, denied_matches)
+        await message.channel.send(
+            f"<@{message.author.id}> you want me to forget {facts_str}? you sure?",
+            view=view
+        )
+        return  # don't process further, wait for their response
     if should_extract(uid_str):
         await loop.run_in_executor(executor, extract_memory, message.author.id, content)
         await loop.run_in_executor(executor, extract_relationships, message.author.id, attributed_content)

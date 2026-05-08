@@ -3,6 +3,8 @@ import time
 import logging
 from groq import Groq
 import os
+import re
+import unicodedata
 
 log = logging.getLogger("corsbot.ai")
 
@@ -22,25 +24,43 @@ FALLBACK_RESPONSES = [
     "i'm having a moment, try again",
 ]
 
+
 # ---------------- PROMPT INJECTION GUARD ---------------- #
 
 _INJECTION_PATTERNS = [
-    "ignore previous instructions",
-    "ignore all instructions",
-    "disregard previous",
-    "forget your instructions",
-    "new instructions:",
-    "system prompt:",
-    "jailbreak",
-    "dan mode",
-    "developer mode",
-    "override instructions",
+    r"ignore\s+(all\s+)?previous\s+instructions?",
+    r"disregard\s+(all\s+)?rules?",
+    r"system\s+override",
+    r"developer\s+mode",
+    r"bypass\s+(all\s+)?filters?",
+    r"act\s+as\s+if\s+you\s+are",
+    r"simulate\s+developer",
+    r"pretend\s+to\s+be",
+    r"jailbreak",
+    r"dan\s+mode",
 ]
 
-def is_prompt_injection(text: str) -> bool:
-    lower = text.lower()
-    return any(pattern in lower for pattern in _INJECTION_PATTERNS)
+_LEET_MAP = str.maketrans({
+    "0": "o",
+    "1": "i",
+    "3": "e",
+    "4": "a",
+    "5": "s",
+    "7": "t",
+})
 
+def normalize_input(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"`{1,3}.*?`{1,3}", " ", text, flags=re.DOTALL)
+    text = re.sub(r"[*_~>#]", " ", text)
+    text = text.translate(_LEET_MAP)
+    text = re.sub(r"\s+", " ", text)
+    return text.lower().strip()
+
+def is_prompt_injection(text: str) -> bool:
+    normalized = normalize_input(text)
+    return any(re.search(pattern, normalized) for pattern in _INJECTION_PATTERNS)
 
 def truncate_text(text: str, max_chars: int) -> str:
     if not text or len(text) <= max_chars:
@@ -153,7 +173,7 @@ def _enforce_brevity(text: str, max_sentences: int = 3) -> str:
     return " ".join(sentences[:max_sentences])
 
 
-def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name=""):
+def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name="", session_context=""):
     history = trim_history(history)
     memory = truncate_text(memory, MAX_MEMORY_CHARS)
     relationships = truncate_text(relationships, MAX_MEMORY_CHARS)
@@ -161,6 +181,8 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
     feedback_context = truncate_text(feedback_context, MAX_FEEDBACK_CHARS)
 
     system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name)
+    if session_context:
+        system += f"\n\nCurrent session context:\n{session_context}"
     messages = [{"role": "system", "content": system}] + history
 
     try:

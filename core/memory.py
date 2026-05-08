@@ -207,8 +207,9 @@ def should_extract(user_id: str) -> bool:
     _msg_counter[user_id] += 1
     return _msg_counter[user_id] % MEMORY_EXTRACT_EVERY == 0
 
-def check_and_delete_denied_facts(user_id, message: str):
-    """If user denies a stored fact ('I'm not X', 'I don't X'), delete it from memory."""
+def check_and_delete_denied_facts(user_id, message: str) -> list:
+    """If user denies a stored fact, return list of matching (key, value) to confirm deletion.
+    Does NOT delete immediately — caller should ask for confirmation first."""
     denial_patterns = [
         r"i'?m not (.+)",
         r"i am not (.+)",
@@ -236,36 +237,45 @@ def check_and_delete_denied_facts(user_id, message: str):
     for pattern in denial_patterns:
         match = _re.search(pattern, lower)
         if match:
-            if match.lastindex:
-                denied_phrase = match.group(1).strip()
-            else:
-                denied_phrase = lower  # generic denial, search broadly
+            denied_phrase = match.group(1).strip() if match.lastindex else lower
             break
 
     if not denied_phrase:
-        return
+        return []
 
-    # Find facts that semantically match the denied phrase
     _, cursor = get_db()
     cursor.execute("SELECT key, value FROM memory WHERE user_id=?", (str(user_id),))
     rows = cursor.fetchall()
     if not rows:
-        return
+        return []
 
     denied_vec = _embed_vec(denied_phrase)
-    to_delete = []
+    matches = []
     for key, value in rows:
+        # Skip identity keys like display_name, username
+        if key in ("display_name", "username", "server_nickname"):
+            continue
         fact_vec = _embed_vec(f"{key}: {value}")
         sim = float(np.dot(denied_vec, fact_vec))
-        if sim > 0.65:  # high threshold — only delete if very confident it matches
-            to_delete.append(key)
+        if sim > 0.65:
+            matches.append((key, value))
 
-    if to_delete:
-        conn, cursor = get_db()
-        for key in to_delete:
-            cursor.execute("DELETE FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
-            log.info(f"[memory] deleted denied fact: user={user_id} key={key}")
-        conn.commit()
+    return matches
+
+def delete_denied_fact(user_id, key: str):
+    """Delete a fact and store a denial record so it won't be re-extracted."""
+    conn, cursor = get_db()
+    cursor.execute("DELETE FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
+    # Store the denial as a special fact so extraction won't re-add it
+    denial_key = f"denied_{key}"
+    cursor.execute(
+        """INSERT INTO memory (user_id, key, value, updated_at, memory_type, reinforcement)
+           VALUES (?, ?, 'denied', ?, 'identity', 99)
+           ON CONFLICT(user_id, key) DO UPDATE SET value='denied', updated_at=excluded.updated_at""",
+        (str(user_id), denial_key, time.time())
+    )
+    conn.commit()
+    log.info(f"[memory] deleted and locked denied fact: user={user_id} key={key}")
 
 def extract_memory(user_id, message):
     if len(message.split()) < 5:
