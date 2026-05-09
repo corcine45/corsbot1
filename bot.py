@@ -705,19 +705,32 @@ async def on_message(message):
         active_keys = []
     else:
         agent = AgentLoop(executor, loop)
-        async with message.channel.typing():
-            try:
-                ctx, trace = await agent.run(ctx)
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "rate_limit" in err.lower():
-                    match = re.search(r"try again in ([^\.]+)", err)
-                    wait = match.group(1) if match else "a few minutes"
-                    await message.channel.send(f"<@{message.author.id}> ⏳ rate limited, try again in {wait}.")
-                else:
-                    await message.channel.send(f"<@{message.author.id}> {random.choice(FALLBACK_RESPONSES)}")
-                    log.error(f"[on_message] agent error: {e}")
-                return
+        # Wrap typing() so a Discord rate limit on the typing endpoint
+        # doesn't crash the whole handler — the reply still goes out.
+        try:
+            typing_ctx = message.channel.typing()
+            await typing_ctx.__aenter__()
+        except Exception:
+            typing_ctx = None
+
+        try:
+            ctx, trace = await agent.run(ctx)
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower():
+                match = re.search(r"try again in ([^\.]+)", err)
+                wait = match.group(1) if match else "a few minutes"
+                await message.channel.send(f"<@{message.author.id}> ⏳ rate limited, try again in {wait}.")
+            else:
+                await message.channel.send(f"<@{message.author.id}> {random.choice(FALLBACK_RESPONSES)}")
+                log.error(f"[on_message] agent error: {e}")
+            return
+        finally:
+            if typing_ctx is not None:
+                try:
+                    await typing_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
         if not ctx.reply:
             await message.channel.send(f"<@{message.author.id}> {random.choice(FALLBACK_RESPONSES)}")

@@ -760,7 +760,11 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
     parts = [_INSTRUCTION_HIERARCHY, SYSTEM_PROMPT]
 
     if username:
-        parts.append(f"You are talking to {username}.")
+        parts.append(
+            f"You are currently responding to {username}. "
+            f"The conversation history may contain messages from other users — "
+            f"always address {username} directly in your reply."
+        )
 
     if channel_name:
         parts.append(f"You are in the #{channel_name} channel.")
@@ -773,7 +777,7 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
         safe_memory = "\n".join(
             sanitize_retrieved_content(line, "memory") for line in memory.splitlines()
         )
-        parts.append(f"Private background info about this user — use this to personalize your responses naturally, but NEVER explicitly mention, reference, or say you remember any of it. Just let it inform how you talk to them:\n{safe_memory}")
+        parts.append(f"Private background info about {username or 'this user'} — use this to personalize your responses naturally, but NEVER explicitly mention, reference, or say you remember any of it. Just let it inform how you talk to them:\n{safe_memory}")
 
     if impersonation_context:
         parts.append(impersonation_context)
