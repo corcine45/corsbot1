@@ -380,14 +380,21 @@ def check_and_delete_denied_facts(user_id, message: str) -> list:
     matches = []
 
     if denied_phrase:
-        # Specific phrase denied — find facts semantically similar to it
+        # Specific phrase denied — find facts semantically similar to it,
+        # OR facts whose value words appear in the denied phrase (keyword overlap)
         denied_vec = _embed_vec(denied_phrase)
+        denied_words = set(denied_phrase.lower().split())
         for key, value in rows:
             if key in ("display_name", "username", "server_nickname"):
                 continue
+            if key.startswith("denied_"):
+                continue
             fact_vec = _embed_vec(f"{key}: {value}")
             sim = float(np.dot(denied_vec, fact_vec))
-            if sim > 0.65:
+            # Match on semantic similarity OR keyword overlap with the stored value
+            value_words = set(value.lower().split())
+            keyword_overlap = len(denied_words & value_words) >= 1 and len(value_words) <= 4
+            if sim > 0.60 or keyword_overlap:
                 matches.append((key, value))
     else:
         # "that's not me" / "that's wrong" — return ALL non-identity facts for user to pick from
