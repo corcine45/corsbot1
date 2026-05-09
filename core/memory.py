@@ -297,10 +297,23 @@ MAX_MEMORY_FACTS = 6
 DEDUP_SIMILARITY_THRESHOLD = 0.92  # facts this similar are considered duplicates
 
 # Keys that are stored but never auto-injected into the prompt.
-# nickname/title are excluded because the bot should never address someone
-# by a name they haven't used themselves in the current conversation.
-# The user can still see these via /memory.
-_PROMPT_EXCLUDED_KEYS = {"nickname", "title"}
+# nickname/title excluded: bot should never address someone by a stored name unprompted.
+# Any key containing another person's name is also excluded at retrieval time.
+_PROMPT_EXCLUDED_KEYS = {"nickname", "title", "aura", "bayot", "king", "queen", "god", "goat"}
+
+
+def _is_about_other_person(key: str, value: str) -> bool:
+    """
+    Returns True if this fact appears to be about another person rather than the user.
+    Keys like 'bennn_aura', 'crisumiles_role', or values referencing other people
+    should not be injected into the prompt as facts about the current user.
+    """
+    # If the key contains an underscore and the prefix looks like a name (capitalized word)
+    # it was probably stored as "PersonName_attribute"
+    import re as _re
+    if _re.match(r'^[a-z]{3,}[_][a-z]', key):
+        return True
+    return False
 _msg_counter: dict = {}
 
 def should_extract(user_id: str) -> bool:
@@ -791,6 +804,8 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
         if key in _PROMPT_EXCLUDED_KEYS:
             continue  # stored but never auto-injected
+        if _is_about_other_person(key, value):
+            continue  # fact is about someone else, not the current user
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue
@@ -847,6 +862,8 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
         if key in _PROMPT_EXCLUDED_KEYS:
             continue  # stored but never auto-injected
+        if _is_about_other_person(key, value):
+            continue  # fact is about someone else, not the current user
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue

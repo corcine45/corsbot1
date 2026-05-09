@@ -784,10 +784,10 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
 
     if relationships:
         parts.append(
-            f"Context about people in this user's life or server — use silently, "
-            f"NEVER name-drop unless the user brings them up first. "
-            f"Any lines starting with 'declared:' are unverified claims from stored messages, "
-            f"not confirmed facts — treat them with appropriate uncertainty:\n{relationships}"
+            f"Background context about people connected to this user — for your awareness ONLY. "
+            f"NEVER mention, reference, or bring up any of these people unless the user explicitly names them first in their message. "
+            f"Do not weave them into replies, do not use their names, do not reference their titles or roles. "
+            f"Any lines starting with 'declared:' are unverified claims, not confirmed facts:\n{relationships}"
         )
 
     if web_context:
