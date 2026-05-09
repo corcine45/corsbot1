@@ -1091,6 +1091,12 @@ Remember context from earlier in the conversation and refer back to it naturally
 # ---------------- CHAT ---------------- #
 
 def _build_system_prompt(username: str | None, memory: str, relationships: str, web_context: str, impersonation_context: str = "", feedback_context: str = "", channel_name: str = "", reflection: str = "", emotion_hint: str = "", personality_hint: str = "", user_activity: str = "", user_status: str = "", user_state_summary: str = "") -> str:
+    # Guard: ensure all string args are actually strings (defensive against tuple leaks)
+    memory = memory[0] if isinstance(memory, tuple) else (memory or "")
+    relationships = relationships[0] if isinstance(relationships, tuple) else (relationships or "")
+    web_context = web_context[0] if isinstance(web_context, tuple) else (web_context or "")
+    reflection = reflection[0] if isinstance(reflection, tuple) else (reflection or "")
+    user_state_summary = user_state_summary[0] if isinstance(user_state_summary, tuple) else (user_state_summary or "")
     # Hierarchy block is always first — highest priority
     parts = [_INSTRUCTION_HIERARCHY, SYSTEM_PROMPT]
 

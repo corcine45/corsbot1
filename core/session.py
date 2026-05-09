@@ -337,7 +337,7 @@ def analyze_state(user_id: int) -> tuple[ConversationState, UserState]:
 
     conversation = "\n".join(f"- {m}" for m in messages)
     try:
-        raw = groq_call(
+        raw, _ = groq_call(
             "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": _ANALYZER_PROMPT},

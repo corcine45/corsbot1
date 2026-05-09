@@ -19,6 +19,9 @@ MAX_SUMMARY_CHARS = 2600
 def _clean(value: Any) -> str:
     if value is None:
         return ""
+    if isinstance(value, tuple):
+        # Defensive: groq_call returns (content, tokens) — extract content
+        value = value[0] if value else ""
     if isinstance(value, str):
         return value.strip()
     return str(value).strip()
