@@ -585,15 +585,19 @@ def extract_memory(user_id, message):
             "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": (
-                    "Extract nuanced personal facts about the user from their message. "
-                    "Focus on: personality traits, preferences, opinions, hobbies, "
-                    "self-given titles or nicknames, and things they like/dislike. "
+                    "Extract personal facts about the USER THEMSELVES from their message. "
+                    "Only extract things the user is explicitly stating about themselves. "
+                    "Focus on: genuine preferences, hobbies, opinions they hold, things they like/dislike. "
                     f"{skip_hint}"
                     "Reply in key=value format, one per line. "
-                    "Use snake_case keys like: likes, dislikes, favorite_game, hobby, "
-                    "personality, opinion_on, title, nickname, etc. "
-                    "Only extract facts clearly stated or strongly implied. "
-                    "If none, reply: NONE"
+                    "Use snake_case keys like: likes, dislikes, favorite_game, hobby, opinion_on, etc. "
+                    "STRICT RULES — do NOT extract:\n"
+                    "- Nicknames, titles, or labels (even if said jokingly — e.g. 'king of X', 'bayot', 'goat')\n"
+                    "- Things said about OTHER people\n"
+                    "- Jokes, memes, or sarcastic statements\n"
+                    "- Slang used in passing (e.g. 'fr', 'no cap', 'bussin')\n"
+                    "- Anything said in a roleplay or hypothetical context\n"
+                    "Only extract clear, sincere, first-person facts. If none, reply: NONE"
                 )},
                 {"role": "user", "content": message}
             ],
