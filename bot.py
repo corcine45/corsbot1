@@ -723,11 +723,18 @@ async def on_message(message):
     )
 
     # Check cache before running the full agent
-    cache_key = build_response_cache_key(thread_id, content, "", "", "", feedback_context)
+    # Fetch memory context for cache key validation
+    memory_context = await loop.run_in_executor(executor, lambda: get_db()[1].execute(
+        "SELECT GROUP_CONCAT(value, ', ') FROM memory WHERE user_id=? LIMIT 5",
+        (uid_str,)
+    ).fetchone()[0])
+    
+    cache_key = build_response_cache_key(thread_id, content, memory_context or "", "", "", feedback_context)
     cached = get_cached_response(cache_key)
     if cached:
         reply = cached
         active_keys = []
+        # Don't store emotion state from cached response — it's from a past generation
     else:
         agent = AgentLoop(executor, loop)
         # Wrap typing() so a Discord rate limit on the typing endpoint
@@ -766,7 +773,9 @@ async def on_message(message):
         set_cached_response(cache_key, reply)
 
     await loop.run_in_executor(executor, store_message, thread_id, "assistant", reply)
-    store_last_reply(str(message.author.id), reply, getattr(ctx, "emotion_state", None) or "default", active_keys)
+    # Only store emotion state if this wasn't a cached response
+    if not cached:
+        store_last_reply(str(message.author.id), reply, getattr(ctx, "emotion_state", None) or "default", active_keys)
     reply = resolve_mentions_in_reply(reply, message.guild)
 
     await send_reply(message.channel, f"<@{message.author.id}> {reply}")
