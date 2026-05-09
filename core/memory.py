@@ -291,7 +291,7 @@ def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> flo
 
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
-MEMORY_EXTRACT_EVERY = 3
+MEMORY_EXTRACT_EVERY = 1  # extract on every message — memory is user-scoped across DMs and servers
 MEMORY_SIMILARITY_THRESHOLD = 0.48
 MAX_MEMORY_FACTS = 6
 DEDUP_SIMILARITY_THRESHOLD = 0.92  # facts this similar are considered duplicates
@@ -557,7 +557,7 @@ def extract_memory(user_id, message):
         Only runs if the message is long enough, and skips keys already
         covered by the deterministic pass.
     """
-    if len(message.split()) < 3:
+    if len(message.split()) < 2:
         return
 
     conn, cursor = get_db()
