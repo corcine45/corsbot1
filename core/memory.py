@@ -295,6 +295,12 @@ MEMORY_EXTRACT_EVERY = 3
 MEMORY_SIMILARITY_THRESHOLD = 0.48
 MAX_MEMORY_FACTS = 6
 DEDUP_SIMILARITY_THRESHOLD = 0.92  # facts this similar are considered duplicates
+
+# Keys that are stored but never auto-injected into the prompt.
+# nickname/title are excluded because the bot should never address someone
+# by a name they haven't used themselves in the current conversation.
+# The user can still see these via /memory.
+_PROMPT_EXCLUDED_KEYS = {"nickname", "title"}
 _msg_counter: dict = {}
 
 def should_extract(user_id: str) -> bool:
@@ -779,6 +785,8 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
 
     non_identity = {}
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
+        if key in _PROMPT_EXCLUDED_KEYS:
+            continue  # stored but never auto-injected
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue
@@ -833,6 +841,8 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
 
     non_identity = {}
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
+        if key in _PROMPT_EXCLUDED_KEYS:
+            continue  # stored but never auto-injected
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue
