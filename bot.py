@@ -95,6 +95,7 @@ _user_cooldowns: dict[int, float] = {}
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.presences = True
 
 class CorsBot(discord.Client):
     def __init__(self):
@@ -552,6 +553,19 @@ async def slash_help(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
+
+@client.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    """Track when users change their status or what they're playing."""
+    if before.activity != after.activity:
+        activity_str = "nothing" if after.activity is None else f"{after.activity.name}"
+        print(f"{after.name} is now playing: {activity_str}")
+
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Track member status changes (online, idle, offline, dnd)."""
+    if before.status != after.status:
+        print(f"{after.name}'s status changed: {before.status} → {after.status}")
 
 @client.event
 async def on_message(message):
