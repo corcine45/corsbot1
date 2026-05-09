@@ -194,15 +194,15 @@ class AgentLoop:
             "kinsa", "kinsa si", "kinsa ang",
         )
         _TITLE_TRIGGERS = (
+            # Only fire cross-user search for role/title queries, NOT person names
             "who is the", "who is king", "who is lord", "who is boss",
             "who is queen", "who is god", "who is goat", "who is legend",
             "who da king", "who da boss", "who da goat", "who da god",
             "who da best", "who da real", "who da one", "who da legend",
             "who declared", "who said they", "who called themselves",
             "who holds", "who owns", "who got the title", "who is titled",
-            "who is known as", "who goes by", "who is called",
             "who's the", "whos the", "who's da", "whos da",
-            "kinsa ang", "kinsa si",
+            "kinsa ang",
         )
         lower = ctx.content.lower()
         if any(t in lower for t in _RELATIONSHIP_TRIGGERS):
@@ -211,6 +211,9 @@ class AgentLoop:
                 self._run_sync(get_relationships, ctx.user_id)
             )
             ctx.relationships = rels or ""
+            # Cross-user search: only for role/title queries, not person-name lookups.
+            # "who is dimples" should NOT scan all users' memory — that surfaces
+            # stored facts as if they're confirmed truth.
             if any(t in lower for t in _TITLE_TRIGGERS):
                 cross = await self._step(
                     trace, "cross_user_search",

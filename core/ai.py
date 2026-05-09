@@ -783,7 +783,12 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
         parts.append(impersonation_context)
 
     if relationships:
-        parts.append(f"Private context about people in this user's life — use this silently to understand their world, NEVER name-drop or reference these people unless the user brings them up first:\n{relationships}")
+        parts.append(
+            f"Context about people in this user's life or server — use silently, "
+            f"NEVER name-drop unless the user brings them up first. "
+            f"Any lines starting with 'declared:' are unverified claims from stored messages, "
+            f"not confirmed facts — treat them with appropriate uncertainty:\n{relationships}"
+        )
 
     if web_context:
         # Sanitize web results — external content is untrusted
