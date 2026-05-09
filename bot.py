@@ -707,6 +707,29 @@ async def on_message(message):
 
     # Build agent context
     from core.agent import AgentContext, AgentLoop
+    
+    # Get user's presence info
+    user_member = None
+    if message.guild:
+        user_member = message.guild.get_member(message.author.id)
+    
+    user_activity = ""
+    user_status = ""
+    if user_member:
+        if user_member.activity:
+            activity = user_member.activity
+            # For Spotify/streaming: try to get song details
+            if hasattr(activity, 'details') and activity.details:
+                # Spotify format: details = song name, state = artist - track
+                if hasattr(activity, 'state') and activity.state:
+                    user_activity = f"{activity.name}: {activity.state} - {activity.details}"
+                else:
+                    user_activity = f"{activity.name}: {activity.details}"
+            else:
+                # Fallback to just the activity name
+                user_activity = activity.name
+        user_status = str(user_member.status)
+    
     ctx = AgentContext(
         user_id=message.author.id,
         uid_str=uid_str,
@@ -720,6 +743,8 @@ async def on_message(message):
         is_impersonating=is_impersonating,
         history=history,
         feedback_context=feedback_context,
+        user_activity=user_activity,
+        user_status=user_status,
     )
 
     # Check cache before running the full agent

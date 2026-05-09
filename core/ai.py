@@ -755,7 +755,7 @@ Remember context from earlier in the conversation and refer back to it naturally
 
 # ---------------- CHAT ---------------- #
 
-def _build_system_prompt(username: str | None, memory: str, relationships: str, web_context: str, impersonation_context: str = "", feedback_context: str = "", channel_name: str = "", reflection: str = "", emotion_hint: str = "", personality_hint: str = "") -> str:
+def _build_system_prompt(username: str | None, memory: str, relationships: str, web_context: str, impersonation_context: str = "", feedback_context: str = "", channel_name: str = "", reflection: str = "", emotion_hint: str = "", personality_hint: str = "", user_activity: str = "", user_status: str = "") -> str:
     # Hierarchy block is always first — highest priority
     parts = [_INSTRUCTION_HIERARCHY, SYSTEM_PROMPT]
 
@@ -807,6 +807,12 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
     if personality_hint:
         parts.append(personality_hint)
 
+    if user_activity:
+        parts.append(f"Right now, {username or 'this user'} is playing/listening to: {user_activity}")
+
+    if user_status and user_status != "online":
+        parts.append(f"User status: {user_status}")
+
     return "\n\n".join(parts)
 
 
@@ -829,7 +835,7 @@ def _enforce_brevity(text: str, max_sentences: int = 3) -> str:
     return " ".join(sentences[:max_sentences])
 
 
-def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name="", session_context="", reflection="", emotion_hint="", emotion_state=None):
+def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name="", session_context="", reflection="", emotion_hint="", emotion_state=None, user_activity="", user_status=""):
     history = trim_history(history)
     memory = truncate_text(memory, MAX_MEMORY_CHARS)
     relationships = truncate_text(relationships, MAX_MEMORY_CHARS)
@@ -844,7 +850,7 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
     # Personality mode
     personality_hint = get_personality_mode_hint(last_user_msg, emotion_state, user_id)
 
-    system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name, reflection, emotion_hint, personality_hint)
+    system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name, reflection, emotion_hint, personality_hint, user_activity, user_status)
     if session_context:
         system += "\n\n" + _build_session_block(session_context)
 

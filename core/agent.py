@@ -44,6 +44,8 @@ class AgentContext:
     guild_id: int | None = None
     mentioned_users: dict = field(default_factory=dict)
     is_impersonating: bool = False
+    user_activity: str = ""  # What the user is playing/listening to
+    user_status: str = ""    # online, idle, offline, dnd
 
     # Step outputs (filled during run)
     emotion_state: str | None = None
@@ -277,6 +279,7 @@ class AgentLoop:
                 ctx.impersonation_context, ctx.feedback_context,
                 ctx.channel_name, ctx.session_context,
                 ctx.reflection, ctx.emotion_hint, ctx.emotion_state,
+                ctx.user_activity, ctx.user_status,
             )
         )
         return result
