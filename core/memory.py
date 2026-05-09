@@ -726,7 +726,7 @@ def extract_memory(user_id, message):
     )
 
     try:
-        output = groq_call(
+        result = groq_call(
             "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": (
@@ -748,6 +748,16 @@ def extract_memory(user_id, message):
             ],
             max_tokens=80, retries=2, timeout=10,
         )
+        # Handle both tuple return (content, tokens) and direct string return
+        if isinstance(result, tuple):
+            output = result[0]
+        else:
+            output = result
+        
+        if not isinstance(output, str):
+            log.warning(f"[memory] groq_call returned non-string output: {type(output)}")
+            return
+        
         if output.strip().upper() == "NONE":
             return
 
@@ -1233,7 +1243,7 @@ def extract_relationships(user_id, message):
     if len(message.split()) < 4:
         return
     try:
-        output = groq_call(
+        output, _ = groq_call(
             "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": (
@@ -1554,7 +1564,7 @@ def extract_relationship_categories_from_message(user_id: str, message: str):
     
     # Use AI to extract and categorize relationships
     try:
-        output = groq_call(
+        output, _ = groq_call(
             "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": (
@@ -1792,7 +1802,7 @@ def update_reflection(user_id: str, recent_messages: list[str]):
             )
             max_tokens = 80
         
-        output = groq_call(
+        output, _ = groq_call(
             "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": system_prompt},
@@ -1878,7 +1888,7 @@ def generate_reflection_summary(user_id: str) -> str:
     context = "\n\n".join(context_parts)
     
     try:
-        output = groq_call(
+        output, _ = groq_call(
             "llama-3.1-8b-instant",
             [
                 {"role": "system", "content": (
