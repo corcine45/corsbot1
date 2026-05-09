@@ -307,36 +307,49 @@ def check_and_delete_denied_facts(user_id, message: str) -> list:
     """If user denies a stored fact, return list of matching (key, value) to confirm deletion.
     Does NOT delete immediately — caller should ask for confirmation first."""
     denial_patterns = [
-        r"i'?m not (.+)",
-        r"i am not (.+)",
-        r"i don'?t (.+)",
-        r"i do not (.+)",
-        r"i never (.+)",
-        r"i'?m no longer (.+)",
-        r"i'?m not a (.+)",
-        r"i'?m not the (.+)",
-        r"that'?s not true",
-        r"that is not true",
-        r"that'?s false",
-        r"that is false",
-        r"that'?s wrong",
-        r"that is wrong",
-        r"delete that",
-        r"forget that",
-        r"that'?s not me",
-        r"that is not me",
+        # Patterns WITH a capture group — the captured phrase is what was denied
+        (r"i'?m not (.+)",           True),
+        (r"i am not (.+)",           True),
+        (r"i don'?t (.+)",           True),
+        (r"i do not (.+)",           True),
+        (r"i never (.+)",            True),
+        (r"i'?m no longer (.+)",     True),
+        (r"i'?m not a (.+)",         True),
+        (r"i'?m not the (.+)",       True),
+        # Patterns WITHOUT a capture group — scan ALL stored facts for a match
+        (r"that'?s not true",        False),
+        (r"that is not true",        False),
+        (r"that'?s false",           False),
+        (r"that is false",           False),
+        (r"that'?s wrong",           False),
+        (r"that is wrong",           False),
+        (r"delete that",             False),
+        (r"forget that",             False),
+        (r"that'?s not me",          False),
+        (r"that is not me",          False),
+        (r"not me btw",              False),
+        (r"that'?s not my",          False),
+        (r"that is not my",          False),
     ]
     import re as _re
     lower = message.lower().strip()
 
     denied_phrase = None
-    for pattern in denial_patterns:
+    scan_all = False
+
+    for pattern, has_capture in denial_patterns:
         match = _re.search(pattern, lower)
         if match:
-            denied_phrase = match.group(1).strip() if match.lastindex else lower
+            if has_capture and match.lastindex:
+                denied_phrase = match.group(1).strip()
+                # Strip trailing filler words
+                denied_phrase = _re.sub(r'\s+(btw|tho|though|lol|fr|ngl|tbh)$', '', denied_phrase).strip()
+            else:
+                # No specific phrase — scan all stored facts against the recent bot message context
+                scan_all = True
             break
 
-    if not denied_phrase:
+    if not denied_phrase and not scan_all:
         return []
 
     _, cursor = get_db()
@@ -345,16 +358,29 @@ def check_and_delete_denied_facts(user_id, message: str) -> list:
     if not rows:
         return []
 
-    denied_vec = _embed_vec(denied_phrase)
     matches = []
-    for key, value in rows:
-        # Skip identity keys like display_name, username
-        if key in ("display_name", "username", "server_nickname"):
-            continue
-        fact_vec = _embed_vec(f"{key}: {value}")
-        sim = float(np.dot(denied_vec, fact_vec))
-        if sim > 0.65:
-            matches.append((key, value))
+
+    if denied_phrase:
+        # Specific phrase denied — find facts semantically similar to it
+        denied_vec = _embed_vec(denied_phrase)
+        for key, value in rows:
+            if key in ("display_name", "username", "server_nickname"):
+                continue
+            fact_vec = _embed_vec(f"{key}: {value}")
+            sim = float(np.dot(denied_vec, fact_vec))
+            if sim > 0.65:
+                matches.append((key, value))
+    else:
+        # "that's not me" / "that's wrong" — return ALL non-identity facts for user to pick from
+        # Limit to the most recently updated facts (most likely what was just referenced)
+        cursor.execute(
+            "SELECT key, value FROM memory WHERE user_id=? "
+            "AND key NOT IN ('display_name','username','server_nickname') "
+            "ORDER BY updated_at DESC LIMIT 5",
+            (str(user_id),)
+        )
+        matches = [(k, v) for k, v in cursor.fetchall()
+                   if not k.startswith("denied_")]
 
     return matches
 
