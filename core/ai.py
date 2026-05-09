@@ -818,9 +818,7 @@ def _build_session_block(session_context: str) -> str:
 
 def _enforce_brevity(text: str, max_sentences: int = 3) -> str:
     """Trim response to max_sentences if it's too long."""
-    # Split on sentence endings
-    import re as _re
-    sentences = _re.split(r'(?<=[.!?])\s+', text.strip())
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     if len(sentences) <= max_sentences:
         return text
     return " ".join(sentences[:max_sentences])

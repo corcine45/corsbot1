@@ -219,11 +219,22 @@ async def extract_attachment_text(attachment: discord.Attachment) -> str:
     if not attachment.content_type or not attachment.content_type.startswith("image/"):
         return ""
 
+    # Reject images over 8MB to prevent DoS
+    MAX_IMAGE_BYTES = 8 * 1024 * 1024
+    if attachment.size and attachment.size > MAX_IMAGE_BYTES:
+        log.warning(f"[vision] image too large ({attachment.size} bytes), skipping")
+        return ""
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(attachment.url) as response:
                 if response.status != 200:
                     print(f"[vision] failed to download image: {response.status}")
+                    return ""
+                # Double-check Content-Length if available
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_IMAGE_BYTES:
+                    log.warning(f"[vision] Content-Length too large, skipping")
                     return ""
                 data = await response.read()
 

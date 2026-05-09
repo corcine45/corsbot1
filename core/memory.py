@@ -1072,30 +1072,4 @@ def get_reflection(user_id: str) -> str:
     return row[0] if row else ""
 
 
-def _extract_facts_about(user_id: int, message: str) -> str:
-    """Extract facts claimed about a mentioned user by someone else.
-    Returns the raw claim text for confirmation, or empty string if nothing found."""
-    if len(message.split()) < 3:
-        return ""
-    try:
-        output = groq_call(
-            "llama-3.1-8b-instant",
-            [
-                {"role": "system", "content": (
-                    "Someone is making a claim about another person in this message. "
-                    "Extract only the factual claims being made about the mentioned person (not the speaker). "
-                    "Reply with a short plain-English summary of what's being claimed about them. "
-                    "Example: 'is funny, plays Valorant' or 'is the king of aura'. "
-                    "If no clear claims about another person, reply: NONE"
-                )},
-                {"role": "user", "content": message}
-            ],
-            max_tokens=60, retries=1, timeout=8,
-        )
-        result = output.strip()
-        if result.upper() == "NONE" or not result:
-            return ""
-        return result
-    except Exception as e:
-        log.error(f"_extract_facts_about error: {e}")
-        return ""
+

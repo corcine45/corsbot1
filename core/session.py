@@ -81,8 +81,8 @@ class ConversationState:
         if age >= SESSION_TIMEOUT:
             return 0.0
         if age >= DECAY_PARTIAL_AT:
-            # Linear decay from 1.0 at 15min to 0.0 at 30min
-            return 1.0 - (age - DECAY_PARTIAL_AT) / (SESSION_TIMEOUT - DECAY_PARTIAL_AT)
+            # Linear decay from 1.0 at 15min to 0.0 at 30min — clamped to [0, 1]
+            return max(0.0, 1.0 - (age - DECAY_PARTIAL_AT) / (SESSION_TIMEOUT - DECAY_PARTIAL_AT))
         return 1.0
 
     def to_prompt_block(self) -> str:
@@ -125,7 +125,7 @@ class UserState:
         if age >= SESSION_TIMEOUT:
             return 0.0
         if age >= DECAY_PARTIAL_AT:
-            return 1.0 - (age - DECAY_PARTIAL_AT) / (SESSION_TIMEOUT - DECAY_PARTIAL_AT)
+            return max(0.0, 1.0 - (age - DECAY_PARTIAL_AT) / (SESSION_TIMEOUT - DECAY_PARTIAL_AT))
         return 1.0
 
     def to_prompt_block(self) -> str:
