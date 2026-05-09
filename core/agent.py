@@ -48,14 +48,19 @@ class AgentContext:
     user_status: str = ""    # online, idle, offline, dnd
 
     # Step outputs (filled during run)
+    raw_emotion_state: str | None = None
     emotion_state: str | None = None
+    emotion_momentum: str = ""
     emotion_hint: str = ""
     memory: str = ""
     active_keys: list = field(default_factory=list)
     relationships: str = ""
     reflection: str = ""
+    presence_patterns: str = ""
     web_context: str = ""
     session_context: str = ""
+    user_state: dict = field(default_factory=dict)
+    user_state_summary: str = ""
     feedback_context: str = ""
     impersonation_context: str = ""
     history: list = field(default_factory=list)
@@ -142,12 +147,18 @@ class AgentLoop:
 
     async def step_classify(self, ctx: AgentContext, trace: AgentTrace):
         """Step 1: Classify emotion. Synchronous — no I/O."""
-        from .emotion import classify_emotion, get_emotion_style_hint
+        from .emotion import classify_emotion, apply_emotional_momentum, get_emotion_style_hint
         t0 = time.perf_counter()
-        ctx.emotion_state = classify_emotion(ctx.content)
+        ctx.raw_emotion_state = classify_emotion(ctx.content)
+        ctx.emotion_state, ctx.emotion_momentum = apply_emotional_momentum(
+            ctx.user_id, ctx.raw_emotion_state
+        )
         ctx.emotion_hint = get_emotion_style_hint(ctx.emotion_state)
         ms = (time.perf_counter() - t0) * 1000
-        trace.add("classify", ms, "ok", ctx.emotion_state or "none")
+        detail = ctx.emotion_state or "none"
+        if ctx.emotion_momentum:
+            detail = f"{ctx.raw_emotion_state or 'none'} -> {ctx.emotion_state} ({ctx.emotion_momentum})"
+        trace.add("classify", ms, "ok", detail)
 
     async def step_memory(self, ctx: AgentContext, trace: AgentTrace):
         """Step 2: Retrieve memory, relationships, and reflection."""
@@ -233,6 +244,13 @@ class AgentLoop:
         )
         ctx.reflection = reflection or ""
 
+        from .presence import get_presence_patterns
+        presence_patterns = await self._step(
+            trace, "presence_patterns",
+            self._run_sync(get_presence_patterns, ctx.uid_str)
+        )
+        ctx.presence_patterns = presence_patterns or ""
+
     async def step_search(self, ctx: AgentContext, trace: AgentTrace):
         """Step 3: Web search if the message needs real-time info."""
         from .search import needs_web_search, web_search, build_search_query
@@ -262,6 +280,17 @@ class AgentLoop:
         ms = (time.perf_counter() - t0) * 1000
         trace.add("session", ms, "ok", ctx.session_context[:60] if ctx.session_context else "empty")
 
+    async def step_user_state(self, ctx: AgentContext, trace: AgentTrace):
+        """Build one unified runtime profile for generation."""
+        from .user_state import build_user_state_from_context, compress_user_state
+
+        t0 = time.perf_counter()
+        ctx.user_state = build_user_state_from_context(ctx)
+        ctx.user_state_summary = compress_user_state(ctx.user_state, ctx.username)
+        ms = (time.perf_counter() - t0) * 1000
+        detail = f"{len(ctx.user_state_summary)} chars" if ctx.user_state_summary else "empty"
+        trace.add("user_state", ms, "ok", detail)
+
     async def step_generate(self, ctx: AgentContext, trace: AgentTrace) -> str | None:
         """
         Step 5: Generate the reply.
@@ -279,7 +308,7 @@ class AgentLoop:
                 ctx.impersonation_context, ctx.feedback_context,
                 ctx.channel_name, ctx.session_context,
                 ctx.reflection, ctx.emotion_hint, ctx.emotion_state,
-                ctx.user_activity, ctx.user_status,
+                ctx.user_activity, ctx.user_status, ctx.user_state_summary,
             )
         )
         return result
@@ -312,6 +341,7 @@ class AgentLoop:
         await self.step_memory(ctx, trace)
         await self.step_search(ctx, trace)
         await self.step_session(ctx, trace)
+        await self.step_user_state(ctx, trace)
 
         reply = await self.step_generate(ctx, trace)
         ctx.reply = reply or ""

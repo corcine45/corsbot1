@@ -13,7 +13,7 @@ DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve()
 DB_PATH = DATA_DIR / "brain.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_RETENTION = 5
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 IDENTITY_KEYS = {"name", "age", "location", "job", "display_name", "birthday", "gender", "nationality"}
 TEMPORARY_KEYS = {"mood", "currently", "doing", "feeling", "status", "playing_now", "watching_now"}
@@ -119,6 +119,31 @@ def initialize_schema(cursor):
     if "guild_id" not in feedback_cols:
         cursor.execute("ALTER TABLE feedback ADD COLUMN guild_id TEXT")
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tokens_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            tokens_used INTEGER,
+            model TEXT,
+            timestamp REAL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS presence_patterns (
+            user_id TEXT,
+            pattern_key TEXT,
+            kind TEXT,
+            subject TEXT,
+            count INTEGER DEFAULT 0,
+            night_count INTEGER DEFAULT 0,
+            social_count INTEGER DEFAULT 0,
+            updated_at REAL,
+            summary TEXT,
+            PRIMARY KEY (user_id, pattern_key)
+        )
+    """)
+
     cols = [row[1] for row in cursor.execute("PRAGMA table_info(memory)").fetchall()]
     if "key" not in cols and "fact" in cols:
         cursor.execute("ALTER TABLE memory RENAME TO memory_old")
@@ -175,6 +200,8 @@ def initialize_schema(cursor):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_relationships_user ON relationships(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_usage_user ON tokens_usage(user_id, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_presence_patterns_user ON presence_patterns(user_id, updated_at)")
 
 
 def get_db():
@@ -211,3 +238,43 @@ def get_history(thread_id, limit=8):
         {"role": r, "content": c if len(c) <= 900 else c[:899] + "…"}
         for r, c in rows
     ]
+
+
+def store_token_usage(user_id, tokens_used, model=""):
+    """Record API token usage for a user."""
+    conn, cursor = get_db()
+    cursor.execute(
+        "INSERT INTO tokens_usage (user_id, tokens_used, model, timestamp) VALUES (?, ?, ?, ?)",
+        (str(user_id), tokens_used, model, time.time()),
+    )
+    conn.commit()
+
+
+def get_token_stats(user_id):
+    """Get token usage stats for a user (total and today)."""
+    _, cursor = get_db()
+    
+    # Total tokens
+    cursor.execute(
+        "SELECT COALESCE(SUM(tokens_used), 0) FROM tokens_usage WHERE user_id=?",
+        (str(user_id),)
+    )
+    total = cursor.fetchone()[0]
+    
+    # Tokens today (last 24 hours)
+    now = time.time()
+    today_start = now - (24 * 3600)
+    cursor.execute(
+        "SELECT COALESCE(SUM(tokens_used), 0) FROM tokens_usage WHERE user_id=? AND timestamp > ?",
+        (str(user_id), today_start)
+    )
+    today = cursor.fetchone()[0]
+    
+    # Count of requests
+    cursor.execute(
+        "SELECT COUNT(*) FROM tokens_usage WHERE user_id=?",
+        (str(user_id),)
+    )
+    requests = cursor.fetchone()[0]
+    
+    return {"total": total, "today": today, "requests": requests}

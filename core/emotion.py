@@ -3,6 +3,8 @@ import requests
 import re
 import os
 import logging
+import time
+from collections import defaultdict, deque
 
 log = logging.getLogger("corsbot.emotion")
 
@@ -73,6 +75,15 @@ EMOTION_STYLE: dict[str, str] = {
         "Keep your reply SHORT (1 sentence). Acknowledge their frustration first. "
         "Don't be dismissive. No jokes unless they're clearly venting about something minor."
     ),
+    "frustrated": (
+        "The user has been irritated across multiple messages. "
+        "Treat this as building frustration, not a one-off reaction. "
+        "Be steady, validate the annoyance, and keep the reply short."
+    ),
+    "venting": (
+        "The user appears to be venting after sustained frustration. "
+        "Let them feel heard first. Do not debate, over-explain, or force solutions unless they ask."
+    ),
     "depressed": (
         "The user seems down or depressed. "
         "Be warm, empathetic, and genuine — no forced positivity. "
@@ -90,6 +101,10 @@ EMOTION_STYLE: dict[str, str] = {
         "Match their energy — be enthusiastic, use their slang, keep it punchy. "
         "Short and high-energy. Hype them up."
     ),
+    "hyper": (
+        "The user has sustained excited energy. "
+        "Match the momentum with fast, playful energy, but keep it readable and not overwhelming."
+    ),
     "sarcastic": (
         "The user is being sarcastic. "
         "Match the sarcasm — be witty and dry. Don't take the bait literally. "
@@ -106,6 +121,74 @@ EMOTION_STYLE: dict[str, str] = {
         "Short and funny. Banter back."
     ),
 }
+
+
+# ---------------- EMOTIONAL MOMENTUM ---------------- #
+
+EMOTION_HISTORY_LIMIT = 6
+EMOTION_HISTORY_TTL = 20 * 60
+
+_emotion_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=EMOTION_HISTORY_LIMIT))
+
+
+def _recent_emotions(user_id: int) -> list[str]:
+    now = time.time()
+    history = _emotion_history.get(user_id)
+    if not history:
+        return []
+
+    while history and now - history[0][1] > EMOTION_HISTORY_TTL:
+        history.popleft()
+    return [emotion for emotion, _ in history if emotion]
+
+
+def apply_emotional_momentum(user_id: int, current_emotion: str | None) -> tuple[str | None, str]:
+    """
+    Track emotional continuity and infer a momentum-adjusted state.
+
+    Examples:
+    - angry -> angry -> angry becomes venting
+    - angry -> angry becomes frustrated
+    - excited -> excited becomes hyper
+    - excited -> hyper-like momentum plus joking becomes joking
+    """
+    if current_emotion:
+        _emotion_history[user_id].append((current_emotion, time.time()))
+
+    recent = _recent_emotions(user_id)
+    if not recent:
+        return current_emotion, ""
+
+    tail3 = recent[-3:]
+    angry_count = sum(1 for e in tail3 if e in {"angry", "frustrated", "venting"})
+    excited_count = sum(1 for e in tail3 if e in {"excited", "hyper"})
+    joking_count = sum(1 for e in tail3 if e == "joking")
+
+    inferred = current_emotion
+    momentum = ""
+
+    if angry_count >= 3:
+        inferred = "venting"
+        momentum = "angry -> frustrated -> venting"
+    elif angry_count >= 2:
+        inferred = "frustrated"
+        momentum = "angry -> frustrated"
+    elif excited_count >= 2 and joking_count >= 1:
+        inferred = "joking"
+        momentum = "excited -> hyper -> joking"
+    elif excited_count >= 2:
+        inferred = "hyper"
+        momentum = "excited -> hyper"
+    elif len(tail3) >= 3 and all(e in {"depressed", "lonely"} for e in tail3):
+        inferred = "depressed"
+        momentum = "low mood continuing"
+    elif len(tail3) >= 2 and all(e == "anxious" for e in tail3[-2:]):
+        inferred = "anxious"
+        momentum = "anxiety continuing"
+
+    if inferred == current_emotion and not momentum:
+        return inferred, ""
+    return inferred, momentum
 
 
 def classify_emotion(text: str) -> str | None:

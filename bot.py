@@ -11,6 +11,7 @@ import time
 import os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -54,6 +55,7 @@ from core.feedback import (
     apply_good_rating, apply_bad_rating, get_feedback_stats,
     get_feedback_context,
 )
+from core.presence import describe_activity, record_presence_pattern
 
 # ---------------- DENIAL CONFIRMATION ---------------- #
 
@@ -464,6 +466,17 @@ async def slash_ratings(interaction: discord.Interaction):
         ephemeral=True
     )
 
+@client.tree.command(name="tokens", description="Show your API token usage")
+async def slash_tokens(interaction: discord.Interaction):
+    from core.db import get_token_stats
+    stats = get_token_stats(interaction.user.id)
+    lines = [
+        "📊 **Token Usage**",
+        f"Total tokens used: **{stats['total']:,}**",
+        f"Tokens used today: **{stats['today']:,}**",
+        f"Total API requests: **{stats['requests']}**",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 @client.tree.command(name="dashboard", description="Show activity dashboard for the bot")
 async def slash_dashboard(interaction: discord.Interaction):
@@ -544,6 +557,7 @@ async def slash_help(interaction: discord.Interaction):
         "`/relationships` — see who I know about in your life",
         "`/rate` — rate my last reply",
         "`/ratings` — see your rating history",
+        "`/tokens` — show your API token usage",
         "`/help` — show this list",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -556,16 +570,49 @@ async def on_ready():
 
 @client.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
-    """Track when users change their status or what they're playing."""
+    """Compress activity changes into presence patterns."""
     if before.activity != after.activity:
-        activity_str = "nothing" if after.activity is None else f"{after.activity.name}"
-        print(f"{after.name} is now playing: {activity_str}")
+        activity_str = describe_activity(after.activity)
+        if activity_str:
+            is_social = bool(
+                after.voice
+                and after.voice.channel
+                and len([m for m in after.voice.channel.members if not m.bot]) > 1
+            )
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(
+                executor,
+                partial(record_presence_pattern, after.id, "activity", activity_str, is_social=is_social),
+            )
+            print(f"{after.name} presence pattern updated: {activity_str}")
 
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    """Track member status changes (online, idle, offline, dnd)."""
+    """Compress status changes into presence patterns."""
     if before.status != after.status:
+        status = str(after.status)
+        if status != "offline":
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(
+                executor,
+                record_presence_pattern,
+                after.id,
+                "status",
+                status,
+            )
         print(f"{after.name}'s status changed: {before.status} → {after.status}")
+
+@client.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """Compress voice activity without storing every join/leave."""
+    if before.channel == after.channel or after.channel is None:
+        return
+    is_social = len([m for m in after.channel.members if not m.bot]) > 1
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(
+        executor,
+        partial(record_presence_pattern, member.id, "voice", "voice chat", is_social=is_social),
+    )
 
 @client.event
 async def on_message(message):

@@ -15,6 +15,10 @@ MAX_MEMORY_CHARS = 2000
 MAX_WEB_CONTEXT_CHARS = 1000
 MAX_FEEDBACK_CHARS = 400
 
+# ── Priority-based context trimming ────────────────────────────────────────── #
+# Token budgets for different context types based on priority
+PRIORITY_MAX_TOKENS = 1800  # total context budget (excluding system prompt & history)
+
 client_ai = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 FALLBACK_RESPONSES = [
@@ -346,7 +350,7 @@ _MODEL_DEFAULT = AI_MODEL                     # general purpose (70b)
 _MODEL_EMPATHY = "llama-3.3-70b-versatile"   # emotional support — always full model
 
 # Emotional states that warrant the empathy route
-_EMPATHY_STATES = {"depressed", "anxious", "lonely"}
+_EMPATHY_STATES = {"depressed", "anxious", "lonely", "venting", "frustrated"}
 
 # Keywords that signal a factual/reasoning-heavy question needing the full model
 _DEEP_THINK_TRIGGERS = {
@@ -431,7 +435,7 @@ def _analyze_intent(message: str, emotion_state: str | None, session_context: st
     context_block = f"\nConversation state: {session_context}" if session_context else ""
     emotion_block = f"\nDetected emotion: {emotion_state}" if emotion_state else ""
     try:
-        return groq_call(
+        content, _ = groq_call(
             _PLAN_MODEL,
             [
                 {"role": "system", "content": (
@@ -450,6 +454,7 @@ def _analyze_intent(message: str, emotion_state: str | None, session_context: st
             retries=1,
             timeout=8,
         )
+        return content
     except Exception as e:
         log.warning(f"[plan] analyze failed: {e}")
         return ""
@@ -467,7 +472,7 @@ def _make_plan(analysis: str, emotion_hint: str, reflection: str) -> str:
         parts.append(f"User insight: {reflection}")
     context = "\n".join(parts)
     try:
-        return groq_call(
+        content, _ = groq_call(
             _PLAN_MODEL,
             [
                 {"role": "system", "content": (
@@ -487,6 +492,7 @@ def _make_plan(analysis: str, emotion_hint: str, reflection: str) -> str:
             retries=1,
             timeout=8,
         )
+        return content
     except Exception as e:
         log.warning(f"[plan] plan failed: {e}")
         return ""
@@ -501,7 +507,7 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
     if not reply or not analysis:
         return reply
     try:
-        verdict = groq_call(
+        verdict, _ = groq_call(
             _PLAN_MODEL,
             [
                 {"role": "system", "content": (
@@ -539,7 +545,7 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
     reason = verdict.partition(":")[2].strip() if ":" in verdict else verdict
     log.debug(f"[plan] verify: FAIL — {reason}")
     try:
-        corrected = groq_call(
+        corrected, _ = groq_call(
             _PLAN_MODEL,
             [
                 {"role": "system", "content": (
@@ -570,7 +576,10 @@ def _should_plan(route: RouteResult) -> bool:
 
 # ---------------- GROQ WRAPPER ---------------- #
 
-def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, timeout: int = 15) -> str:
+def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, timeout: int = 15) -> tuple[str, int]:
+    """
+    Call Groq API and return (response_content, tokens_used).
+    """
     last_err = None
     for attempt in range(retries):
         try:
@@ -580,7 +589,12 @@ def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, tim
                 max_tokens=max_tokens,
                 timeout=timeout,
             )
-            return res.choices[0].message.content
+            content = res.choices[0].message.content
+            # Extract token usage if available
+            tokens_used = 0
+            if hasattr(res, 'usage') and res.usage:
+                tokens_used = res.usage.total_tokens or 0
+            return content, tokens_used
         except Exception as e:
             last_err = e
             err_str = str(e)
@@ -601,18 +615,14 @@ def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, tim
 # The base SYSTEM_PROMPT stays constant — modes are appended as a style
 # modifier block, so the core identity never changes.
 #
-# Selection logic (priority order):
-#   1. Emotion-driven override  — depressed/anxious → supportive
-#                               — excited/joking    → playful
-#                               — angry             → chill (de-escalate)
-#   2. Content-driven           — analytical keywords → analytical
-#                               — serious topic      → serious
-#   3. Conversation temperature — random drift within a session to prevent
-#                                 the bot sounding identical every message
+# Selection logic scores channel, topic/session, emotional state, social
+# activity, and recent mode history to avoid repetitive personality.
+
+RESPONSE_MODES = ("casual", "supportive", "chaotic", "analytical", "playful", "serious")
 
 _PERSONALITY_MODES: dict[str, str] = {
-    "chill": (
-        "Current mode: chill. "
+    "casual": (
+        "Current mode: casual. "
         "Keep it relaxed and low-key. Short sentences. No pressure. "
         "Minimal slang — just natural, easy conversation. "
         "Don't try too hard. Let silences breathe."
@@ -654,8 +664,11 @@ _EMOTION_MODE_MAP: dict[str, str] = {
     "depressed": "supportive",
     "anxious":   "supportive",
     "lonely":    "supportive",
-    "angry":     "chill",       # de-escalate, don't match anger
+    "angry":     "casual",       # de-escalate, don't match anger
+    "frustrated": "casual",
+    "venting":   "supportive",
     "excited":   "playful",
+    "hyper":     "playful",
     "joking":    "playful",
     "sarcastic": "chaotic",
 }
@@ -675,48 +688,358 @@ _SERIOUS_TRIGGERS = {
     "i don't know what to do anymore", "i dont know what to do anymore",
 }
 
+_CHANNEL_MODE_HINTS: dict[str, tuple[str, ...]] = {
+    "supportive": ("vent", "support", "mental", "help", "advice", "therapy"),
+    "analytical": ("code", "dev", "debug", "bug", "study", "school", "homework", "qna", "questions"),
+    "serious": ("admin", "mod", "rules", "announce", "news", "report", "ticket"),
+    "playful": ("meme", "memes", "gaming", "games", "music", "vc", "clips"),
+    "chaotic": ("spam", "chaos", "shitpost", "random"),
+}
+
+_TOPIC_MODE_HINTS: dict[str, tuple[str, ...]] = {
+    "supportive": ("sad", "stressed", "anxious", "lonely", "depressed", "venting", "overwhelmed"),
+    "analytical": ("code", "debug", "error", "explain", "compare", "analyze", "problem", "issue"),
+    "serious": ("argument", "conflict", "serious", "important", "deadline", "risk", "decision"),
+    "playful": ("joke", "meme", "game", "music", "ranked", "spotify", "funny"),
+    "chaotic": ("sarcasm", "roast", "banter", "shitpost"),
+}
+
+_SOCIAL_ACTIVITY_HINTS: dict[str, tuple[str, ...]] = {
+    "playful": ("spotify", "playing", "streaming", "valorant", "roblox", "minecraft", "league"),
+    "chaotic": ("party", "watching", "custom status"),
+    "casual": ("idle", "dnd"),
+}
+
 # Per-user conversation temperature: tracks recent mode history to drive drift
 # Format: {user_id: [mode, mode, ...]} (last 5 modes)
 _mode_history: dict[int, list[str]] = {}
 _MODE_HISTORY_LEN = 5
+
+# ── Adaptive Speaking Style System ─────────────────────────────────────────── #
+# Tracks per-user communication style preferences and adapts responses.
+# Different users get different bot personalities based on how THEY communicate.
+
+_USER_STYLE_HISTORY: dict[int, list[dict]] = {}  # {user_id: [{style: str, timestamp: float}, ...]}
+_USER_STYLE_CACHE: dict[int, dict] = {}  # Cached style analysis per user
+_STYLE_ANALYSIS_EVERY = 5  # Re-analyze style every N messages
+_STYLE_HISTORY_LIMIT = 20  # Keep last 20 style observations
+
+# Style archetypes with their characteristics
+_USER_STYLE_ARCHETYPES = {
+    "dry_humor": {
+        "description": "User appreciates dry, sarcastic, deadpan humor",
+        "signals": {"dark humor", "sarcasm", "deadpan", "ironic", "self-deprecating", 
+                    "dry wit", "sardonic", "wry", "savage", "roast", "burn",
+                    "lmao", "💀", "😭", "im dead", "dead", "not me", "the audacity"},
+        "bot_response": (
+            "This user appreciates dry, deadpan humor. Be sarcastic and witty. "
+            "Use deadpan delivery, ironic observations, and subtle roasts. "
+            "Don't over-explain jokes. Keep it sharp and slightly savage."
+        ),
+    },
+    "chaotic": {
+        "description": "User enjoys unpredictable, high-energy, chaotic energy",
+        "signals": {"chaos", "unhinged", "wild", "crazy", "random", "lol random",
+                    "no thoughts", "brain rot", "feral", "menace", "goblin mode",
+                    "all over the place", "ADHD energy", "scattered", "💀💀", "😭😭"},
+        "bot_response": (
+            "This user enjoys chaotic, unpredictable energy. Be unhinged and spontaneous. "
+            "Jump between topics, use random observations, be louder and more erratic. "
+            "Embrace the chaos — throw in non-sequiturs and absurd takes."
+        ),
+    },
+    "serious": {
+        "description": "User prefers direct, substantive, no-nonsense conversation",
+        "signals": {"serious", "actually", "real question", "genuinely", "honestly",
+                    "real talk", "not joking", "for real though", "lowkey deep",
+                    "philosophical", "existential", "meaningful", "thoughtful",
+                    "analysis", "breakdown", "explain", "why", "how does"},
+        "bot_response": (
+            "This user prefers serious, substantive conversation. Be direct and thoughtful. "
+            "Skip the jokes and banter. Give real answers, thoughtful takes, and genuine insights. "
+            "Don't deflect with humor — engage with the actual topic."
+        ),
+    },
+    "emotionally_open": {
+        "description": "User shares feelings openly and appreciates emotional warmth",
+        "signals": {"feelings", "emotions", "struggling", "overwhelmed", "anxious",
+                    "sad", "happy", "excited", "scared", "vulnerable", "opening up",
+                    "mental health", "therapy", "healing", "processing", "working through",
+                    "appreciate you", "thank you for listening", "means a lot", "💕", "🥺"},
+        "bot_response": (
+            "This user is emotionally open and appreciates warmth. Be supportive and validating. "
+            "Acknowledge their feelings first. Be warm, empathetic, and genuine. "
+            "Don't rush to solutions — just be present and supportive."
+        ),
+    },
+    "casual_chill": {
+        "description": "User prefers relaxed, low-key, easygoing conversation",
+        "signals": {"chill", "relaxed", "vibing", "lowkey", "casual", "easy",
+                    "no big deal", "whatever", "idc", "just saying", "tbh", "ngl",
+                    "fr", "yeah", "sure", "cool", "nice", "bet", "aight"},
+        "bot_response": (
+            "This user prefers casual, chill conversation. Keep it relaxed and low-pressure. "
+            "Short sentences, no trying too hard. Just natural, easy back-and-forth. "
+            "Don't be intense or overly enthusiastic — match their laid-back energy."
+        ),
+    },
+    "playful_banter": {
+        "description": "User loves playful teasing, banter, and lighthearted jokes",
+        "signals": {"banter", "teasing", "playful", "joking", "messing with",
+                    "roasting", "play fight", "back and forth", "wit", "quick",
+                    "comeback", "shade", "playful", "fun", "entertaining", "😏", "🤣"},
+        "bot_response": (
+            "This user loves playful banter and teasing. Match their energy with wit and humor. "
+            "Throw in playful jabs, quick comebacks, and lighthearted teasing. "
+            "Keep it fun and energetic — this is a verbal sparring match, not a debate."
+        ),
+    },
+}
+
+# Keywords that strongly indicate each style (for quick classification)
+_STYLE_KEYWORDS = {
+    "dry_humor": ["💀", "😭", "dead", "savage", "roast", "burn", "audacity", "not me", "ironic"],
+    "chaotic": ["💀💀", "😭😭", "chaos", "unhinged", "wild", "random", "feral", "menace", "scattered"],
+    "serious": ["actually", "genuinely", "honestly", "real", "serious", "thoughtful", "analysis"],
+    "emotionally_open": ["💕", "🥺", "feelings", "struggling", "vulnerable", "appreciate", "healing"],
+    "casual_chill": ["chill", "vibing", "lowkey", "casual", "bet", "aight", "fr", "tbh", "ngl"],
+    "playful_banter": ["😏", "🤣", "banter", "teasing", "playful", "roasting", "comeback", "shade"],
+}
+
+
+def _analyze_user_style(user_id: int, message: str) -> str:
+    """
+    Analyze a user's message to infer their communication style preference.
+    Returns the dominant style archetype name.
+    """
+    lower = message.lower()
+    
+    # Score each style based on signal matches
+    scores = {style: 0 for style in _USER_STYLE_ARCHETYPES}
+    
+    for style, keywords in _STYLE_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in lower:
+                scores[style] += 1
+    
+    # Check archetype-specific signals
+    for style, archetype in _USER_STYLE_ARCHETYPES.items():
+        for signal in archetype["signals"]:
+            if signal in lower:
+                scores[style] += 2  # Stronger signal
+    
+    # Get the dominant style (if any score > 0)
+    max_score = max(scores.values())
+    if max_score == 0:
+        return "casual_chill"  # Default fallback
+    
+    # Get all styles with max score
+    top_styles = [s for s, score in scores.items() if score == max_score]
+    
+    # If tie, prefer the one with more historical weight
+    if len(top_styles) > 1:
+        history = _USER_STYLE_HISTORY.get(user_id, [])
+        if history:
+            recent_styles = [h["style"] for h in history[-10:]]
+            for style in top_styles:
+                if style in recent_styles:
+                    return style
+        return top_styles[0]  # Just pick first if no history
+    
+    return top_styles[0]
+
+
+def _record_user_style(user_id: int, style: str):
+    """Record a style observation for a user."""
+    if user_id is None:
+        return
+    
+    history = _USER_STYLE_HISTORY.setdefault(user_id, [])
+    history.append({"style": style, "timestamp": time.time()})
+    
+    # Trim to limit
+    if len(history) > _STYLE_HISTORY_LIMIT:
+        history = history[-_STYLE_HISTORY_LIMIT:]
+        _USER_STYLE_HISTORY[user_id] = history
+    
+    # Update cache
+    _update_style_cache(user_id)
+
+
+def _update_style_cache(user_id: int):
+    """Update the cached style analysis for a user."""
+    if user_id is None:
+        return
+    
+    history = _USER_STYLE_HISTORY.get(user_id, [])
+    if not history:
+        return
+    
+    # Count style frequencies (weighted by recency)
+    now = time.time()
+    style_weights = {}
+    
+    for entry in history:
+        age_hours = (now - entry["timestamp"]) / 3600
+        # Recent entries weighted more heavily
+        recency_weight = max(0.3, 1.0 - (age_hours / 48))  # Decay over 48 hours
+        style = entry["style"]
+        style_weights[style] = style_weights.get(style, 0) + recency_weight
+    
+    if not style_weights:
+        return
+    
+    # Find dominant style
+    dominant = max(style_weights, key=style_weights.get)
+    confidence = style_weights[dominant] / sum(style_weights.values())
+    
+    # Get archetype info
+    archetype = _USER_STYLE_ARCHETYPES.get(dominant, {})
+    
+    _USER_STYLE_CACHE[user_id] = {
+        "dominant_style": dominant,
+        "confidence": confidence,
+        "description": archetype.get("description", ""),
+        "bot_response": archetype.get("bot_response", ""),
+        "all_styles": style_weights,
+    }
+
+
+def get_user_style_info(user_id: int) -> dict:
+    """
+    Get the cached style info for a user.
+    Returns dict with dominant_style, confidence, description, bot_response.
+    """
+    if user_id is None:
+        return {
+            "dominant_style": "casual_chill",
+            "confidence": 0.5,
+            "description": "Default casual style",
+            "bot_response": "",
+        }
+    
+    # Check if we need to re-analyze
+    if user_id not in _USER_STYLE_CACHE or not _USER_STYLE_HISTORY.get(user_id):
+        return {
+            "dominant_style": "casual_chill",
+            "confidence": 0.5,
+            "description": "Default casual style (no data yet)",
+            "bot_response": "",
+        }
+    
+    return _USER_STYLE_CACHE.get(user_id, {
+        "dominant_style": "casual_chill",
+        "confidence": 0.5,
+        "description": "Default casual style",
+        "bot_response": "",
+    })
+
+
+def should_analyze_style(user_id: int) -> bool:
+    """Check if we should re-analyze this user's style."""
+    if user_id is None:
+        return False
+    
+    history = _USER_STYLE_HISTORY.get(user_id, [])
+    return len(history) % _STYLE_ANALYSIS_EVERY == 0 and len(history) >= 3
+
+
+def get_adaptive_style_hint(user_id: int) -> str:
+    """
+    Get the adaptive style hint to inject into the system prompt.
+    Returns empty string if no strong style preference detected.
+    """
+    if user_id is None:
+        return ""
+    
+    style_info = get_user_style_info(user_id)
+    
+    # Only return hint if we have enough confidence
+    if style_info["confidence"] < 0.35:
+        return ""
+    
+    return style_info["bot_response"]
 
 
 def _pick_personality_mode(
     content: str,
     emotion_state: str | None,
     user_id: int | None,
+    channel_name: str = "",
+    session_context: str = "",
+    relationships: str = "",
+    user_activity: str = "",
+    user_status: str = "",
 ) -> str:
     """
     Select the personality mode for this response.
 
     Priority:
     1. Emotion override (depressed → supportive, excited → playful, etc.)
-    2. Content signals (analytical keywords → analytical, serious → serious)
-    3. Temperature drift — avoid repeating the same mode too many times in a row
-    4. Default: chill
+    2. User's adaptive style preference (if detected)
+    3. Content signals (analytical keywords → analytical, serious → serious)
+    4. Temperature drift — avoid repeating the same mode too many times in a row
+    5. Default: casual
     """
-    # 1. Emotion override
+    scores = {mode: 0 for mode in RESPONSE_MODES}
+    scores["casual"] = 1
+
     if emotion_state and emotion_state in _EMOTION_MODE_MAP:
-        return _EMOTION_MODE_MAP[emotion_state]
+        scores[_EMOTION_MODE_MAP[emotion_state]] += 4
+
+    # Apply user's adaptive style preference
+    if user_id is not None:
+        style_info = get_user_style_info(user_id)
+        style = style_info.get("dominant_style", "")
+        confidence = style_info.get("confidence", 0)
+        
+        # Map style archetypes to response modes
+        style_to_mode = {
+            "dry_humor": "chaotic",    # Dry humor → chaotic/sarcastic
+            "chaotic": "chaotic",
+            "serious": "serious",
+            "emotionally_open": "supportive",
+            "casual_chill": "casual",
+            "playful_banter": "playful",
+        }
+        
+        if style in style_to_mode and confidence > 0.4:
+            scores[style_to_mode[style]] += 3 * confidence
 
     lower = content.lower()
+    topic_text = f"{content}\n{session_context}".lower()
+    channel = (channel_name or "").lower()
+    social_text = f"{relationships}\n{user_activity}\n{user_status}".lower()
 
-    # 2. Content signals
     if any(t in lower for t in _SERIOUS_TRIGGERS):
-        return "serious"
+        scores["serious"] += 4
     if any(t in lower for t in _ANALYTICAL_TRIGGERS):
-        return "analytical"
+        scores["analytical"] += 4
 
-    # 3. Temperature drift — pick from modes not recently used
+    for mode, hints in _CHANNEL_MODE_HINTS.items():
+        if any(h in channel for h in hints):
+            scores[mode] += 2
+
+    for mode, hints in _TOPIC_MODE_HINTS.items():
+        if any(h in topic_text for h in hints):
+            scores[mode] += 2
+
+    for mode, hints in _SOCIAL_ACTIVITY_HINTS.items():
+        if any(h in social_text for h in hints):
+            scores[mode] += 1
+
+    if relationships:
+        scores["casual"] += 1
+        scores["playful"] += 1
+
     history = _mode_history.get(user_id, []) if user_id else []
-    recent = set(history[-3:])  # avoid last 3 modes
-    candidates = [m for m in ("chill", "chaotic", "playful", "analytical") if m not in recent]
-    if not candidates:
-        candidates = ["chill", "playful"]
+    for mode in history[-3:]:
+        scores[mode] -= 1
 
+    best_score = max(scores.values())
+    candidates = [mode for mode, score in scores.items() if score == best_score]
     chosen = random.choice(candidates)
 
-    # Update history
     if user_id is not None:
         hist = _mode_history.setdefault(user_id, [])
         hist.append(chosen)
@@ -726,9 +1049,21 @@ def _pick_personality_mode(
     return chosen
 
 
-def get_personality_mode_hint(content: str, emotion_state: str | None, user_id: int | None) -> str:
+def get_personality_mode_hint(
+    content: str,
+    emotion_state: str | None,
+    user_id: int | None,
+    channel_name: str = "",
+    session_context: str = "",
+    relationships: str = "",
+    user_activity: str = "",
+    user_status: str = "",
+) -> str:
     """Return the style modifier string for the selected personality mode."""
-    mode = _pick_personality_mode(content, emotion_state, user_id)
+    mode = _pick_personality_mode(
+        content, emotion_state, user_id,
+        channel_name, session_context, relationships, user_activity, user_status,
+    )
     log.debug(f"[personality] mode={mode} user={user_id} emotion={emotion_state}")
     return _PERSONALITY_MODES[mode]
 
@@ -755,7 +1090,7 @@ Remember context from earlier in the conversation and refer back to it naturally
 
 # ---------------- CHAT ---------------- #
 
-def _build_system_prompt(username: str | None, memory: str, relationships: str, web_context: str, impersonation_context: str = "", feedback_context: str = "", channel_name: str = "", reflection: str = "", emotion_hint: str = "", personality_hint: str = "", user_activity: str = "", user_status: str = "") -> str:
+def _build_system_prompt(username: str | None, memory: str, relationships: str, web_context: str, impersonation_context: str = "", feedback_context: str = "", channel_name: str = "", reflection: str = "", emotion_hint: str = "", personality_hint: str = "", user_activity: str = "", user_status: str = "", user_state_summary: str = "") -> str:
     # Hierarchy block is always first — highest priority
     parts = [_INSTRUCTION_HIERARCHY, SYSTEM_PROMPT]
 
@@ -769,10 +1104,14 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
     if channel_name:
         parts.append(f"You are in the #{channel_name} channel.")
 
-    if reflection:
+    if user_state_summary:
+        safe_user_state = sanitize_retrieved_content(user_state_summary, "user_state")
+        parts.append(safe_user_state)
+
+    if reflection and not user_state_summary:
         parts.append(f"Behavioral insight about this user (use silently to personalize — never mention it): {reflection}")
 
-    if memory:
+    if memory and not user_state_summary:
         # Sanitize memory before injecting — it was extracted from user messages
         safe_memory = "\n".join(
             sanitize_retrieved_content(line, "memory") for line in memory.splitlines()
@@ -782,7 +1121,7 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
     if impersonation_context:
         parts.append(impersonation_context)
 
-    if relationships:
+    if relationships and not user_state_summary:
         parts.append(
             f"Background context about people connected to this user — for your awareness ONLY. "
             f"NEVER mention, reference, or bring up any of these people unless the user explicitly names them first in their message. "
@@ -798,19 +1137,19 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
             "Use this to answer accurately and cite sources when relevant."
         )
 
-    if feedback_context:
+    if feedback_context and not user_state_summary:
         parts.append(f"Recent feedback on your replies: {feedback_context}")
 
-    if emotion_hint:
+    if emotion_hint and not user_state_summary:
         parts.append(f"Tone guidance for this message: {emotion_hint}")
 
     if personality_hint:
         parts.append(personality_hint)
 
-    if user_activity:
+    if user_activity and not user_state_summary:
         parts.append(f"Right now, {username or 'this user'} is playing/listening to: {user_activity}")
 
-    if user_status and user_status != "online":
+    if user_status and user_status != "online" and not user_state_summary:
         parts.append(f"User status: {user_status}")
 
     return "\n\n".join(parts)
@@ -835,7 +1174,7 @@ def _enforce_brevity(text: str, max_sentences: int = 3) -> str:
     return " ".join(sentences[:max_sentences])
 
 
-def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name="", session_context="", reflection="", emotion_hint="", emotion_state=None, user_activity="", user_status=""):
+def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name="", session_context="", reflection="", emotion_hint="", emotion_state=None, user_activity="", user_status="", user_state_summary=""):
     history = trim_history(history)
     memory = truncate_text(memory, MAX_MEMORY_CHARS)
     relationships = truncate_text(relationships, MAX_MEMORY_CHARS)
@@ -848,17 +1187,25 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
     log.debug(f"[router] route={route.route} model={route.model} tokens={route.max_tokens}")
 
     # Personality mode
-    personality_hint = get_personality_mode_hint(last_user_msg, emotion_state, user_id)
+    personality_hint = get_personality_mode_hint(
+        last_user_msg, emotion_state, user_id,
+        channel_name, session_context, relationships, user_activity, user_status,
+    )
 
-    system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name, reflection, emotion_hint, personality_hint, user_activity, user_status)
-    if session_context:
+    system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name, reflection, emotion_hint, personality_hint, user_activity, user_status, user_state_summary)
+    if session_context and not user_state_summary:
         system += "\n\n" + _build_session_block(session_context)
 
     messages = [{"role": "system", "content": system}] + history
 
     try:
-        result = groq_call(route.model, messages, max_tokens=route.max_tokens)
-        return _enforce_brevity(result)
+        result, tokens_used = groq_call(route.model, messages, max_tokens=route.max_tokens)
+        result = _enforce_brevity(result)
+        # Store token usage
+        if user_id:
+            from .db import store_token_usage
+            store_token_usage(user_id, tokens_used, route.model)
+        return result
     except Exception as e:
         err_str = str(e)
         if "429" in err_str or "rate_limit" in err_str.lower():
@@ -866,8 +1213,13 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
             if route.model != _MODEL_FAST:
                 log.warning(f"[ai_chat] rate limited on {route.model}, falling back to {_MODEL_FAST}")
                 try:
-                    result = groq_call(_MODEL_FAST, messages, max_tokens=min(route.max_tokens, 200))
-                    return _enforce_brevity(result)
+                    result, tokens_used = groq_call(_MODEL_FAST, messages, max_tokens=min(route.max_tokens, 200))
+                    result = _enforce_brevity(result)
+                    # Store token usage for fallback model
+                    if user_id:
+                        from .db import store_token_usage
+                        store_token_usage(user_id, tokens_used, _MODEL_FAST)
+                    return result
                 except Exception as e2:
                     err2 = str(e2)
                     if "429" in err2 or "rate_limit" in err2.lower():

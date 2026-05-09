@@ -85,23 +85,61 @@ class ConversationState:
             return max(0.0, 1.0 - (age - DECAY_PARTIAL_AT) / (SESSION_TIMEOUT - DECAY_PARTIAL_AT))
         return 1.0
 
-    def to_prompt_block(self) -> str:
+    def to_prompt_block(self, use_priority: bool = True) -> str:
+        """
+        Return the conversation state as a formatted prompt block.
+        
+        When use_priority is True, fields are organized by priority:
+        - CRITICAL: topic
+        - HIGH: activity, argument, open_thread
+        - MEDIUM: goal
+        
+        This enables intelligent trimming when token budget is tight.
+        """
         decay = self.decay_factor()
         if decay == 0.0:
             return ""
-        lines = []
+        
         # Apply decay to confidence threshold — older state needs higher confidence to inject
         effective_threshold = CONFIDENCE_THRESHOLD + (1.0 - decay) * 0.2
-        for label, f in [
-            ("topic", self.topic),
-            ("goal", self.goal),
-            ("activity", self.activity),
-            ("ongoing argument", self.argument),
-            ("open thread", self.open_thread),
-        ]:
-            if f.value and f.confidence >= effective_threshold:
-                lines.append(f"{label}: {f.value}")
-        return "\n".join(lines)
+        
+        if not use_priority:
+            # Legacy flat format
+            lines = []
+            for label, f in [
+                ("topic", self.topic),
+                ("goal", self.goal),
+                ("activity", self.activity),
+                ("ongoing argument", self.argument),
+                ("open thread", self.open_thread),
+            ]:
+                if f.value and f.confidence >= effective_threshold:
+                    lines.append(f"{label}: {f.value}")
+            return "\n".join(lines)
+        
+        # Priority-based format
+        sections = []
+        
+        # CRITICAL: topic (most important for context)
+        if self.topic.value and self.topic.confidence >= effective_threshold:
+            sections.append(f"[CRITICAL]\ntopic: {self.topic.value}")
+        
+        # HIGH: activity, argument, open_thread
+        high_lines = []
+        if self.activity.value and self.activity.confidence >= effective_threshold:
+            high_lines.append(f"activity: {self.activity.value}")
+        if self.argument.value and self.argument.confidence >= effective_threshold:
+            high_lines.append(f"argument: {self.argument.value}")
+        if self.open_thread.value and self.open_thread.confidence >= effective_threshold:
+            high_lines.append(f"open_thread: {self.open_thread.value}")
+        if high_lines:
+            sections.append(f"[HIGH]\n" + "\n".join(high_lines))
+        
+        # MEDIUM: goal
+        if self.goal.value and self.goal.confidence >= effective_threshold:
+            sections.append(f"[MEDIUM]\ngoal: {self.goal.value}")
+        
+        return "\n\n".join(sections)
 
     def fingerprint(self) -> str:
         """Hash of the injected content — used to detect changes."""

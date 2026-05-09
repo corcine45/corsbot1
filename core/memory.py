@@ -281,13 +281,138 @@ def _resolve_memory_type(key: str, memory_type: str | None) -> str:
 
 
 def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> float:
+    """
+    Calculate a memory's retrieval score based on decay and reinforcement.
+    
+    Reinforcement mimics human familiarity — repeated exposure makes memories
+    easier to recall. Each reinforcement increases the baseline score and
+    slows the decay rate.
+    """
     half_life = DECAY.get(memory_type)
     if half_life is None:
-        return 1.0
+        # Identity facts don't decay, but reinforcement still boosts priority
+        boost = min(reinforcement, 10) * 0.1  # up to +1.0 bonus
+        return min(1.0, 1.0 + boost)
+    
     age = time.time() - updated_at
-    boost = min(reinforcement, 5) / 5
-    decay = 0.5 ** (age / half_life)
-    return decay * (0.5 + 0.5 * boost)
+    
+    # Reinforcement reduces effective age (memory feels "newer")
+    # Each reinforcement level reduces perceived age by 10%, up to 50%
+    reinforcement_factor = min(reinforcement, 5) * 0.1
+    effective_age = age * (1.0 - reinforcement_factor)
+    
+    # Base decay
+    decay = 0.5 ** (effective_age / half_life)
+    
+    # Reinforcement boosts the floor (minimum score)
+    # Without reinforcement: floor = 0.5
+    # With max reinforcement: floor = 0.9
+    floor_boost = 0.5 + (min(reinforcement, 5) / 5) * 0.4
+    
+    return decay * floor_boost
+
+
+def reinforce_memory(user_id: str, key: str, amount: int = 1) -> None:
+    """
+    Increase the reinforcement counter for a specific memory.
+    
+    This mimics human familiarity — when a topic/topic repeatedly appears,
+    the memory becomes easier to recall. Call this when:
+    - User mentions something that matches a stored memory
+    - A memory fact was particularly relevant to the conversation
+    - User confirms or re-states a stored fact
+    
+    Args:
+        user_id: The user ID
+        key: The memory key to reinforce
+        amount: How much to increase reinforcement by (default 1)
+    """
+    conn, cursor = get_db()
+    cursor.execute(
+        "UPDATE memory SET reinforcement = reinforcement + ? "
+        "WHERE user_id = ? AND key = ?",
+        (amount, str(user_id), key)
+    )
+    conn.commit()
+    
+    # Also update the embedding's position in FAISS index
+    cursor.execute(
+        "SELECT value FROM memory WHERE user_id = ? AND key = ?",
+        (str(user_id), key)
+    )
+    row = cursor.fetchone()
+    if row:
+        vec = _embed_vec(f"{key}: {row[0]}")
+        faiss_upsert(str(user_id), key, vec)
+
+
+def reinforce_memories_for_query(user_id: str, query: str, top_k: int = 3, amount: int = 1) -> list:
+    """
+    Find and reinforce memories that are relevant to the current query.
+    
+    This implements "use-dependent strengthening" — memories that are
+    retrieved and used in conversation become stronger, mimicking how
+    human memory works through retrieval practice.
+    
+    Args:
+        user_id: The user ID
+        query: The current message/query
+        top_k: Number of top matching memories to reinforce
+        amount: Reinforcement amount per memory
+    
+    Returns:
+        List of (key, new_reinforcement) tuples for reinforced memories
+    """
+    if not query or len(query.split()) < 3:
+        return []
+    
+    _, cursor = get_db()
+    
+    # Get the query vector
+    query_vec = _embed_vec(query)
+    
+    # Find relevant memories
+    matches = faiss_search(str(user_id), query_vec, top_k=top_k)
+    
+    reinforced = []
+    for sim, key in matches:
+        if sim < MEMORY_SIMILARITY_THRESHOLD:
+            continue
+        
+        # Reinforce this memory
+        cursor.execute(
+            "UPDATE memory SET reinforcement = reinforcement + ? "
+            "WHERE user_id = ? AND key = ?",
+            (amount, str(user_id), key)
+        )
+        
+        # Get new reinforcement value
+        cursor.execute(
+            "SELECT reinforcement FROM memory WHERE user_id = ? AND key = ?",
+            (str(user_id), key)
+        )
+        row = cursor.fetchone()
+        if row:
+            reinforced.append((key, row[0]))
+            
+            # Update FAISS index with new embedding
+            cursor.execute(
+                "SELECT value FROM memory WHERE user_id = ? AND key = ?",
+                (str(user_id), key)
+            )
+            val_row = cursor.fetchone()
+            if val_row:
+                vec = _embed_vec(f"{key}: {val_row[0]}")
+                faiss_upsert(str(user_id), key, vec)
+    
+    # Commit all changes
+    conn, _ = get_db()
+    conn.commit()
+    
+    if reinforced:
+        log.debug(f"[memory] reinforced {len(reinforced)} memories for user={user_id}")
+    
+    return reinforced
 
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
@@ -848,6 +973,151 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
     return "\n".join(result)
 
 
+# ── Priority-based memory retrieval ────────────────────────────────────────── #
+
+def get_memory_prioritized(user_id, query: str = "", topic: str = "", emotion: str = "", max_tokens: int = 1500) -> dict:
+    """
+    Return memory facts organized by priority level.
+    
+    This function integrates with the priority system to return context
+    organized by importance:
+    
+    - CRITICAL: topic and emotion (passed as parameters)
+    - HIGH: highly relevant recent memories (similarity > 0.7)
+    - MEDIUM: moderately relevant memories (similarity > 0.5)
+    - LOW: older preferences and identity facts
+    
+    Returns a dict with keys: "critical", "high", "medium", "low"
+    """
+    from .priority import Priority, ContextPriorityManager, estimate_context_tokens
+    
+    result = {"critical": "", "high": "", "medium": "", "low": ""}
+    
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT key, value, memory_type, updated_at, reinforcement FROM memory WHERE user_id=?",
+        (str(user_id),)
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        # Still return topic/emotion as critical
+        lines = []
+        if topic:
+            lines.append(f"topic: {topic}")
+        if emotion:
+            lines.append(f"emotion: {emotion}")
+        if lines:
+            result["critical"] = "\n".join(lines)
+        return result
+    
+    now = time.time()
+    fact_lookup = {}
+    for key, value, memory_type, updated_at, reinforcement in rows:
+        resolved_type = _resolve_memory_type(key, memory_type)
+        fact_lookup[key] = (value, resolved_type, updated_at, reinforcement or 1)
+    
+    # Separate identity facts (LOW priority) from other memories
+    identity_facts = {}
+    non_identity = {}
+    
+    for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
+        if key in _PROMPT_EXCLUDED_KEYS:
+            continue
+        if _is_about_other_person(key, value):
+            continue
+        half_life = DECAY.get(memory_type)
+        if half_life and (now - updated_at) > half_life * 3:
+            continue
+        
+        if memory_type == "identity" or key in IDENTITY_KEYS:
+            identity_facts[key] = (value, updated_at, reinforcement)
+        else:
+            non_identity[key] = (value, memory_type, updated_at, reinforcement)
+    
+    # Build priority manager
+    manager = ContextPriorityManager(max_tokens=max_tokens)
+    
+    # Add CRITICAL context: topic and emotion
+    if topic:
+        manager.add(f"topic: {topic}", Priority.CRITICAL, "topic", now)
+    if emotion:
+        manager.add(f"emotion: {emotion}", Priority.CRITICAL, "emotion", now)
+    
+    # Score and categorize non-identity memories
+    if query and non_identity:
+        expanded = _expand_query(query)
+        q1 = _embed_vec(query)
+        q2 = _embed_vec(expanded) if expanded != query.lower() else q1
+        query_vec = ((q1 + q2) / 2).astype(np.float32)
+        norm = np.linalg.norm(query_vec)
+        if norm > 0:
+            query_vec = query_vec / norm
+        
+        for sim, key in faiss_search(str(user_id), query_vec, top_k=len(non_identity)):
+            if key not in non_identity:
+                continue
+            if sim < MEMORY_SIMILARITY_THRESHOLD:
+                continue
+            
+            value, memory_type, updated_at, reinforcement = non_identity[key]
+            decay = _decay_score(memory_type, updated_at, reinforcement)
+            fact_str = f"{key}: {value}"
+            
+            # Categorize by similarity threshold
+            if sim >= 0.7:
+                manager.add(fact_str, Priority.HIGH, "memory", updated_at, relevance_score=sim * decay)
+            else:
+                manager.add(fact_str, Priority.MEDIUM, "memory", updated_at, relevance_score=sim * decay)
+    else:
+        # No query — add all non-identity as MEDIUM
+        for key, (value, memory_type, updated_at, reinforcement) in non_identity.items():
+            decay = _decay_score(memory_type, updated_at, reinforcement)
+            fact_str = f"{key}: {value}"
+            manager.add(fact_str, Priority.MEDIUM, "memory", updated_at, relevance_score=decay)
+    
+    # Add identity facts as LOW priority
+    for key, (value, updated_at, reinforcement) in identity_facts.items():
+        fact_str = f"{key}: {value}"
+        manager.add(fact_str, Priority.LOW, "identity", updated_at, relevance_score=0.5)
+    
+    # Get trimmed context
+    trimmed = manager.get_trimmed_context(max_tokens)
+    
+    # Parse the trimmed output back into priority buckets
+    if trimmed:
+        current_section = None
+        section_content = []
+        
+        for line in trimmed.split("\n"):
+            if line.startswith("[CRITICAL]"):
+                if current_section and section_content:
+                    result[current_section] = "\n".join(section_content)
+                current_section = "critical"
+                section_content = []
+            elif line.startswith("[HIGH]"):
+                if current_section and section_content:
+                    result[current_section] = "\n".join(section_content)
+                current_section = "high"
+                section_content = []
+            elif line.startswith("[MEDIUM]"):
+                if current_section and section_content:
+                    result[current_section] = "\n".join(section_content)
+                current_section = "medium"
+                section_content = []
+            elif line.startswith("[LOW]"):
+                if current_section and section_content:
+                    result[current_section] = "\n".join(section_content)
+                current_section = "low"
+                section_content = []
+            elif line.strip():
+                section_content.append(line.strip())
+        
+        if current_section and section_content:
+            result[current_section] = "\n".join(section_content)
+    
+    return result
+
+
 def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
     """Same as get_memory but also returns the list of active keys (for feedback boosting)."""
     _, cursor = get_db()
@@ -1023,6 +1293,333 @@ def get_relationships(user_id, top_k: int = 6) -> str:
         lines.append(line)
     return "\n".join(lines)
 
+
+# ── Relationship Modeling System ───────────────────────────────────────────── #
+
+# Relationship category definitions with keyword signals for classification
+_RELATIONSHIP_CATEGORIES = {
+    "closest_friends": {
+        "relations": {"best friend", "bestie", "bff", "close friend", "ride or die", "day one"},
+        "signals": {"trust", "always there", "been through everything", "told them everything", 
+                    "closest friend", "bestie", "best friend", "day one friend"},
+        "weight": 3,  # High priority for social context
+    },
+    "favorite_people": {
+        "relations": {"crush", "partner", "significant other", "favorite person", "someone i like",
+                      "person i like", "interested in", "dating", "in love with"},
+        "signals": {"my favorite person", "the one", "crush on", "in love with", "dating",
+                    "seeing someone", "talking to someone", "my person"},
+        "weight": 3,
+    },
+    "frequent_conflicts": {
+        "relations": {"enemy", "rival", "nemesis", "person i fight with", "someone i hate",
+                      "ex friend", "former friend", "toxic"},
+        "signals": {"always fighting with", "can't stand", "hate dealing with", "drama with",
+                    "conflict with", "issues with", "toxic relationship", "frenemy"},
+        "weight": 2,  # Medium priority - relevant but not positive
+    },
+    "usual_group": {
+        "relations": {"friend", "friend group", "crew", "squad", "gang", "circle",
+                      "teammate", "classmate", "coworker", "roommate"},
+        "signals": {"my friends", "the squad", "the crew", "my group", "we always",
+                    "me and the boys", "me and the girls", "our group", "hanging with"},
+        "weight": 1,  # Lower priority - general social context
+    },
+}
+
+
+def _classify_relationship(relation: str, context: str) -> str:
+    """
+    Classify a relationship into one of the defined categories.
+    Returns the category name or 'acquaintances' if no strong match.
+    """
+    text = f"{relation} {context}".lower()
+    
+    scores = {}
+    for category, config in _RELATIONSHIP_CATEGORIES.items():
+        score = 0
+        # Check relation type matches
+        for rel_keyword in config["relations"]:
+            if rel_keyword in relation.lower():
+                score += 2
+        # Check context signals
+        for signal in config["signals"]:
+            if signal in text:
+                score += 1
+        if score > 0:
+            scores[category] = score
+    
+    if not scores:
+        return "acquaintances"
+    
+    return max(scores, key=scores.get)
+
+
+def analyze_and_categorize_relationships(user_id: str) -> dict:
+    """
+    Analyze all stored relationships for a user and categorize them.
+    
+    Returns a structured dict:
+    {
+        "closest_friends": [{"name": "...", "relation": "...", "context": "...", "strength": N}],
+        "favorite_people": [...],
+        "frequent_conflicts": [...],
+        "usual_group": [...],
+        "acquaintances": [...]
+    }
+    """
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT related_name, relation, context, strength, updated_at FROM relationships "
+        "WHERE user_id=? ORDER BY strength DESC",
+        (str(user_id),)
+    )
+    rows = cursor.fetchall()
+    
+    categorized = {cat: [] for cat in list(_RELATIONSHIP_CATEGORIES.keys()) + ["acquaintances"]}
+    
+    for name, relation, context, strength, updated_at in rows:
+        category = _classify_relationship(relation, context or "")
+        
+        # Apply time decay to strength
+        age_days = (time.time() - updated_at) / 86400
+        decayed_strength = strength * max(0.5, 1.0 - (age_days / 90))  # 50% decay over 90 days
+        
+        entry = {
+            "name": name,
+            "relation": relation,
+            "context": context or "",
+            "strength": decayed_strength,
+            "original_strength": strength,
+        }
+        
+        categorized[category].append(entry)
+    
+    # Sort each category by strength
+    for cat in categorized:
+        categorized[cat].sort(key=lambda x: x["strength"], reverse=True)
+    
+    return categorized
+
+
+def get_relationship_summary(user_id: str, max_people: int = 10) -> str:
+    """
+    Get a human-readable relationship summary for prompt injection.
+    
+    Format:
+    Closest friends: Alice (best friend - we've been friends since childhood), Bob (day one)
+    Favorite people: Charlie (crush)
+    Usual group: The gaming squad - Dave, Eve, Frank
+    """
+    categorized = analyze_and_categorize_relationships(user_id)
+    
+    sections = []
+    
+    # Closest friends (highest priority)
+    if categorized["closest_friends"]:
+        friends = categorized["closest_friends"][:3]
+        friend_strs = []
+        for f in friends:
+            info = f["name"]
+            if f["relation"] and f["relation"] != "friend":
+                info += f" ({f['relation']}"
+                if f["context"]:
+                    info += f" - {f['context']}"
+                info += ")"
+            elif f["context"]:
+                info += f" - {f['context']}"
+            friend_strs.append(info)
+        sections.append(f"Closest friends: {', '.join(friend_strs)}")
+    
+    # Favorite people
+    if categorized["favorite_people"]:
+        favs = categorized["favorite_people"][:2]
+        fav_strs = []
+        for f in favs:
+            info = f["name"]
+            if f["relation"]:
+                info += f" ({f['relation']}"
+                if f["context"]:
+                    info += f" - {f['context']}"
+                info += ")"
+            fav_strs.append(info)
+        sections.append(f"Favorite people: {', '.join(fav_strs)}")
+    
+    # Frequent conflicts (for social awareness)
+    if categorized["frequent_conflicts"]:
+        conflicts = categorized["frequent_conflicts"][:2]
+        conflict_strs = []
+        for f in conflicts:
+            info = f["name"]
+            if f["relation"]:
+                info += f" ({f['relation']}"
+                if f["context"]:
+                    info += f" - {f['context']}"
+                info += ")"
+            conflict_strs.append(info)
+        sections.append(f"Conflicts: {', '.join(conflict_strs)}")
+    
+    # Usual group
+    if categorized["usual_group"]:
+        group = categorized["usual_group"][:5]
+        names = [g["name"] for g in group]
+        group_context = group[0].get("context", "") if group else ""
+        group_info = ", ".join(names)
+        if group_context:
+            group_info += f" ({group_context})"
+        sections.append(f"Social circle: {group_info}")
+    
+    # Acquaintances (just count them)
+    if categorized["acquaintances"]:
+        count = len(categorized["acquaintances"])
+        if count > 0:
+            sections.append(f"Other connections: {count} acquaintance{'s' if count != 1 else ''}")
+    
+    return "\n".join(sections)
+
+
+def update_relationship_sentiment(user_id: str, person_name: str, sentiment: str, context: str = ""):
+    """
+    Update or create a relationship with sentiment analysis.
+    
+    Sentiment can be: "positive", "negative", "neutral", "conflicted"
+    This helps track the emotional tone of relationships over time.
+    """
+    conn, cursor = get_db()
+    now = time.time()
+    
+    # Determine relation type from sentiment
+    relation_map = {
+        "positive": "close connection",
+        "negative": "source of tension",
+        "neutral": "acquaintance",
+        "conflicted": "complicated relationship",
+    }
+    relation = relation_map.get(sentiment, "connection")
+    
+    # Check if relationship exists
+    cursor.execute(
+        "SELECT strength, context FROM relationships WHERE user_id=? AND related_name=?",
+        (str(user_id), person_name)
+    )
+    existing = cursor.fetchone()
+    
+    if existing:
+        # Update existing relationship
+        new_strength = existing[0] + 1
+        new_context = existing[1] + "; " + context if context else existing[1]
+        cursor.execute(
+            "UPDATE relationships SET strength=?, context=?, relation=?, updated_at=? "
+            "WHERE user_id=? AND related_name=?",
+            (new_strength, new_context, relation, now, str(user_id), person_name)
+        )
+    else:
+        # Create new relationship
+        cursor.execute(
+            """INSERT INTO relationships (user_id, related_name, relation, context, strength, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (str(user_id), person_name, relation, context, 1, now)
+        )
+    
+    conn.commit()
+
+
+def get_social_awareness_context(user_id: str) -> str:
+    """
+    Generate a comprehensive social awareness context block for the AI prompt.
+    
+    This provides the bot with social context about the user's relationships,
+    enabling more personalized and socially aware responses.
+    """
+    summary = get_relationship_summary(user_id)
+    if not summary:
+        return ""
+    
+    return f"Social context for {user_id}:\n{summary}"
+
+
+def extract_relationship_categories_from_message(user_id: str, message: str):
+    """
+    Extract relationship mentions from a message and categorize them.
+    Uses AI to understand the nature of relationships mentioned.
+    """
+    # Quick check for relationship mentions
+    lower = message.lower()
+    relationship_words = ["friend", "bestie", "bff", "crush", "partner", "boyfriend", "girlfriend",
+                          "enemy", "rival", "squad", "crew", "group", "gang", "teammate",
+                          "roommate", "classmate", "coworker", "best friend", "day one"]
+    
+    if not any(word in lower for word in relationship_words):
+        return
+    
+    # Use AI to extract and categorize relationships
+    try:
+        output = groq_call(
+            "llama-3.1-8b-instant",
+            [
+                {"role": "system", "content": (
+                    "Extract people mentioned in this message and their relationship to the user. "
+                    "For each person, provide: name, relationship_type, sentiment, context. "
+                    "Relationship types: closest_friend, favorite_person, frequent_conflict, usual_group_member, acquaintance "
+                    "Sentiment: positive, negative, neutral, conflicted "
+                    "Format: name|relation_type|sentiment|context (one per line) "
+                    "If no clear relationships mentioned, reply: NONE"
+                )},
+                {"role": "user", "content": message}
+            ],
+            max_tokens=120, retries=1, timeout=8,
+        )
+        
+        if output.strip().upper() == "NONE":
+            return
+        
+        conn, cursor = get_db()
+        now = time.time()
+        
+        for line in output.strip().split("\n"):
+            parts = line.strip().split("|")
+            if len(parts) < 3:
+                continue
+            
+            name = parts[0].strip()
+            rel_type = parts[1].strip().lower()
+            sentiment = parts[2].strip().lower()
+            context = parts[3].strip() if len(parts) > 3 else ""
+            
+            if not name or not rel_type:
+                continue
+            
+            # Map relation type to a readable relation string
+            rel_map = {
+                "closest_friend": "close friend",
+                "favorite_person": "favorite person",
+                "frequent_conflict": "source of conflict",
+                "usual_group_member": "group member",
+                "acquaintance": "acquaintance",
+            }
+            relation = rel_map.get(rel_type, rel_type)
+            
+            # Store/update relationship
+            cursor.execute(
+                "SELECT strength FROM relationships WHERE user_id=? AND related_name=?",
+                (str(user_id), name)
+            )
+            row = cursor.fetchone()
+            strength = (row[0] + 1) if row else 1
+            
+            cursor.execute(
+                """INSERT INTO relationships (user_id, related_name, relation, context, strength, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, related_name) DO UPDATE SET
+                       relation=excluded.relation, context=excluded.context,
+                       strength=excluded.strength, updated_at=excluded.updated_at""",
+                (str(user_id), name, relation, context, strength, now)
+            )
+        
+        conn.commit()
+    except Exception as e:
+        log.debug(f"[relationships] AI extraction failed: {e}")
+
 def search_memory_by_value(query: str, top_k: int = 5) -> str:
     """Search across ALL users' memory for a value matching the query.
     Used for 'who is X' type questions. Returns clear attribution."""
@@ -1064,15 +1661,78 @@ def search_memory_by_value(query: str, top_k: int = 5) -> str:
     return "\n".join(lines)
 
 # ---------------- REFLECTION MEMORY ---------------- #
+#
+# Two-tier reflection system:
+# 1. Light reflection (every 10 messages): Quick style/tone insight
+# 2. Deep reflection (every ~100 messages): Comprehensive pattern analysis
+#
+# Deep reflections analyze behavioral patterns across many interactions,
+# generating insights like:
+#   "User responds well to teasing but shuts down with serious advice."
+#   "Often seeks reassurance indirectly through hypothetical questions."
+#   "Avoids discussing stress directly — changes topic when asked."
 
-REFLECTION_UPDATE_EVERY = 10   # update reflection every N messages
+REFLECTION_LIGHT_EVERY = 10    # quick insight every N messages
+REFLECTION_DEEP_EVERY = 100    # deep pattern analysis every N messages
 REFLECTION_MIN_MESSAGES = 5    # don't bother until user has at least this many messages
 _reflection_counter: dict = {}
 
+# Pattern categories for deep reflection analysis
+_REFLECTION_PATTERN_CATEGORIES = {
+    "communication_style": {
+        "focus": "How does the user communicate? Direct, indirect, verbose, terse?",
+        "examples": [
+            "User communicates indirectly — hints at needs rather than stating them.",
+            "User is very direct and appreciates bluntness in return.",
+            "User writes in short bursts; prefers quick back-and-forth over long explanations.",
+        ],
+    },
+    "emotional_patterns": {
+        "focus": "What emotional patterns emerge? How do they handle ups and downs?",
+        "examples": [
+            "User processes emotions through humor — jokes when uncomfortable.",
+            "User tends to vent before asking for advice — acknowledge feelings first.",
+            "User minimizes their own struggles; deflects concern with jokes.",
+        ],
+    },
+    "response_preferences": {
+        "focus": "What type of responses do they engage with most?",
+        "examples": [
+            "User responds well to teasing but shuts down with serious advice.",
+            "User engages most when challenged — enjoys intellectual sparring.",
+            "User prefers validation over solutions; just wants to be heard.",
+        ],
+    },
+    "avoidance_patterns": {
+        "focus": "What topics or approaches cause disengagement?",
+        "examples": [
+            "Avoids discussing stress directly — changes topic when asked.",
+            "User disengages when conversations get too serious too fast.",
+            "User avoids vulnerability — deflects personal questions with humor.",
+        ],
+    },
+    "engagement_triggers": {
+        "focus": "What consistently gets them talking more?",
+        "examples": [
+            "User lights up when talking about creative projects — ask follow-ups.",
+            "User engages deeply with philosophical questions; surface-level chat bores them.",
+            "User opens up when feeling heard — reflective listening works well.",
+        ],
+    },
+}
+
+
 def should_update_reflection(user_id: str) -> bool:
+    """Check if we should do a light reflection update."""
     _reflection_counter.setdefault(user_id, 0)
     _reflection_counter[user_id] += 1
-    return _reflection_counter[user_id] % REFLECTION_UPDATE_EVERY == 0
+    return _reflection_counter[user_id] % REFLECTION_LIGHT_EVERY == 0
+
+
+def should_do_deep_reflection(user_id: str) -> bool:
+    """Check if we should do a deep pattern analysis."""
+    _reflection_counter.setdefault(user_id, 0)
+    return _reflection_counter[user_id] % REFLECTION_DEEP_EVERY == 0 and _reflection_counter[user_id] >= REFLECTION_DEEP_EVERY
 
 
 def update_reflection(user_id: str, recent_messages: list[str]):
@@ -1080,36 +1740,79 @@ def update_reflection(user_id: str, recent_messages: list[str]):
     Generate and store a behavioral/personality summary for the user
     based on their recent messages. This is the 'reflection' — a high-level
     insight like 'User struggles with confidence but responds well to direct encouragement.'
+    
+    This is the LIGHT reflection — quick, focused on immediate patterns.
     """
     if len(recent_messages) < REFLECTION_MIN_MESSAGES:
         return
+    
+    is_deep = should_do_deep_reflection(user_id)
+    
     try:
-        conversation = "\n".join(f"- {m}" for m in recent_messages[-20:])
+        conversation = "\n".join(f"- {m}" for m in recent_messages[-30:])
+        
+        if is_deep:
+            # Deep reflection — comprehensive pattern analysis
+            system_prompt = (
+                "You are analyzing a user's conversation patterns with a Discord bot. "
+                "Generate 2-3 concise behavioral insights that would help the bot respond better. "
+                "Focus on PATTERNS across messages, not one-off observations. "
+                "Look for:\n"
+                "- Communication style (direct/indirect, verbose/terse)\n"
+                "- Emotional patterns (how they process feelings)\n"
+                "- Response preferences (what type of replies they engage with)\n"
+                "- Avoidance patterns (what makes them disengage)\n"
+                "- Engagement triggers (what gets them talking more)\n\n"
+                "Format: One insight per line. 1-2 sentences each. Third-person. "
+                "Be specific and actionable — not generic platitudes.\n\n"
+                "Good examples:\n"
+                "- 'User responds well to teasing but shuts down with serious advice.'\n"
+                "- 'Often seeks reassurance indirectly through hypothetical questions.'\n"
+                "- 'Avoids discussing stress directly — changes topic when asked.'\n"
+                "- 'User processes emotions through humor — jokes when uncomfortable.'\n"
+                "- 'Engages deeply with philosophical takes; surface-level chat bores them.'\n"
+                "Only output the insights. No labels, no preamble, no explanations."
+            )
+            max_tokens = 150
+        else:
+            # Light reflection — quick style insight
+            system_prompt = (
+                "You are analyzing a user's recent messages to a Discord bot. "
+                "Write a single concise behavioral/personality insight about this user — "
+                "something genuinely useful for personalizing future responses. "
+                "Focus on: communication style, emotional patterns, what they respond well to, "
+                "recurring themes, humor style, or how they handle topics. "
+                "Write it as a third-person observation, 1-2 sentences max. "
+                "Examples:\n"
+                "- 'User is self-deprecating but responds well to direct encouragement and humor.'\n"
+                "- 'User tends to vent before asking for advice — acknowledge feelings first.'\n"
+                "- 'User is very competitive and loves banter; match their energy.'\n"
+                "- 'User gets anxious about decisions; short, confident answers work best.'\n"
+                "Only output the insight. No labels, no preamble."
+            )
+            max_tokens = 80
+        
         output = groq_call(
             "llama-3.1-8b-instant",
             [
-                {"role": "system", "content": (
-                    "You are analyzing a user's recent messages to a Discord bot. "
-                    "Write a single concise behavioral/personality insight about this user — "
-                    "something genuinely useful for personalizing future responses. "
-                    "Focus on: communication style, emotional patterns, what they respond well to, "
-                    "recurring themes, humor style, or how they handle topics. "
-                    "Write it as a third-person observation, 1-2 sentences max. "
-                    "Examples:\n"
-                    "- 'User is self-deprecating but responds well to direct encouragement and humor.'\n"
-                    "- 'User tends to vent before asking for advice — acknowledge feelings first.'\n"
-                    "- 'User is very competitive and loves banter; match their energy.'\n"
-                    "- 'User gets anxious about decisions; short, confident answers work best.'\n"
-                    "Only output the insight. No labels, no preamble."
-                )},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Recent messages:\n{conversation}"}
             ],
-            max_tokens=80, retries=2, timeout=12,
+            max_tokens=max_tokens, retries=2, timeout=12,
         )
         insight = output.strip()
         if not insight or len(insight) < 10:
             return
-
+        
+        # For deep reflections, take the first line as the primary insight
+        # but store the full analysis for potential future use
+        if is_deep:
+            lines = [l.strip() for l in insight.split("\n") if l.strip()]
+            primary_insight = lines[0] if lines else insight
+            log.info(f"[reflection] DEEP analysis for user={user_id}: {len(lines)} insights generated")
+        else:
+            primary_insight = insight
+        
         conn, cursor = get_db()
         now = time.time()
         cursor.execute(
@@ -1117,10 +1820,10 @@ def update_reflection(user_id: str, recent_messages: list[str]):
                VALUES (?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
                    insight=excluded.insight, updated_at=excluded.updated_at""",
-            (str(user_id), insight, now)
+            (str(user_id), primary_insight, now)
         )
         conn.commit()
-        log.info(f"[reflection] updated for user={user_id}: {insight[:60]}...")
+        log.info(f"[reflection] updated for user={user_id}: {primary_insight[:60]}...")
     except Exception as e:
         log.error(f"[reflection] update error: {type(e).__name__}: {e}")
 
@@ -1134,6 +1837,71 @@ def get_reflection(user_id: str) -> str:
     )
     row = cursor.fetchone()
     return row[0] if row else ""
+
+
+def generate_reflection_summary(user_id: str) -> str:
+    """
+    Generate a comprehensive reflection summary by analyzing patterns
+    across the user's stored memories, relationships, and conversation history.
+    
+    This is called during deep reflection to synthesize all available data.
+    """
+    _, cursor = get_db()
+    
+    # Gather all available data
+    cursor.execute("SELECT key, value FROM memory WHERE user_id=?", (str(user_id),))
+    memories = cursor.fetchall()
+    
+    cursor.execute("SELECT related_name, relation, context, strength FROM relationships WHERE user_id=?", (str(user_id),))
+    relationships = cursor.fetchall()
+    
+    cursor.execute("SELECT insight FROM reflections WHERE user_id=?", (str(user_id),))
+    prev_reflection = cursor.fetchone()
+    
+    # Build context for analysis
+    context_parts = []
+    
+    if memories:
+        memory_text = "\n".join(f"- {k}: {v}" for k, v in memories[:20])
+        context_parts.append(f"Stored facts about user:\n{memory_text}")
+    
+    if relationships:
+        rel_text = "\n".join(f"- {name} ({relation}): {context}" for name, relation, context, _ in relationships[:10])
+        context_parts.append(f"User's relationships:\n{rel_text}")
+    
+    if prev_reflection and prev_reflection[0]:
+        context_parts.append(f"Previous insight: {prev_reflection[0]}")
+    
+    if not context_parts:
+        return ""
+    
+    context = "\n\n".join(context_parts)
+    
+    try:
+        output = groq_call(
+            "llama-3.1-8b-instant",
+            [
+                {"role": "system", "content": (
+                    "Analyze this user's data and generate 2-3 actionable behavioral insights. "
+                    "Look for patterns in their stored facts, relationships, and previous reflections. "
+                    "Focus on what would help a Discord bot interact with them better.\n\n"
+                    "Consider:\n"
+                    "- What communication style works best?\n"
+                    "- What topics engage them vs. bore them?\n"
+                    "- How do they seek support or connection?\n"
+                    "- What patterns emerge across their data?\n\n"
+                    "Format: One insight per line. Specific and actionable. Third-person."
+                )},
+                {"role": "user", "content": context}
+            ],
+            max_tokens=150, retries=1, timeout=10,
+        )
+        
+        insights = [l.strip() for l in output.strip().split("\n") if l.strip()]
+        return "\n".join(insights[:3])
+    except Exception as e:
+        log.debug(f"[reflection] summary generation failed: {e}")
+        return ""
 
 
 
