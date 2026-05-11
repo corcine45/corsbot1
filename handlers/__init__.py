@@ -239,7 +239,7 @@ class MessageHandler:
             active_keys = []
         else:
             # Run agent
-            agent = AgentLoop(executor, loop)
+            agent = AgentLoop(self.executor, loop)
             reply, active_keys = await self._run_agent(message, agent, ctx, loop)
             if reply:
                 self.response_cache.set(cache_key, reply)
