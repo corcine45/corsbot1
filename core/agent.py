@@ -339,45 +339,48 @@ class AgentLoop:
             (e["content"] for e in reversed(ctx.history) if e["role"] == "user"), ctx.content
         )
         route = route_message(last_user_msg, ctx.emotion_state, bool(ctx.web_context), history_len=len(ctx.history))
-        do_plan = _should_plan(route)
+        do_plan = _should_plan(route, last_user_msg, ctx.emotion_state)
 
-        # ── Step 5: Reason ───────────────────────────────────────────────
-        # Synthesize what we know before drafting — prevents ignoring context
-        # or hallucinating facts that contradict stored memory.
+        # ── Steps 5+6: Reason + Intent (parallel) ───────────────────────
+        # Both are independent — run concurrently to save ~150-180ms.
         reasoning = ""
-        if do_plan and any([ctx.memory, ctx.relationships, ctx.web_context, ctx.reflection]):
-            t0 = time.perf_counter()
-            try:
-                reasoning = await self._run_sync(
-                    _reason,
-                    last_user_msg, ctx.memory, ctx.relationships,
-                    ctx.web_context, ctx.reflection, ctx.emotion_state,
-                )
-                ms = (time.perf_counter() - t0) * 1000
-                trace.add("reason", ms, "ok", reasoning[:60] if reasoning else "empty")
-            except Exception as e:
-                ms = (time.perf_counter() - t0) * 1000
-                trace.add("reason", ms, "failed", str(e)[:60])
-                log.warning("reason_failed", user_id=ctx.user_id, error=str(e))
-        else:
-            trace.add("reason", 0, "skipped")
-
-        # ── Step 6: Classify intent ──────────────────────────────────────
-        # What does the user actually need from this message?
         analysis = ""
         if do_plan:
+            has_context = any([ctx.memory, ctx.relationships, ctx.web_context, ctx.reflection])
             t0 = time.perf_counter()
             try:
-                analysis = await self._run_sync(
+                coros = []
+                if has_context:
+                    coros.append(self._run_sync(
+                        _reason,
+                        last_user_msg, ctx.memory, ctx.relationships,
+                        ctx.web_context, ctx.reflection, ctx.emotion_state,
+                    ))
+                else:
+                    coros.append(asyncio.coroutine(lambda: "")() if False else asyncio.sleep(0))
+
+                coros.append(self._run_sync(
                     _analyze_intent,
                     last_user_msg, ctx.emotion_state, ctx.session_context,
-                )
+                ))
+
+                results = await asyncio.gather(*coros, return_exceptions=True)
+
+                if has_context:
+                    reasoning = results[0] if isinstance(results[0], str) else ""
+                    analysis  = results[1] if isinstance(results[1], str) else ""
+                else:
+                    analysis = results[1] if isinstance(results[1], str) else ""
+
                 ms = (time.perf_counter() - t0) * 1000
+                trace.add("reason", ms, "ok", reasoning[:60] if reasoning else "skipped")
                 trace.add("intent", ms, "ok", analysis[:60] if analysis else "empty")
             except Exception as e:
                 ms = (time.perf_counter() - t0) * 1000
+                trace.add("reason", ms, "failed", str(e)[:60])
                 trace.add("intent", ms, "failed", str(e)[:60])
         else:
+            trace.add("reason", 0, "skipped")
             trace.add("intent", 0, "skipped")
 
         # ── Step 7: Plan ─────────────────────────────────────────────────
@@ -423,8 +426,8 @@ class AgentLoop:
             return None
 
         # ── Step 9: Safety check + rewrite ───────────────────────────────
-        # Verify the draft against intent and plan. Rewrite if it fails.
-        if do_plan and analysis:
+        # Only run for empathy route — too expensive for casual chat.
+        if do_plan and analysis and route.route == "empathy":
             t0 = time.perf_counter()
             try:
                 verified = await self._run_sync(

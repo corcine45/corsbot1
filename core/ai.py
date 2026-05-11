@@ -765,9 +765,49 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
         return reply
 
 
-def _should_plan(route: RouteResult) -> bool:
-    """Planning only makes sense for non-trivial messages."""
-    return route.route in ("default", "empathy", "search")
+def _should_plan(route: RouteResult, message: str = "", emotion_state: str | None = None) -> bool:
+    """
+    Planning adds 3-4 extra LLM calls (~500-800ms). Only worth it for:
+    - Emotional support messages
+    - Long/complex messages (10+ words)
+    - Explicit advice/explanation requests
+    - Web search results that need synthesis
+
+    Short casual messages on the default route (e.g. "nf3", "same bro") don't need planning.
+    """
+    if route.route == "fast":
+        return False
+
+    # Always plan for empathy and search
+    if route.route in ("empathy", "search"):
+        return True
+
+    # For default route, only plan if message is genuinely complex
+    if not message:
+        return False
+
+    lower = message.lower()
+    word_count = len(lower.split())
+
+    # Long messages likely need careful handling
+    if word_count >= 15:
+        return True
+
+    # Explicit advice/explanation requests
+    _PLAN_TRIGGERS = {
+        "explain", "why", "how", "advice", "help me", "what should",
+        "what do you think", "opinion", "thoughts", "recommend",
+        "should i", "can you", "could you", "write", "debug", "fix",
+        "analyze", "summarize", "compare", "difference",
+    }
+    if any(t in lower for t in _PLAN_TRIGGERS):
+        return True
+
+    # Emotional weight
+    if emotion_state in ("depressed", "anxious", "lonely", "venting", "frustrated", "angry"):
+        return True
+
+    return False
 
 
 def _reason(message: str, memory: str, relationships: str, web_context: str, reflection: str, emotion_state: str | None) -> str:
