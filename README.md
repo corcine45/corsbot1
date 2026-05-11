@@ -1,1 +1,3 @@
-u readn this u gay
+
+uses groq, discord, giphy, tavily API's 
+gl <3
