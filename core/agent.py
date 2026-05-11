@@ -338,7 +338,7 @@ class AgentLoop:
         last_user_msg = next(
             (e["content"] for e in reversed(ctx.history) if e["role"] == "user"), ctx.content
         )
-        route = route_message(last_user_msg, ctx.emotion_state, bool(ctx.web_context))
+        route = route_message(last_user_msg, ctx.emotion_state, bool(ctx.web_context), history_len=len(ctx.history))
         do_plan = _should_plan(route)
 
         # ── Step 5: Reason ───────────────────────────────────────────────

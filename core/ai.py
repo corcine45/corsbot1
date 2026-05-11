@@ -566,15 +566,19 @@ class RouteResult:
         self.route      = route   # "fast" | "empathy" | "search" | "default"
 
 
-def route_message(content: str, emotion_state: str | None, has_web_context: bool) -> RouteResult:
+def route_message(content: str, emotion_state: str | None, has_web_context: bool, history_len: int = 0) -> RouteResult:
     """
     Decide which model and token budget to use based on message characteristics.
 
     Priority order (highest → lowest):
     1. search   — has real-time web context → needs full model to synthesize results
     2. empathy  — depressed / anxious / lonely → full model, higher token budget
-    3. fast     — pure social/reaction messages (≤8 words, no question, no deep signal)
-    4. default  — everything else → full model, standard budget
+    3. greeting — pure greeting with NO conversation history → fast model
+    4. fast     — very short casual, no question, no active conversation
+    5. default  — everything else → full model, standard budget
+
+    Key rule: if there's conversation history, even short messages use the full
+    model — "nf3" in a chess game needs context, not a fast route.
     """
     # 1. Search route
     if has_web_context:
@@ -588,26 +592,20 @@ def route_message(content: str, emotion_state: str | None, has_web_context: bool
     words = lower.split()
     word_count = len(words)
 
-    # 3. Greeting route — pure greetings, no planning needed at all
-    if word_count <= 3 and any(w in _GREETING_TRIGGERS for w in words):
+    # 3. Greeting route — only when there's no active conversation
+    if word_count <= 3 and history_len == 0 and any(w in _GREETING_TRIGGERS for w in words):
         return RouteResult(_MODEL_FAST, 60, "fast")
 
-    # 4. Fast route — only for very short pure-reaction messages
-    # Conditions (ALL must be true):
-    #   - ≤8 words (was 12 — too loose)
-    #   - has a casual signal
-    #   - no deep-think trigger
-    #   - doesn't start with a question word
-    #   - no "?" in the message
+    # 4. Fast route — very short casual, no question, no active conversation
     first_word = words[0] if words else ""
     is_question = "?" in lower or first_word in _QUESTION_STARTERS
     has_casual  = any(t in lower for t in _CASUAL_TRIGGERS)
     has_deep    = any(t in lower for t in _DEEP_THINK_TRIGGERS)
 
-    if word_count <= 8 and has_casual and not has_deep and not is_question:
-        return RouteResult(_MODEL_FAST, 180, "fast")  # raised from 120
+    if word_count <= 8 and has_casual and not has_deep and not is_question and history_len == 0:
+        return RouteResult(_MODEL_FAST, 180, "fast")
 
-    # 4. Default — full model
+    # 5. Default — full model
     return RouteResult(_MODEL_DEFAULT, 512, "default")
 
 # ---------------- MULTI-STEP PLANNING PIPELINE ---------------- #
@@ -1450,7 +1448,7 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
 
     # Route: pick model + token budget based on message type
     last_user_msg = next((e["content"] for e in reversed(history) if e["role"] == "user"), "")
-    route = route_message(last_user_msg, emotion_state, bool(web_context))
+    route = route_message(last_user_msg, emotion_state, bool(web_context), history_len=len(history))
     log.debug(f"[router] route={route.route} model={route.model} tokens={route.max_tokens}")
 
     # Personality mode
