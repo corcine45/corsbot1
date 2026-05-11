@@ -1,20 +1,23 @@
 """
 Agent Loop — the explicit orchestrator for Corsbot's response pipeline.
 
-Replaces the flat sequence of awaits in on_message with a structured,
-step-by-step execution trace. Each step is named, timed, and isolated —
-a failure in one step degrades gracefully rather than crashing the whole loop.
-
 Pipeline:
-  1. classify    — emotion state + injection guard (already done before this runs)
-  2. memory      — retrieve relevant facts + relationships + reflection
-  3. search      — web search if real-time info is needed
-  4. session     — update + fetch conversation state
-  5. generate    — ai_chat (internally: intent analysis → plan → draft → verify)
-  6. post        — store reply, pick GIF, resolve mentions
+  1. classify     — emotion state classification + momentum tracking
+  2. memory       — retrieve facts, relationships, reflection, presence
+  3. search       — web search if real-time info is needed
+  4. session      — update + fetch conversation state
+  5. user_state   — build unified runtime user profile
+  6. reason       — synthesize what's known before drafting (prevents hallucination)
+  7. intent       — classify what the user actually needs
+  8. plan         — turn intent + reasoning into a concrete response plan
+  9. draft        — generate reply with plan injected as guidance
+  10. safety      — verify draft against intent/plan, rewrite if it fails
+  11. post        — pick GIF based on emotion
 
-The AgentContext dataclass carries all state between steps.
-The AgentTrace dataclass records timing and outcomes for each step.
+Steps 6-10 only run for non-trivial routes (default, empathy, search).
+Banter/fast routes skip planning and go straight to draft.
+
+Each step is named, timed, and isolated — a failure degrades gracefully.
 """
 
 import asyncio
@@ -24,7 +27,9 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any
 
-log = logging.getLogger("corsbot.agent")
+from core.logger import get_logger
+
+log = get_logger("corsbot.agent")
 
 
 # ── Context ──────────────────────────────────────────────────────────────── #
@@ -59,6 +64,7 @@ class AgentContext:
     presence_patterns: str = ""
     web_context: str = ""
     session_context: str = ""
+    conversation_summary: str = ""   # rolling summary of older messages
     user_state: dict = field(default_factory=dict)
     user_state_summary: str = ""
     feedback_context: str = ""
@@ -67,6 +73,7 @@ class AgentContext:
 
     # Final output
     reply: str = ""
+    response_plan: str = ""   # plan produced by step_generate, stored for debugging
     gif_url: str | None = None
     gif_emotion: str | None = None
 
@@ -260,25 +267,49 @@ class AgentLoop:
             return
 
         query = build_search_query(ctx.content)
-        result = await self._step(
-            trace, "search",
-            self._run_sync(web_search, query)
-        )
-        ctx.web_context = result or ""
-        if ctx.web_context:
-            log.debug(f"[agent] search fetched context for: {query!r}")
+        t0 = time.perf_counter()
+        try:
+            result = await web_search(query)
+            ctx.web_context = result or ""
+            ms = (time.perf_counter() - t0) * 1000
+            trace.add("search", ms, "ok", query[:60])
+            if ctx.web_context:
+                log.debug(f"[agent] search fetched context for: {query!r}")
+        except Exception as e:
+            ms = (time.perf_counter() - t0) * 1000
+            trace.add("search", ms, "error", str(e))
+            log.warning("search_failed", query=query, error=str(e))
 
     async def step_session(self, ctx: AgentContext, trace: AgentTrace):
-        """Step 4: Update and fetch conversation state."""
+        """Step 4: Update conversation state + fetch rolling summary."""
         from .session import add_message, should_refresh, analyze_state, get_state_prompt
+        from .summarizer import should_summarize, summarize_thread, get_history_with_summary
 
         t0 = time.perf_counter()
         add_message(ctx.user_id, ctx.content)
+
+        # Trigger summarization in background if threshold reached
+        if should_summarize(ctx.thread_id):
+            asyncio.ensure_future(
+                self.loop.run_in_executor(self.executor, summarize_thread, ctx.thread_id)
+            )
+
         if should_refresh(ctx.user_id):
             await self._run_sync(analyze_state, ctx.user_id)
+
         ctx.session_context = get_state_prompt(ctx.user_id)
+
+        # Replace raw history with summary + recent messages
+        summary, recent = await self._run_sync(
+            get_history_with_summary, ctx.thread_id
+        )
+        ctx.conversation_summary = summary
+        if recent:
+            ctx.history = recent  # override the full history passed in
+
         ms = (time.perf_counter() - t0) * 1000
-        trace.add("session", ms, "ok", ctx.session_context[:60] if ctx.session_context else "empty")
+        summary_note = f"summary={len(summary)}chars" if summary else "no_summary"
+        trace.add("session", ms, "ok", f"{summary_note} recent={len(ctx.history)}msgs")
 
     async def step_user_state(self, ctx: AgentContext, trace: AgentTrace):
         """Build one unified runtime profile for generation."""
@@ -293,13 +324,88 @@ class AgentLoop:
 
     async def step_generate(self, ctx: AgentContext, trace: AgentTrace) -> str | None:
         """
-        Step 5: Generate the reply.
-        Internally runs: intent analysis → plan → draft → self-critique.
-        """
-        from .ai import ai_chat
+        Steps 5-9: reason → plan → draft → safety_check → rewrite → respond.
 
+        Each sub-step is traced individually. Failures degrade gracefully —
+        a failed reason/plan still produces a draft, a failed safety check
+        still returns the original draft.
+        """
+        from .ai import (
+            ai_chat, _analyze_intent, _make_plan, _reason,
+            _verify_reply, _should_plan, route_message,
+        )
+
+        last_user_msg = next(
+            (e["content"] for e in reversed(ctx.history) if e["role"] == "user"), ctx.content
+        )
+        route = route_message(last_user_msg, ctx.emotion_state, bool(ctx.web_context))
+        do_plan = _should_plan(route)
+
+        # ── Step 5: Reason ───────────────────────────────────────────────
+        # Synthesize what we know before drafting — prevents ignoring context
+        # or hallucinating facts that contradict stored memory.
+        reasoning = ""
+        if do_plan and any([ctx.memory, ctx.relationships, ctx.web_context, ctx.reflection]):
+            t0 = time.perf_counter()
+            try:
+                reasoning = await self._run_sync(
+                    _reason,
+                    last_user_msg, ctx.memory, ctx.relationships,
+                    ctx.web_context, ctx.reflection, ctx.emotion_state,
+                )
+                ms = (time.perf_counter() - t0) * 1000
+                trace.add("reason", ms, "ok", reasoning[:60] if reasoning else "empty")
+            except Exception as e:
+                ms = (time.perf_counter() - t0) * 1000
+                trace.add("reason", ms, "failed", str(e)[:60])
+                log.warning("reason_failed", user_id=ctx.user_id, error=str(e))
+        else:
+            trace.add("reason", 0, "skipped")
+
+        # ── Step 6: Classify intent ──────────────────────────────────────
+        # What does the user actually need from this message?
+        analysis = ""
+        if do_plan:
+            t0 = time.perf_counter()
+            try:
+                analysis = await self._run_sync(
+                    _analyze_intent,
+                    last_user_msg, ctx.emotion_state, ctx.session_context,
+                )
+                ms = (time.perf_counter() - t0) * 1000
+                trace.add("intent", ms, "ok", analysis[:60] if analysis else "empty")
+            except Exception as e:
+                ms = (time.perf_counter() - t0) * 1000
+                trace.add("intent", ms, "failed", str(e)[:60])
+        else:
+            trace.add("intent", 0, "skipped")
+
+        # ── Step 7: Plan ─────────────────────────────────────────────────
+        # Turn analysis + reasoning into a concrete response plan.
+        plan = ""
+        if do_plan and analysis:
+            # Merge reasoning into the plan context
+            plan_context = analysis
+            if reasoning:
+                plan_context = f"{analysis}\n\nReasoning:\n{reasoning}"
+            t0 = time.perf_counter()
+            try:
+                plan = await self._run_sync(
+                    _make_plan,
+                    plan_context, ctx.emotion_hint, ctx.reflection,
+                )
+                ms = (time.perf_counter() - t0) * 1000
+                trace.add("plan", ms, "ok", plan[:60] if plan else "empty")
+            except Exception as e:
+                ms = (time.perf_counter() - t0) * 1000
+                trace.add("plan", ms, "failed", str(e)[:60])
+        else:
+            trace.add("plan", 0, "skipped")
+
+        # ── Step 8: Draft ────────────────────────────────────────────────
+        # Generate the actual reply, injecting the plan as guidance.
         result = await self._step(
-            trace, "generate",
+            trace, "draft",
             self._run_sync(
                 ai_chat,
                 ctx.history, ctx.memory,
@@ -309,8 +415,32 @@ class AgentLoop:
                 ctx.channel_name, ctx.session_context,
                 ctx.reflection, ctx.emotion_hint, ctx.emotion_state,
                 ctx.user_activity, ctx.user_status, ctx.user_state_summary,
+                plan,               # response_plan
+                ctx.conversation_summary,
             )
         )
+        if not result:
+            return None
+
+        # ── Step 9: Safety check + rewrite ───────────────────────────────
+        # Verify the draft against intent and plan. Rewrite if it fails.
+        if do_plan and analysis:
+            t0 = time.perf_counter()
+            try:
+                verified = await self._run_sync(
+                    _verify_reply, result, analysis, plan,
+                )
+                ms = (time.perf_counter() - t0) * 1000
+                rewritten = verified != result
+                trace.add("safety", ms, "ok", "rewritten" if rewritten else "pass")
+                result = verified
+            except Exception as e:
+                ms = (time.perf_counter() - t0) * 1000
+                trace.add("safety", ms, "failed", str(e)[:60])
+                log.warning("safety_check_failed", user_id=ctx.user_id, error=str(e))
+        else:
+            trace.add("safety", 0, "skipped")
+
         return result
 
     async def step_post(self, ctx: AgentContext, trace: AgentTrace):
@@ -318,13 +448,16 @@ class AgentLoop:
         from .emotion import pick_gif_for_message
 
         t0 = time.perf_counter()
-        gif_url, gif_emotion = await self._run_sync(
-            pick_gif_for_message, ctx.content, ctx.reply
-        )
-        ctx.gif_url = gif_url
-        ctx.gif_emotion = gif_emotion
+        try:
+            gif_url, gif_emotion = await pick_gif_for_message(ctx.content, ctx.reply)
+            ctx.gif_url = gif_url
+            ctx.gif_emotion = gif_emotion
+        except Exception as e:
+            ctx.gif_url = None
+            ctx.gif_emotion = None
+            log.warning("gif_failed", user_id=ctx.user_id, error=str(e))
         ms = (time.perf_counter() - t0) * 1000
-        trace.add("post", ms, "ok", gif_emotion or "no gif")
+        trace.add("post", ms, "ok", ctx.gif_emotion or "no gif")
 
     # ── Main run ─────────────────────────────────────────────────────────── #
 
@@ -352,5 +485,14 @@ class AgentLoop:
             trace.add("post", 0, "skipped", "no reply")
 
         trace.total_ms = (time.perf_counter() - t_start) * 1000
-        log.info(f"[agent] user={ctx.uid_str} {trace.summary()}")
+        log.info("agent_run_complete",
+            user_id=ctx.user_id,
+            guild_id=ctx.guild_id,
+            latency_ms=round(trace.total_ms),
+            emotion=ctx.emotion_state,
+            memory_keys=ctx.active_keys,
+            web_search=bool(ctx.web_context),
+            gif=bool(ctx.gif_url),
+            trace=trace.summary(),
+        )
         return ctx, trace

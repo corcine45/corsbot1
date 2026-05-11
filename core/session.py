@@ -196,6 +196,7 @@ class _Session:
     last_seen:         float             = field(default_factory=time.time)
     last_conv_fp:      str               = ""   # fingerprint of last injected conv state
     last_user_fp:      str               = ""   # fingerprint of last injected user state
+    last_analyzed_fp:  str               = ""   # fingerprint of messages at last analyze_state call
 
 
 _sessions: dict[int, _Session] = defaultdict(_Session)
@@ -324,8 +325,10 @@ Rules:
 def analyze_state(user_id: int) -> tuple[ConversationState, UserState]:
     """
     Run the LLM analyzer and return updated (ConversationState, UserState).
+    Skips the LLM call if messages haven't changed since last analysis.
     Synchronous — run in an executor from async code.
     """
+    import hashlib
     from .ai import groq_call
 
     messages = get_recent_messages(user_id)
@@ -334,6 +337,15 @@ def analyze_state(user_id: int) -> tuple[ConversationState, UserState]:
         if sess:
             return sess.conv, sess.user
         return ConversationState(), UserState()
+
+    # Fingerprint the current message window
+    msg_fp = hashlib.md5("\n".join(messages).encode()).hexdigest()[:8]
+
+    sess = _sessions.get(user_id)
+    if sess and sess.last_analyzed_fp == msg_fp:
+        # Messages haven't changed — skip the LLM call, return cached state
+        log.debug(f"[session] analyze_state skipped (no change) user={user_id}")
+        return sess.conv, sess.user
 
     conversation = "\n".join(f"- {m}" for m in messages)
     try:
@@ -349,13 +361,17 @@ def analyze_state(user_id: int) -> tuple[ConversationState, UserState]:
         )
     except Exception as e:
         log.warning(f"[session] analyze_state failed: {e}")
-        sess = _sessions.get(user_id)
         if sess:
             return sess.conv, sess.user
         return ConversationState(), UserState()
 
     conv, user = _parse_state(raw)
     set_state(user_id, conv, user)
+
+    # Store fingerprint so we skip next call if nothing changed
+    sess = _get_or_create(user_id)
+    sess.last_analyzed_fp = msg_fp
+
     return conv, user
 
 

@@ -1,13 +1,11 @@
+import aiohttp
 import os
-import requests
 import re
 import time
 
-# Tavily Search API (optional)
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+from config import settings
 
-# DuckDuckGo instant answer + HTML search — no API key required
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 DDG_SEARCH_URL = "https://html.duckduckgo.com/html/"
 DDG_INSTANT_URL = "https://api.duckduckgo.com/"
 
@@ -17,180 +15,126 @@ HEADERS = {
 }
 
 _cache: dict[str, tuple[str, float]] = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 300
 
-# Keywords that signal the user wants real-time info — keep these specific
 REALTIME_TRIGGERS = {
-    # News & current events
     "news", "latest", "today's", "right now", "live score", "scores",
-    "standings", "match result", "breaking", "breaking news", "update",
-    "updates", "what's happening", "whats happening", "current",
-    "recently", "just now", "this week", "this month",
-    # Sports
-    "who won", "game score", "match score", "final score", "highlights",
-    "transfer", "signed", "traded", "injured", "lineup", "roster",
-    # Weather
-    "weather", "temperature", "forecast", "rain", "storm", "typhoon",
-    # Finance
-    "stock price", "stock market", "crypto price", "bitcoin price",
-    "ethereum price", "exchange rate", "usd", "php rate",
-    # Tech/Gaming
-    "patch notes", "update notes", "new update", "new patch", "season",
-    "new season", "new episode", "new chapter", "new release",
+    "standings", "match result", "breaking", "breaking news",
+    "what's happening", "whats happening",
+    "who won", "game score", "match score", "final score",
+    "weather", "temperature", "forecast",
+    "stock price", "crypto price", "bitcoin price", "ethereum price", "exchange rate",
+    "patch notes", "new update", "new patch", "new season", "new episode",
     "just dropped", "just announced", "just released", "just launched",
-    "release date", "coming out", "when does", "when is",
-    # General real-time
-    "what happened to", "what happened with", "what's the latest",
-    "whats the latest", "any news", "did they", "have they",
+    "release date", "when does", "when is",
+    "what happened to", "what's the latest", "whats the latest",
     "is it out", "is it available", "is it live",
+    "who is", "who's", "whos",
 }
 
 def needs_web_search(text: str) -> bool:
-    """Returns True only if the message clearly needs real-time information."""
     lower = text.lower()
     return any(trigger in lower for trigger in REALTIME_TRIGGERS)
 
 
-def ddg_instant(query: str) -> str | None:
-    """Try DuckDuckGo instant answers first (fast, structured)."""
+async def ddg_instant(session: aiohttp.ClientSession, query: str) -> str | None:
     try:
-        res = requests.get(
+        async with session.get(
             DDG_INSTANT_URL,
             params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
             headers=HEADERS,
-            timeout=5,
-        )
-        data = res.json()
-        # AbstractText is the best source — Wikipedia-style summary
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            data = await resp.json(content_type=None)
         if data.get("AbstractText"):
             return data["AbstractText"][:600]
-        # RelatedTopics as fallback
         topics = data.get("RelatedTopics", [])
-        snippets = []
-        for t in topics[:3]:
-            if isinstance(t, dict) and t.get("Text"):
-                snippets.append(t["Text"])
+        snippets = [t["Text"] for t in topics[:3] if isinstance(t, dict) and t.get("Text")]
         if snippets:
             return " | ".join(snippets)[:600]
-        return None
     except Exception as e:
         print(f"[search] DDG instant failed: {e}")
+    return None
+
+
+async def tavily_search(session: aiohttp.ClientSession, query: str, max_results: int = 3) -> str | None:
+    if not settings.tavily_api_key:
         return None
-
-
-def tavily_search(query: str, max_results: int = 3, search_depth: str = "basic") -> str | None:
-    """Use Tavily search if a key is configured."""
-    if not TAVILY_API_KEY:
-        return None
-
     try:
-        res = requests.post(
+        async with session.post(
             TAVILY_SEARCH_URL,
-            headers={
-                "Authorization": f"Bearer {TAVILY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "query": query,
-                "max_results": max_results,
-                "include_answer": False,
-                "search_depth": search_depth,
-                "topic": "general",
-            },
-            timeout=12,
-        )
-        data = res.json()
-        if res.status_code != 200:
-            print(f"[search] Tavily failed: {res.status_code} {data}")
-            return None
-
+            headers={"Authorization": f"Bearer {settings.tavily_api_key}", "Content-Type": "application/json"},
+            json={"query": query, "max_results": max_results, "include_answer": False, "search_depth": "basic"},
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
         results = data.get("results", [])
         if not results:
             return None
-
         clean = []
         for item in results[:max_results]:
             title = item.get("title", "").strip()
-            url = item.get("url") or item.get("link") or item.get("source")
-            snippet = item.get("content", "") or item.get("raw_content", "")
-            snippet = re.sub(r"\s+", " ", snippet).strip()
+            url = item.get("url") or item.get("link") or ""
+            snippet = re.sub(r"\s+", " ", item.get("content", "") or item.get("raw_content", "")).strip()
             if title and snippet:
                 clean.append(f"{title} — {snippet} [source: {url}]")
-            elif title:
-                clean.append(f"{title} [source: {url}]")
             elif snippet:
-                source = f" [source: {url}]" if url else ""
-                clean.append(f"{snippet}{source}")
+                clean.append(f"{snippet} [source: {url}]")
         return "\n".join(clean)[:1200] if clean else None
     except Exception as e:
-        print(f"[search] Tavily search failed: {e}")
-        return None
+        print(f"[search] Tavily failed: {e}")
+    return None
 
 
-def ddg_search(query: str, max_results: int = 3) -> str | None:
-    """Scrape DuckDuckGo HTML search for snippets with source citations."""
+async def ddg_search(session: aiohttp.ClientSession, query: str, max_results: int = 3) -> str | None:
     try:
-        res = requests.post(
+        async with session.post(
             DDG_SEARCH_URL,
             data={"q": query, "b": "", "kl": "us-en"},
             headers=HEADERS,
-            timeout=8,
-        )
-        html = res.text
-
-        # Extract titles, links, and snippets from result cards.
-        results = re.findall(
-            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-            html, re.DOTALL
-        )
-        snippets = re.findall(
-            r'class="result__snippet"[^>]*>(.*?)</a>',
-            html, re.DOTALL
-        )
-
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            html = await resp.text()
+        results = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL)
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
         clean = []
         for idx, (link, raw_title) in enumerate(results[:max_results]):
             title = re.sub(r"<[^>]+>", "", raw_title).strip()
-            snippet = ""
-            if idx < len(snippets):
-                snippet = re.sub(r"<[^>]+>", "", snippets[idx]).strip()
-                snippet = re.sub(r"\s+", " ", snippet)
+            snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", snippets[idx])).strip() if idx < len(snippets) else ""
             if title or snippet:
-                text = title
-                if snippet:
-                    text += f" — {snippet}"
-                text += f" [source: {link}]"
-                clean.append(text)
-
+                clean.append(f"{title} — {snippet} [source: {link}]" if snippet else f"{title} [source: {link}]")
         return "\n".join(clean)[:1200] if clean else None
     except Exception as e:
-        print(f"[search] DDG HTML search failed: {e}")
-        return None
+        print(f"[search] DDG HTML failed: {e}")
+    return None
 
 
-def web_search(query: str) -> str | None:
-    """Use Tavily if configured, otherwise fall back to DuckDuckGo."""
+async def web_search(query: str) -> str | None:
     key = query.lower().strip()
     if key in _cache:
         result, ts = _cache[key]
         if time.time() - ts < CACHE_TTL:
             return result
 
-    result = ddg_instant(query)
-    if result:
-        result = f"DuckDuckGo Instant Answer: {result}"
-    else:
-        tavily_result = tavily_search(query)
-        if tavily_result:
-            result = f"Tavily Search: {tavily_result}"
+    result = None
+    async with aiohttp.ClientSession() as session:
+        instant = await ddg_instant(session, query)
+        if instant:
+            result = f"DuckDuckGo: {instant}"
         else:
-            result = ddg_search(query)
+            tavily = await tavily_search(session, query)
+            if tavily:
+                result = f"Tavily: {tavily}"
+            else:
+                result = await ddg_search(session, query)
 
     if result:
         _cache[key] = (result, time.time())
     return result
 
+
 def build_search_query(message: str) -> str:
-    """Clean up the message into a good search query."""
     cleaned = re.sub(r'\b(corsbot|hey|please|bro|can you)\b', '', message.lower())
     return re.sub(r'\s+', ' ', cleaned).strip()[:200]

@@ -1,14 +1,13 @@
 import random
-import requests
 import re
 import os
 import logging
 import time
 from collections import defaultdict, deque
 
-log = logging.getLogger("corsbot.emotion")
+from config import settings
 
-GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
+log = logging.getLogger("corsbot.emotion")
 
 # ---------------- EMOTION CLASSIFIER ---------------- #
 
@@ -301,12 +300,12 @@ def build_gif_query(emotion: str, context: str) -> str:
     base_queries = GIF_MAP.get(emotion, [emotion])
     return random.choice(base_queries)
 
-def pick_gif_for_message(content: str, reply: str) -> tuple:
+async def pick_gif_for_message(content: str, reply: str) -> tuple:
     """Only send a GIF when there's a strong forced emotion signal. No AI detection."""
     forced = detect_forced_emotion(content)
     if forced and random.random() < GIF_CHANCE.get(forced, 0.20):
         from .gif import search_gif
-        url = search_gif(build_gif_query(forced, content))
+        url = await search_gif(build_gif_query(forced, content))
         if url:
             return url, forced
     return None, None

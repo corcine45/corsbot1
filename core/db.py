@@ -13,7 +13,7 @@ DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve()
 DB_PATH = DATA_DIR / "brain.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_RETENTION = 5
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 IDENTITY_KEYS = {"name", "age", "location", "job", "display_name", "birthday", "gender", "nationality"}
 TEMPORARY_KEYS = {"mood", "currently", "doing", "feeling", "status", "playing_now", "watching_now"}
@@ -104,6 +104,15 @@ def initialize_schema(cursor):
     """)
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS summaries (
+            thread_id TEXT PRIMARY KEY,
+            summary TEXT,
+            message_count INTEGER DEFAULT 0,
+            updated_at REAL
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
@@ -182,6 +191,14 @@ def initialize_schema(cursor):
     if "sensitivity" not in cols:
         cursor.execute("ALTER TABLE memory ADD COLUMN sensitivity TEXT DEFAULT 'normal'")
         cols.append("sensitivity")
+    if "confidence" not in cols:
+        cursor.execute("ALTER TABLE memory ADD COLUMN confidence REAL DEFAULT 1.0")
+        cols.append("confidence")
+    if "last_accessed" not in cols:
+        cursor.execute("ALTER TABLE memory ADD COLUMN last_accessed REAL DEFAULT 0")
+        cols.append("last_accessed")
+        # Backfill: set last_accessed = updated_at for existing rows
+        cursor.execute("UPDATE memory SET last_accessed = updated_at WHERE last_accessed = 0")
 
     cursor.execute(
         f"UPDATE memory SET memory_type='identity' WHERE (memory_type IS NULL OR memory_type='') AND LOWER(key) IN ({','.join('?' for _ in IDENTITY_KEYS)})",

@@ -6,9 +6,7 @@ import logging
 import pickle
 import numpy as np
 import faiss
-from functools import lru_cache
 from sentence_transformers import SentenceTransformer
-
 log = logging.getLogger("corsbot.memory")
 
 from .db import get_db, DATA_DIR
@@ -16,17 +14,116 @@ from .ai import groq_call
 
 # ---------------- EMBEDDER ---------------- #
 
-log.info("Loading embedding model...")
-embedder = SentenceTransformer("all-mpnet-base-v2")
 EMBED_DIM = 768
-log.info("Embedding model ready.")
+_embedder: SentenceTransformer | None = None
+_embedder_lock = threading.Lock()
 
-@lru_cache(maxsize=512)
+
+def get_embedder() -> SentenceTransformer:
+    """Lazy-load the embedding model on first use. Thread-safe."""
+    global _embedder
+    if _embedder is None:
+        with _embedder_lock:
+            if _embedder is None:  # double-checked locking
+                log.info("Loading embedding model...")
+                _embedder = SentenceTransformer("all-mpnet-base-v2")
+                log.info("Embedding model ready.")
+    return _embedder
+
+
+import queue as _queue
+
+# Bounded embedding cache — replaces lru_cache (unbounded, no eviction)
+_EMBED_CACHE: dict[str, np.ndarray] = {}
+_EMBED_CACHE_MAX = 2048  # ~6MB at 768-dim float32
+
+
 def _embed_vec(text: str) -> np.ndarray:
-    return embedder.encode(text, normalize_embeddings=True).astype(np.float32)
+    """Embed text with a bounded in-memory LRU cache. Thread-safe via GIL."""
+    cached = _EMBED_CACHE.get(text)
+    if cached is not None:
+        return cached
+    vec = get_embedder().encode(text, normalize_embeddings=True).astype(np.float32)
+    if len(_EMBED_CACHE) >= _EMBED_CACHE_MAX:
+        del _EMBED_CACHE[next(iter(_EMBED_CACHE))]
+    _EMBED_CACHE[text] = vec
+    return vec
+
 
 def _embed(text: str) -> bytes:
     return _embed_vec(text).tobytes()
+
+
+# ---------------- EMBEDDING WRITE QUEUE ---------------- #
+#
+# Embedding generation is CPU-heavy (~50-200ms per fact).
+# On the write path (storing new facts), we don't need the embedding
+# immediately — the fact is already in SQLite and will be found by
+# exact-key lookup. The FAISS index is only needed for semantic search.
+#
+# Strategy:
+#   1. Store the fact in SQLite immediately (durable, zero latency)
+#   2. Queue (user_id, key, value) for background embedding + FAISS upsert
+#   3. A single daemon thread drains the queue continuously
+#
+# This means the first semantic search after a new fact is stored may
+# not find it via FAISS yet — but it will be found on the next query
+# after the background worker processes it. Acceptable tradeoff.
+
+import queue as _queue
+
+_embed_queue: _queue.Queue = _queue.Queue()
+_embed_worker_started = False
+_embed_worker_lock = threading.Lock()
+
+
+def _embed_worker():
+    """Background thread that drains the embedding queue."""
+    log.info("[embed_queue] worker started")
+    while True:
+        try:
+            item = _embed_queue.get(timeout=5)
+            if item is None:  # sentinel — shut down
+                break
+            user_id, key, value = item
+            try:
+                vec = _embed_vec(f"{key}: {value}")
+                faiss_upsert(user_id, key, vec)
+                # Also update the embedding blob in SQLite
+                conn, cursor = get_db()
+                cursor.execute(
+                    "UPDATE memory SET embedding=? WHERE user_id=? AND key=?",
+                    (vec.tobytes(), user_id, key),
+                )
+                conn.commit()
+            except Exception as e:
+                log.warning(f"[embed_queue] failed to embed {user_id}:{key}: {e}")
+            finally:
+                _embed_queue.task_done()
+        except _queue.Empty:
+            continue
+        except Exception as e:
+            log.error(f"[embed_queue] worker error: {e}")
+
+
+def _ensure_embed_worker():
+    """Start the background embedding worker if not already running."""
+    global _embed_worker_started
+    if not _embed_worker_started:
+        with _embed_worker_lock:
+            if not _embed_worker_started:
+                t = threading.Thread(target=_embed_worker, daemon=True, name="embed-worker")
+                t.start()
+                _embed_worker_started = True
+
+
+def queue_embedding(user_id: str, key: str, value: str):
+    """
+    Queue a fact for background embedding + FAISS upsert.
+    Call this instead of embed_vec + faiss_upsert on the write path.
+    """
+    _ensure_embed_worker()
+    _embed_queue.put((str(user_id), key, value))
 
 # ---------------- FAISS ---------------- #
 
@@ -280,36 +377,25 @@ def _resolve_memory_type(key: str, memory_type: str | None) -> str:
     return memory_type or _classify_key(key)
 
 
-def _decay_score(memory_type: str, updated_at: float, reinforcement: int) -> float:
+def _decay_score(memory_type: str, updated_at: float, reinforcement: int, confidence: float = 1.0) -> float:
     """
-    Calculate a memory's retrieval score based on decay and reinforcement.
-    
-    Reinforcement mimics human familiarity — repeated exposure makes memories
-    easier to recall. Each reinforcement increases the baseline score and
-    slows the decay rate.
+    Calculate a memory's retrieval score based on decay, reinforcement, and confidence.
+
+    - Identity facts don't decay but reinforcement boosts priority
+    - Confidence scales the final score — low-confidence facts rank lower
+    - Reinforcement reduces effective age (memory feels "newer")
     """
     half_life = DECAY.get(memory_type)
     if half_life is None:
-        # Identity facts don't decay, but reinforcement still boosts priority
-        boost = min(reinforcement, 10) * 0.1  # up to +1.0 bonus
-        return min(1.0, 1.0 + boost)
-    
+        boost = min(reinforcement, 10) * 0.1
+        return min(1.0, 1.0 + boost) * confidence
+
     age = time.time() - updated_at
-    
-    # Reinforcement reduces effective age (memory feels "newer")
-    # Each reinforcement level reduces perceived age by 10%, up to 50%
     reinforcement_factor = min(reinforcement, 5) * 0.1
     effective_age = age * (1.0 - reinforcement_factor)
-    
-    # Base decay
     decay = 0.5 ** (effective_age / half_life)
-    
-    # Reinforcement boosts the floor (minimum score)
-    # Without reinforcement: floor = 0.5
-    # With max reinforcement: floor = 0.9
     floor_boost = 0.5 + (min(reinforcement, 5) / 5) * 0.4
-    
-    return decay * floor_boost
+    return decay * floor_boost * confidence
 
 
 def reinforce_memory(user_id: str, key: str, amount: int = 1) -> None:
@@ -334,16 +420,13 @@ def reinforce_memory(user_id: str, key: str, amount: int = 1) -> None:
         (amount, str(user_id), key)
     )
     conn.commit()
-    
-    # Also update the embedding's position in FAISS index
-    cursor.execute(
-        "SELECT value FROM memory WHERE user_id = ? AND key = ?",
-        (str(user_id), key)
-    )
+
+    # Queue re-embedding in background (reinforcement doesn't change the value,
+    # but keeps the FAISS index fresh after compaction)
+    cursor.execute("SELECT value FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
     row = cursor.fetchone()
     if row:
-        vec = _embed_vec(f"{key}: {row[0]}")
-        faiss_upsert(str(user_id), key, vec)
+        queue_embedding(str(user_id), key, row[0])
 
 
 def reinforce_memories_for_query(user_id: str, query: str, top_k: int = 3, amount: int = 1) -> list:
@@ -394,16 +477,11 @@ def reinforce_memories_for_query(user_id: str, query: str, top_k: int = 3, amoun
         row = cursor.fetchone()
         if row:
             reinforced.append((key, row[0]))
-            
-            # Update FAISS index with new embedding
-            cursor.execute(
-                "SELECT value FROM memory WHERE user_id = ? AND key = ?",
-                (str(user_id), key)
-            )
+            # Queue re-embedding in background
+            cursor.execute("SELECT value FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
             val_row = cursor.fetchone()
             if val_row:
-                vec = _embed_vec(f"{key}: {val_row[0]}")
-                faiss_upsert(str(user_id), key, vec)
+                queue_embedding(str(user_id), key, val_row[0])
     
     # Commit all changes
     conn, _ = get_db()
@@ -635,10 +713,16 @@ def _extract_deterministic(message: str) -> dict[str, str]:
     return found
 
 
-def _store_facts(user_id, facts: dict[str, str], conn, cursor, now: float):
+def _store_facts(user_id, facts: dict[str, str], conn, cursor, now: float, confidence: float = 1.0):
     """
     Shared fact-storage logic used by both extraction passes.
-    Handles dedup, reinforcement, embedding, and FAISS upsert.
+
+    Write path is split:
+    - SQLite INSERT happens immediately (durable, zero latency)
+    - Embedding + FAISS upsert is queued to a background worker
+
+    The dedup check still needs a synchronous embed to search FAISS,
+    but only runs if the FAISS index already has vectors for this user.
     """
     for key, value in facts.items():
         if not key or not value:
@@ -650,42 +734,57 @@ def _store_facts(user_id, facts: dict[str, str], conn, cursor, now: float):
             continue
 
         memory_type = _classify_key(key)
-        vec = _embed_vec(f"{key}: {value}")
 
-        # Deduplication: check if a very similar fact already exists under a different key
+        # Deduplication: only run if FAISS has vectors for this user
+        # (avoids triggering model load on first-ever message)
         existing_similar = None
-        for sim, existing_key in faiss_search(str(user_id), vec, top_k=3):
-            if sim >= DEDUP_SIMILARITY_THRESHOLD and existing_key != key:
-                existing_similar = existing_key
-                break
+        if _faiss_index is not None and _faiss_index.ntotal > 0:
+            vec = _embed_vec(f"{key}: {value}")
+            for sim, existing_key in faiss_search(str(user_id), vec, top_k=3):
+                if sim >= DEDUP_SIMILARITY_THRESHOLD and existing_key != key:
+                    existing_similar = existing_key
+                    break
 
-        if existing_similar:
-            log.info(f"[memory] dedup: '{key}={value}' similar to existing '{existing_similar}', updating")
-            cursor.execute(
-                "UPDATE memory SET value=?, updated_at=?, reinforcement=reinforcement+1 WHERE user_id=? AND key=?",
-                (value, now, str(user_id), existing_similar)
-            )
-            updated_vec = _embed_vec(f"{existing_similar}: {value}")
-            cursor.execute(
-                "UPDATE memory SET embedding=? WHERE user_id=? AND key=?",
-                (updated_vec.tobytes(), str(user_id), existing_similar)
-            )
-            faiss_upsert(str(user_id), existing_similar, updated_vec)
-            continue
+            if existing_similar:
+                log.info(f"[memory] dedup: '{key}={value}' similar to existing '{existing_similar}', updating")
+                cursor.execute(
+                    "UPDATE memory SET value=?, updated_at=?, reinforcement=reinforcement+1, confidence=MIN(confidence+0.1, 1.0) WHERE user_id=? AND key=?",
+                    (value, now, str(user_id), existing_similar)
+                )
+                # Queue embedding update for the deduped key
+                queue_embedding(str(user_id), existing_similar, value)
+                continue
 
-        cursor.execute("SELECT reinforcement FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
+        # Check for contradiction: same key, different value
+        cursor.execute("SELECT value, reinforcement, confidence FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
         row = cursor.fetchone()
-        reinforcement = (row[0] + 1) if row else 1
+
+        if row:
+            existing_value, existing_reinforcement, existing_confidence = row
+            if existing_value.lower().strip() != value.lower().strip():
+                contradiction_confidence = max(0.4, confidence * 0.6)
+                log.info(f"[memory] contradiction: key={key!r} old={existing_value!r} new={value!r} confidence={contradiction_confidence:.2f}")
+                reinforcement = existing_reinforcement + 1
+                final_confidence = contradiction_confidence
+            else:
+                reinforcement = existing_reinforcement + 1
+                final_confidence = min(1.0, (existing_confidence or confidence) + 0.1)
+        else:
+            reinforcement = 1
+            final_confidence = confidence
+
+        # Store in SQLite immediately — no embedding blob yet (will be filled by worker)
         cursor.execute(
-            """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement, confidence, last_accessed)
+               VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
                ON CONFLICT(user_id, key) DO UPDATE SET
                    value=excluded.value, updated_at=excluded.updated_at,
-                   embedding=excluded.embedding, memory_type=excluded.memory_type,
-                   reinforcement=excluded.reinforcement""",
-            (str(user_id), key, value, now, vec.tobytes(), memory_type, reinforcement),
+                   memory_type=excluded.memory_type,
+                   reinforcement=excluded.reinforcement, confidence=excluded.confidence""",
+            (str(user_id), key, value, now, memory_type, reinforcement, final_confidence, now),
         )
-        faiss_upsert(str(user_id), key, vec)
+        # Queue embedding + FAISS upsert in background
+        queue_embedding(str(user_id), key, value)
 
 
 def extract_memory(user_id, message):
@@ -712,7 +811,7 @@ def extract_memory(user_id, message):
     det_facts = _extract_deterministic(message)
     if det_facts:
         log.debug(f"[memory] deterministic extracted: {det_facts}")
-        _store_facts(user_id, det_facts, conn, cursor, now)
+        _store_facts(user_id, det_facts, conn, cursor, now, confidence=1.0)
         conn.commit()
 
     # ── Pass 2: AI extraction ────────────────────────────────────────────
@@ -776,7 +875,7 @@ def extract_memory(user_id, message):
 
         if ai_facts:
             log.debug(f"[memory] AI extracted: {ai_facts}")
-            _store_facts(user_id, ai_facts, conn, cursor, now)
+            _store_facts(user_id, ai_facts, conn, cursor, now, confidence=0.75)
             conn.commit()
 
     except Exception as e:
@@ -927,9 +1026,9 @@ def _apply_sensitivity_filter(
     return filtered
 
 def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
-    _, cursor = get_db()
+    conn, cursor = get_db()
     cursor.execute(
-        "SELECT key, value, memory_type, updated_at, reinforcement FROM memory WHERE user_id=?",
+        "SELECT key, value, memory_type, updated_at, reinforcement, confidence FROM memory WHERE user_id=?",
         (str(user_id),)
     )
     rows = cursor.fetchall()
@@ -938,29 +1037,27 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
 
     now = time.time()
     fact_lookup = {}
-    for key, value, memory_type, updated_at, reinforcement in rows:
+    for key, value, memory_type, updated_at, reinforcement, confidence in rows:
         resolved_type = _resolve_memory_type(key, memory_type)
-        fact_lookup[key] = (value, resolved_type, updated_at, reinforcement or 1)
+        fact_lookup[key] = (value, resolved_type, updated_at, reinforcement or 1, confidence if confidence is not None else 1.0)
 
     non_identity = {}
-    for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
+    for key, (value, memory_type, updated_at, reinforcement, confidence) in fact_lookup.items():
         if key in _PROMPT_EXCLUDED_KEYS:
-            continue  # stored but never auto-injected
+            continue
         if _is_about_other_person(key, value):
-            continue  # fact is about someone else, not the current user
+            continue
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue
-        non_identity[key] = (value, memory_type, updated_at, reinforcement)
+        non_identity[key] = (value, memory_type, updated_at, reinforcement, confidence)
 
     scored_facts = []
     if query and non_identity:
         expanded = _expand_query(query)
-        # Average embeddings of original + expanded query for better coverage
         q1 = _embed_vec(query)
         q2 = _embed_vec(expanded) if expanded != query.lower() else q1
         query_vec = ((q1 + q2) / 2).astype(np.float32)
-        # Renormalize
         norm = np.linalg.norm(query_vec)
         if norm > 0:
             query_vec = query_vec / norm
@@ -970,17 +1067,27 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
                 continue
             if sim < MEMORY_SIMILARITY_THRESHOLD:
                 continue
-            value, memory_type, updated_at, reinforcement = non_identity[key]
-            scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement), key, value))
+            value, memory_type, updated_at, reinforcement, confidence = non_identity[key]
+            scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement, confidence), key, value))
     else:
         query_vec = None
-        for key, (value, memory_type, updated_at, reinforcement) in non_identity.items():
-            scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
+        for key, (value, memory_type, updated_at, reinforcement, confidence) in non_identity.items():
+            scored_facts.append((_decay_score(memory_type, updated_at, reinforcement, confidence), key, value))
 
     scored_facts.sort(reverse=True)
     scored_facts = _apply_sensitivity_filter(scored_facts, query, query_vec if query else None)
-    result = [f"{k}={v}" for _, k, v in scored_facts[:MAX_MEMORY_FACTS]]
-    return "\n".join(result)
+    top_facts = scored_facts[:MAX_MEMORY_FACTS]
+
+    # Write last_accessed for retrieved facts
+    if top_facts:
+        keys = [k for _, k, _ in top_facts]
+        cursor.executemany(
+            "UPDATE memory SET last_accessed=? WHERE user_id=? AND key=?",
+            [(now, str(user_id), k) for k in keys]
+        )
+        conn.commit()
+
+    return "\n".join(f"{k}={v}" for _, k, v in top_facts)
 
 
 # ── Priority-based memory retrieval ────────────────────────────────────────── #
@@ -1130,9 +1237,9 @@ def get_memory_prioritized(user_id, query: str = "", topic: str = "", emotion: s
 
 def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
     """Same as get_memory but also returns the list of active keys (for feedback boosting)."""
-    _, cursor = get_db()
+    conn, cursor = get_db()
     cursor.execute(
-        "SELECT key, value, memory_type, updated_at, reinforcement FROM memory WHERE user_id=?",
+        "SELECT key, value, memory_type, updated_at, reinforcement, confidence FROM memory WHERE user_id=?",
         (str(user_id),)
     )
     rows = cursor.fetchall()
@@ -1141,20 +1248,20 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
 
     now = time.time()
     fact_lookup = {}
-    for key, value, memory_type, updated_at, reinforcement in rows:
+    for key, value, memory_type, updated_at, reinforcement, confidence in rows:
         resolved_type = _resolve_memory_type(key, memory_type)
-        fact_lookup[key] = (value, resolved_type, updated_at, reinforcement or 1)
+        fact_lookup[key] = (value, resolved_type, updated_at, reinforcement or 1, confidence if confidence is not None else 1.0)
 
     non_identity = {}
-    for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
+    for key, (value, memory_type, updated_at, reinforcement, confidence) in fact_lookup.items():
         if key in _PROMPT_EXCLUDED_KEYS:
-            continue  # stored but never auto-injected
+            continue
         if _is_about_other_person(key, value):
-            continue  # fact is about someone else, not the current user
+            continue
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
             continue
-        non_identity[key] = (value, memory_type, updated_at, reinforcement)
+        non_identity[key] = (value, memory_type, updated_at, reinforcement, confidence)
 
     scored_facts = []
     if query and non_identity:
@@ -1171,20 +1278,112 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
                 continue
             if sim < MEMORY_SIMILARITY_THRESHOLD:
                 continue
-            value, memory_type, updated_at, reinforcement = non_identity[key]
-            scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement), key, value))
+            value, memory_type, updated_at, reinforcement, confidence = non_identity[key]
+            scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement, confidence), key, value))
     else:
         query_vec = None
-        for key, (value, memory_type, updated_at, reinforcement) in non_identity.items():
-            scored_facts.append((_decay_score(memory_type, updated_at, reinforcement), key, value))
+        for key, (value, memory_type, updated_at, reinforcement, confidence) in non_identity.items():
+            scored_facts.append((_decay_score(memory_type, updated_at, reinforcement, confidence), key, value))
 
     scored_facts.sort(reverse=True)
     scored_facts = _apply_sensitivity_filter(scored_facts, query, query_vec if query else None)
     top_scored = scored_facts[:MAX_MEMORY_FACTS]
     active_keys = [k for _, k, _ in top_scored]
 
-    result = [f"{k}={v}" for _, k, v in top_scored]
-    return "\n".join(result), active_keys
+    # Write last_accessed for retrieved facts
+    if top_scored:
+        cursor.executemany(
+            "UPDATE memory SET last_accessed=? WHERE user_id=? AND key=?",
+            [(now, str(user_id), k) for k in active_keys]
+        )
+        conn.commit()
+
+    return "\n".join(f"{k}={v}" for _, k, v in top_scored), active_keys
+
+
+# ── Expiration / Purge ────────────────────────────────────────────────────── #
+
+# Thresholds for automatic purging
+_PURGE_MIN_AGE_DAYS = 30          # never purge facts newer than this
+_PURGE_LOW_CONFIDENCE = 0.4       # purge if confidence is this low...
+_PURGE_NOT_ACCESSED_DAYS = 14     # ...and hasn't been accessed in this many days
+_PURGE_TEMPORARY_DAYS = 1         # temporary facts expire after 1 day regardless
+
+_purge_counter: dict[str, int] = {}
+_PURGE_EVERY = 50                 # run purge check every N messages per user
+
+
+def should_purge(user_id: str) -> bool:
+    _purge_counter.setdefault(user_id, 0)
+    _purge_counter[user_id] += 1
+    return _purge_counter[user_id] % _PURGE_EVERY == 0
+
+
+def purge_stale_memories(user_id: str) -> int:
+    """
+    Delete memory facts that are stale, low-confidence, or expired.
+
+    Rules (any one triggers deletion):
+    1. Temporary facts (mood, currently, etc.) older than 1 day
+    2. Facts with confidence < 0.4 AND not accessed in 14+ days
+    3. Preference facts past their 3x half-life (already filtered at retrieval,
+       but this cleans them from the DB permanently)
+
+    Identity facts are never purged automatically.
+    Returns the number of facts deleted.
+    """
+    conn, cursor = get_db()
+    now = time.time()
+
+    cursor.execute(
+        "SELECT key, value, memory_type, updated_at, last_accessed, confidence, reinforcement "
+        "FROM memory WHERE user_id=? AND memory_type != 'identity'",
+        (str(user_id),)
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return 0
+
+    to_delete = []
+    for key, value, memory_type, updated_at, last_accessed, confidence, reinforcement in rows:
+        if key.startswith("denied_"):
+            continue  # never purge denial locks
+
+        age_days = (now - updated_at) / 86400
+        last_access_days = (now - (last_accessed or updated_at)) / 86400
+
+        # Rule 1: temporary facts expire fast
+        if memory_type == "temporary" and age_days > _PURGE_TEMPORARY_DAYS:
+            to_delete.append(key)
+            continue
+
+        # Rule 2: low confidence + not recently accessed
+        conf = confidence if confidence is not None else 1.0
+        if conf < _PURGE_LOW_CONFIDENCE and last_access_days > _PURGE_NOT_ACCESSED_DAYS:
+            to_delete.append(key)
+            continue
+
+        # Rule 3: preference facts past 3x half-life (90 days)
+        half_life = DECAY.get(memory_type or "preference")
+        if half_life and age_days > _PURGE_MIN_AGE_DAYS:
+            if (now - updated_at) > half_life * 3:
+                to_delete.append(key)
+                continue
+
+    if to_delete:
+        cursor.executemany(
+            "DELETE FROM memory WHERE user_id=? AND key=?",
+            [(str(user_id), k) for k in to_delete]
+        )
+        conn.commit()
+        log.info("memory_purged",
+            user_id=user_id,
+            count=len(to_delete),
+            keys=to_delete[:10],  # log first 10 for debugging
+        )
+
+    return len(to_delete)
+
 
 def store_user_name(user_id, display_name, username=None, guild_nick=None):
     """Store all name variants for a user for better identification."""
@@ -1192,42 +1391,39 @@ def store_user_name(user_id, display_name, username=None, guild_nick=None):
     now = time.time()
 
     # Always store display_name
-    vec = _embed_vec(f"display_name: {display_name}")
     cursor.execute(
         """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
-           VALUES (?, 'display_name', ?, ?, ?, 'identity', 1)
+           VALUES (?, 'display_name', ?, ?, NULL, 'identity', 1)
            ON CONFLICT(user_id, key) DO UPDATE SET
                value=excluded.value, updated_at=excluded.updated_at,
-               embedding=excluded.embedding, memory_type='identity'""",
-        (str(user_id), display_name, now, vec.tobytes()),
+               memory_type='identity'""",
+        (str(user_id), display_name, now),
     )
-    faiss_upsert(str(user_id), "display_name", vec)
+    queue_embedding(str(user_id), "display_name", display_name)
 
     # Store username (the @handle) if provided
     if username:
-        vec2 = _embed_vec(f"username: {username}")
         cursor.execute(
             """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
-               VALUES (?, 'username', ?, ?, ?, 'identity', 1)
+               VALUES (?, 'username', ?, ?, NULL, 'identity', 1)
                ON CONFLICT(user_id, key) DO UPDATE SET
                    value=excluded.value, updated_at=excluded.updated_at,
-                   embedding=excluded.embedding, memory_type='identity'""",
-            (str(user_id), username, now, vec2.tobytes()),
+                   memory_type='identity'""",
+            (str(user_id), username, now),
         )
-        faiss_upsert(str(user_id), "username", vec2)
+        queue_embedding(str(user_id), "username", username)
 
     # Store server nickname if different from display name
     if guild_nick and guild_nick != display_name:
-        vec3 = _embed_vec(f"server_nickname: {guild_nick}")
         cursor.execute(
             """INSERT INTO memory (user_id, key, value, updated_at, embedding, memory_type, reinforcement)
-               VALUES (?, 'server_nickname', ?, ?, ?, 'identity', 1)
+               VALUES (?, 'server_nickname', ?, ?, NULL, 'identity', 1)
                ON CONFLICT(user_id, key) DO UPDATE SET
                    value=excluded.value, updated_at=excluded.updated_at,
-                   embedding=excluded.embedding, memory_type='identity'""",
-            (str(user_id), guild_nick, now, vec3.tobytes()),
+                   memory_type='identity'""",
+            (str(user_id), guild_nick, now),
         )
-        faiss_upsert(str(user_id), "server_nickname", vec3)
+        queue_embedding(str(user_id), "server_nickname", guild_nick)
 
     conn.commit()
 
