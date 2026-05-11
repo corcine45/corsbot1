@@ -7,8 +7,9 @@ import re
 import unicodedata
 
 from config import settings
+from core.logger import get_logger
 
-log = logging.getLogger("corsbot.ai")
+log = get_logger("corsbot.ai")
 
 AI_MODEL = settings.ai_model
 client_ai = Groq(api_key=settings.groq_api_key)
@@ -455,21 +456,17 @@ def is_high_risk_intent(text: str) -> tuple[bool, IntentClassification]:
     classification = classify_message_intent(text)
 
     if classification.risk_level in ("high", "critical"):
-        log.warning("intent_blocked",
-            category=classification.category,
-            risk_score=classification.risk_score,
-            risk_level=classification.risk_level,
-            reason=classification.reason,
-            input=text[:80],
+        log.warning(
+            f"intent_blocked category={classification.category} "
+            f"score={classification.risk_score} reason={classification.reason} "
+            f"input={text[:80]!r}"
         )
         return True, classification
 
     if classification.risk_level in ("medium", "low"):
-        log.info("intent_flagged",
-            category=classification.category,
-            risk_score=classification.risk_score,
-            risk_level=classification.risk_level,
-            reason=classification.reason,
+        log.info(
+            f"intent_flagged category={classification.category} "
+            f"score={classification.risk_score} level={classification.risk_level}"
         )
 
     return False, classification
