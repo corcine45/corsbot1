@@ -93,7 +93,9 @@ QUICK_REPLIES = {
         "hi", "hey", "hello", "sup", "yo", "hiya", "heya", "wassup", "wsp",
         "wazzup", "howdy", "ello", "helo", "heyy", "heyyyy", "yoo", "yooo",
         "oi", "ay", "ayy", "ayyy", "what's up", "whats up", "wuts up",
-    ]): ["hey!", "yo!", "sup", "heyyy", "what's good", "ayy", "yoo", "what's good bro"],
+        "hoy", "hoyy", "hoyyy", "hoyyyy", "oy", "oyy", "oyyy",
+        "hala", "hala bira", "musta", "kamusta", "uy", "uyy",
+    ]): ["hey!", "yo!", "sup", "heyyy", "what's good", "ayy", "yoo", "hoy!"],
 
     frozenset([
         "lol", "lmao", "lmfao", "haha", "hahaha", "hahahaha", "😂", "💀",

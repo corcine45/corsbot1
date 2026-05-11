@@ -541,6 +541,14 @@ _QUESTION_STARTERS = {
     "do", "does", "did", "will", "have", "has",
 }
 
+# Pure greetings — always fast route, no planning needed
+_GREETING_TRIGGERS = {
+    "hi", "hey", "hello", "sup", "yo", "hiya", "heya", "wassup", "wsp",
+    "hoy", "hoyy", "hoyyy", "hoyyyy", "oy", "oyy", "uy", "uyy",
+    "musta", "kamusta", "gm", "gn", "wb", "heyyy", "yoo", "yooo",
+    "ello", "helo", "howdy", "ayy", "ayyy",
+}
+
 # Casual signals — pure social messages with no informational intent
 _CASUAL_TRIGGERS = {
     "lol", "lmao", "haha", "fr", "bro", "ngl", "tbh", "imo",
@@ -580,7 +588,11 @@ def route_message(content: str, emotion_state: str | None, has_web_context: bool
     words = lower.split()
     word_count = len(words)
 
-    # 3. Fast route — only for very short pure-reaction messages
+    # 3. Greeting route — pure greetings, no planning needed at all
+    if word_count <= 3 and any(w in _GREETING_TRIGGERS for w in words):
+        return RouteResult(_MODEL_FAST, 60, "fast")
+
+    # 4. Fast route — only for very short pure-reaction messages
     # Conditions (ALL must be true):
     #   - ≤8 words (was 12 — too loose)
     #   - has a casual signal
@@ -1313,6 +1325,7 @@ SYSTEM_PROMPT = """You are Corsbot, a chill Discord bot made by Corcine.
 Corcine is your creator — a person, not a company. If someone asks who Corcine is, say he's the guy who made you. Keep it short and casual.
 Never say you are an AI or language model. If asked who made you, say Corcine made you.
 You understand Bisaya/Cebuano — if someone writes in Bisaya, understand it fully but always reply in English.
+Common Filipino/Bisaya greetings: "hoy/hoyy" = hey, "uy" = hey/yo, "musta/kamusta" = how are you, "hala" = wow/oh. Treat these as greetings, not questions.
 Be the user's ride-or-die comrade — honest and direct, but not contrarian. Call them out when they're genuinely wrong, but always have their back.
 Be SHORT — 1-2 sentences max unless more detail is needed. No essays.
 Be open-minded about topics and opinions. When someone shares a take, actually consider their point before responding — find what makes sense in their argument even if you disagree. Acknowledge valid points, agree when they're right, and push back only when you genuinely think they're off. If someone lays out a solid argument, just agree — don't manufacture a counterpoint for the sake of it. Don't be contrarian for no reason.
