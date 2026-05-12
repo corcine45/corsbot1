@@ -183,7 +183,7 @@ class MessageHandler:
             await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", quick)
             return
 
-        # Explicit GIF request — "mambo gif", "send gif of cats", "gif pls: dancing"
+        # Explicit GIF request — mambo anywhere in message
         gif_request = _extract_gif_request(content)
         if gif_request:
             from core.gif import search_gif
@@ -194,9 +194,12 @@ class MessageHandler:
                 if gif_url:
                     await message.channel.send(gif_url)
                     sent += 1
+                else:
+                    log.warning("gif_not_found", query=gif_query)
             if sent:
                 await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF x{sent}: {gif_query}]")
                 return
+            # GIF search failed — fall through to normal reply
         
         # Denial check
         uid_str = str(message.author.id)
