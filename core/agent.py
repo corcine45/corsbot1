@@ -492,6 +492,9 @@ class AgentLoop:
         ctx.reply = reply or ""
 
         if ctx.reply:
+            # Track bot's response in session for future message context
+            from .session import add_bot_message
+            await self._run_sync(add_bot_message, ctx.user_id, ctx.reply)
             await self.step_post(ctx, trace)
         else:
             trace.add("post", 0, "skipped", "no reply")

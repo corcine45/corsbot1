@@ -218,11 +218,26 @@ def _get_or_create(user_id: int) -> _Session:
 # ── Public API ────────────────────────────────────────────────────────────── #
 
 def add_message(user_id: int, content: str):
+    """Add a user message to the session message window."""
     sess = _get_or_create(user_id)
     sess.messages.append(content)
     sess.messages = sess.messages[-MESSAGE_WINDOW:]
     sess.msg_count += 1
     sess.last_seen = time.time()
+
+
+def add_bot_message(user_id: int, content: str):
+    """Add a bot message to the session message window for context tracking.
+    
+    This ensures the bot's own recent responses are available when processing
+    future messages, preventing the bot from contradicting itself or appearing
+    confused about what it previously said.
+    """
+    sess = _get_or_create(user_id)
+    sess.messages.append(content)
+    sess.messages = sess.messages[-MESSAGE_WINDOW:]
+    sess.last_seen = time.time()
+    log.debug(f"[session] added bot message user={user_id} len={len(content)}")
 
 
 def should_refresh(user_id: int) -> bool:

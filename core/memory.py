@@ -495,7 +495,8 @@ def reinforce_memories_for_query(user_id: str, query: str, top_k: int = 3, amoun
 # ---------------- EXTRACT / GET / STORE ---------------- #
 
 MEMORY_EXTRACT_EVERY = 1  # extract on every message — memory is user-scoped across DMs and servers
-MEMORY_SIMILARITY_THRESHOLD = 0.48
+MEMORY_SIMILARITY_THRESHOLD = 0.62  # increased from 0.48 for stricter relevance filtering
+MEMORY_DEDUP_THRESHOLD = 0.85  # facts this similar are removed to avoid redundancy
 MAX_MEMORY_FACTS = 6
 DEDUP_SIMILARITY_THRESHOLD = 0.92  # facts this similar are considered duplicates
 
@@ -517,6 +518,48 @@ def _is_about_other_person(key: str, value: str) -> bool:
     if _re.match(r'^[a-z]{3,}[_][a-z]', key):
         return True
     return False
+
+
+def _deduplicate_facts(scored_facts: list, dedup_threshold: float = MEMORY_DEDUP_THRESHOLD) -> list:
+    """
+    Remove near-duplicate facts from scored list. If two facts are too similar,
+    keep only the highest-scored one.
+    
+    Args:
+        scored_facts: List of (score, key, value) tuples, already sorted by score
+        dedup_threshold: Similarity score above which facts are considered duplicates
+    
+    Returns:
+        Deduplicated list of (score, key, value) tuples
+    """
+    if len(scored_facts) <= 1:
+        return scored_facts
+    
+    result = []
+    kept_vecs = []
+    kept_indices = []
+    
+    for i, (score, key, value) in enumerate(scored_facts):
+        fact_vec = _embed_vec(f"{key}: {value}").astype(np.float32)
+        is_duplicate = False
+        
+        # Check against all previously kept facts
+        for kept_vec in kept_vecs:
+            norm = np.linalg.norm(fact_vec)
+            kept_norm = np.linalg.norm(kept_vec)
+            if norm > 0 and kept_norm > 0:
+                similarity = np.dot(fact_vec, kept_vec) / (norm * kept_norm)
+                if similarity > dedup_threshold:
+                    is_duplicate = True
+                    break
+        
+        if not is_duplicate:
+            result.append((score, key, value))
+            kept_vecs.append(fact_vec)
+            kept_indices.append(i)
+    
+    log.debug(f"[memory] deduplication: {len(scored_facts)} → {len(result)} facts")
+    return result
 _msg_counter: dict = {}
 
 def should_extract(user_id: str) -> bool:
@@ -1076,6 +1119,10 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
 
     scored_facts.sort(reverse=True)
     scored_facts = _apply_sensitivity_filter(scored_facts, query, query_vec if query else None)
+    
+    # Apply deduplication to remove near-duplicate facts
+    scored_facts = _deduplicate_facts(scored_facts, MEMORY_DEDUP_THRESHOLD)
+    
     top_facts = scored_facts[:MAX_MEMORY_FACTS]
 
     # Write last_accessed for retrieved facts
@@ -1180,8 +1227,9 @@ def get_memory_prioritized(user_id, query: str = "", topic: str = "", emotion: s
             decay = _decay_score(memory_type, updated_at, reinforcement)
             fact_str = f"{key}: {value}"
             
-            # Categorize by similarity threshold
-            if sim >= 0.7:
+            # Categorize by similarity threshold (HIGH ≥ 0.75, MEDIUM ≥ 0.62)
+            # This ensures very relevant facts get higher priority
+            if sim >= 0.75:
                 manager.add(fact_str, Priority.HIGH, "memory", updated_at, relevance_score=sim * decay)
             else:
                 manager.add(fact_str, Priority.MEDIUM, "memory", updated_at, relevance_score=sim * decay)
@@ -1287,6 +1335,10 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
 
     scored_facts.sort(reverse=True)
     scored_facts = _apply_sensitivity_filter(scored_facts, query, query_vec if query else None)
+    
+    # Apply deduplication to remove near-duplicate facts
+    scored_facts = _deduplicate_facts(scored_facts, MEMORY_DEDUP_THRESHOLD)
+    
     top_scored = scored_facts[:MAX_MEMORY_FACTS]
     active_keys = [k for _, k, _ in top_scored]
 
