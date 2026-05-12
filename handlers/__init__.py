@@ -48,8 +48,8 @@ import re as _re
 _MAMBO_RE = _re.compile(r'\bmamboo*\b', _re.I)
 _MAMBO_COUNT_RE = _re.compile(r'^(\d+)\s+mamboo*$', _re.I)
 _NEGATIVE_MAMBO_RE = _re.compile(
-    r"\b(?:no|not|never|none|without|hardly|barely|scarcely|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|don't|dont|doesn't|doesnt|didn't|didnt|can't|cant|couldn't|couldnt|won't|wont|shouldn't|shouldnt|wouldn't|wouldnt)\b(?:\s+\w+){0,3}\s+\bmamboo*\b"
-    r"|\bmamboo*\b(?:\s+\w+){0,3}\s+\b(?:no|not|never|none|without|hardly|barely|scarcely|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|don't|dont|doesn't|doesnt|didn't|didnt|can't|cant|couldn't|couldnt|won't|wont|shouldn't|shouldnt|wouldn't|wouldnt)\b",
+    r"\b(?:no|not|never|none|without|hardly|barely|scarcely|ain't|aint|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|don't|dont|doesn't|doesnt|didn't|didnt|can't|cant|couldn't|couldnt|won't|wont|shouldn't|shouldnt|wouldn't|wouldnt)\b(?:[\s\W]+\w+){0,3}[\s\W]+\bmamboo*\b"
+    r"|\bmamboo*\b(?:[\s\W]+\w+){0,3}[\s\W]+\b(?:no|not|never|none|without|hardly|barely|scarcely|ain't|aint|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|don't|dont|doesn't|doesnt|didn't|didnt|can't|cant|couldn't|couldnt|won't|wont|shouldn't|shouldnt|wouldn't|wouldnt)\b",
     _re.I,
 )
 
