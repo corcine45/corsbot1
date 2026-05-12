@@ -114,35 +114,28 @@ class MessageHandler:
         
         is_dm = isinstance(message.channel, discord.DMChannel)
         should_reply = is_dm or (self.client.user in message.mentions)
-        
-        # Cooldown check
-        if should_reply and not await self._check_cooldown(message.author.id):
-            return
-        
-        if not should_reply:
-            return
-        
-        # Extract content and OCR text
+
+        # Extract content and OCR text early so mambo GIFs can auto-trigger in public chat.
         content = message.content.strip()
         ocr_text = ""
-        
+
         if message.attachments:
             ocr_text = await self._extract_attachments(message.attachments)
-        
+
         if not content and not ocr_text:
             return
-        
+
         # Strip bot mention
         content = content.replace(f"<@{self.client.user.id}>", "").replace(f"<@!{self.client.user.id}>", "").strip()
         if not content and not ocr_text:
             return
-        
+
         # Combine OCR and content
         if ocr_text and content:
             content = f"{ocr_text}\n\n{content}"
         elif ocr_text:
             content = ocr_text
-        
+
         # Injection guard — three layers:
         # 1. Regex patterns (fast, zero cost)
         # 2. Semantic similarity (embedding-based, catches indirect framing)
@@ -157,7 +150,38 @@ class MessageHandler:
         if blocked:
             await message.channel.send(f"<@{message.author.id}> nice try 💀")
             return
-        
+
+        # Explicit GIF request — mambo anywhere in message
+        gif_request = _extract_gif_request(content)
+        if gif_request:
+            from core.gif import search_gif
+            gif_query, gif_count = gif_request
+            sent = 0
+            loop = asyncio.get_running_loop()
+            thread_id = get_thread_id(
+                message.author.id,
+                message.guild.id if message.guild else None,
+                message.channel.id,
+                is_dm,
+            )
+            for _ in range(gif_count):
+                gif_url = await search_gif(gif_query)
+                if gif_url:
+                    await message.channel.send(gif_url)
+                    sent += 1
+                else:
+                    log.warning("gif_not_found", query=gif_query)
+            if sent:
+                await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF x{sent}: {gif_query}]")
+                return
+            # GIF search failed — fall through to normal reply
+
+        if should_reply and not await self._check_cooldown(message.author.id):
+            return
+
+        if not should_reply:
+            return
+
         # Resolve mentions
         mentioned_users = await self._resolve_mentions(message, content)
         
