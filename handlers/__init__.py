@@ -43,31 +43,16 @@ log = get_logger("corsbot.handlers.messages")
 
 import re as _re
 
-# Patterns that signal an explicit GIF request
-# Captures: "mambo gif", "send mambo gif", "gif of mambo", "mambo gif pls", "mambo gif please"
-_GIF_REQUEST_PATTERNS = [
-    _re.compile(r'^(?:send\s+)?(.+?)\s+gif(?:\s+(?:pls|please|now|bro|na))?$', _re.I),
-    _re.compile(r'^gif\s+(?:of\s+)?(.+?)(?:\s+(?:pls|please|now|bro|na))?$', _re.I),
-    _re.compile(r'^(?:send\s+)?gif\s*:\s*(.+)$', _re.I),
-]
+# "mambo" is the magic word — sends a random GIF
+# "2 mambo" sends 2, etc. (capped at 5)
+_MAMBO_RE = _re.compile(r'^(?:(\d+)\s+)?mambo$', _re.I)
 
-def _extract_gif_request(text: str) -> str | None:
-    """
-    Returns a GIF search query if the message is asking for a specific GIF.
-    Examples:
-      "mambo gif" → "mambo"
-      "send mambo gif pls" → "mambo"
-      "gif of a cat" → "a cat"
-      "gif: dancing" → "dancing"
-    Returns None if not a GIF request.
-    """
-    cleaned = text.strip().rstrip("!?.")
-    for pattern in _GIF_REQUEST_PATTERNS:
-        m = pattern.match(cleaned)
-        if m:
-            query = m.group(1).strip()
-            if query and len(query) >= 2:
-                return query
+def _extract_gif_request(text: str) -> tuple[str, int] | None:
+    """Returns ("mambo", count) if message is a mambo request, else None."""
+    m = _MAMBO_RE.match(text.strip().rstrip("!?."))
+    if m:
+        count = min(int(m.group(1)), 5) if m.group(1) else 1
+        return "mambo", count
     return None
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -190,15 +175,19 @@ class MessageHandler:
             return
 
         # Explicit GIF request — "mambo gif", "send gif of cats", "gif pls: dancing"
-        gif_query = _extract_gif_request(content)
-        if gif_query:
+        gif_request = _extract_gif_request(content)
+        if gif_request:
             from core.gif import search_gif
-            gif_url = await search_gif(gif_query)
-            if gif_url:
-                await message.channel.send(gif_url)
-                await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF: {gif_query}]")
+            gif_query, gif_count = gif_request
+            sent = 0
+            for _ in range(gif_count):
+                gif_url = await search_gif(gif_query)
+                if gif_url:
+                    await message.channel.send(gif_url)
+                    sent += 1
+            if sent:
+                await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF x{sent}: {gif_query}]")
                 return
-            # If no GIF found, fall through to normal reply
         
         # Denial check
         uid_str = str(message.author.id)
