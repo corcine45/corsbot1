@@ -43,16 +43,25 @@ log = get_logger("corsbot.handlers.messages")
 
 import re as _re
 
-# "mambo" is the magic word — sends a random GIF
-# "2 mambo" sends 2, etc. (capped at 5)
-_MAMBO_RE = _re.compile(r'^(?:(\d+)\s+)?mambo$', _re.I)
+# "mambo" anywhere in the message triggers a GIF
+# "2 mambo" or "mambo mambo" sends 2, etc. (capped at 5)
+_MAMBO_RE = _re.compile(r'\bmambo\b', _re.I)
+_MAMBO_COUNT_RE = _re.compile(r'^(\d+)\s+mambo$', _re.I)
 
 def _extract_gif_request(text: str) -> tuple[str, int] | None:
-    """Returns ("mambo", count) if message is a mambo request, else None."""
-    m = _MAMBO_RE.match(text.strip().rstrip("!?."))
-    if m:
-        count = min(int(m.group(1)), 5) if m.group(1) else 1
-        return "mambo", count
+    """Returns ("mambo", count) if message contains mambo, else None."""
+    cleaned = text.strip().rstrip("!?.")
+
+    # "2 mambo" → 2 gifs
+    count_match = _MAMBO_COUNT_RE.match(cleaned)
+    if count_match:
+        return "mambo", min(int(count_match.group(1)), 5)
+
+    # count occurrences of "mambo" in the message
+    count = len(_MAMBO_RE.findall(cleaned))
+    if count:
+        return "mambo", min(count, 5)
+
     return None
 
 # ────────────────────────────────────────────────────────────────────────────────
