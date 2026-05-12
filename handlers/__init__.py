@@ -41,6 +41,35 @@ from utils import (
 
 log = get_logger("corsbot.handlers.messages")
 
+import re as _re
+
+# Patterns that signal an explicit GIF request
+# Captures: "mambo gif", "send mambo gif", "gif of mambo", "mambo gif pls", "mambo gif please"
+_GIF_REQUEST_PATTERNS = [
+    _re.compile(r'^(?:send\s+)?(.+?)\s+gif(?:\s+(?:pls|please|now|bro|na))?$', _re.I),
+    _re.compile(r'^gif\s+(?:of\s+)?(.+?)(?:\s+(?:pls|please|now|bro|na))?$', _re.I),
+    _re.compile(r'^(?:send\s+)?gif\s*:\s*(.+)$', _re.I),
+]
+
+def _extract_gif_request(text: str) -> str | None:
+    """
+    Returns a GIF search query if the message is asking for a specific GIF.
+    Examples:
+      "mambo gif" → "mambo"
+      "send mambo gif pls" → "mambo"
+      "gif of a cat" → "a cat"
+      "gif: dancing" → "dancing"
+    Returns None if not a GIF request.
+    """
+    cleaned = text.strip().rstrip("!?.")
+    for pattern in _GIF_REQUEST_PATTERNS:
+        m = pattern.match(cleaned)
+        if m:
+            query = m.group(1).strip()
+            if query and len(query) >= 2:
+                return query
+    return None
+
 # ────────────────────────────────────────────────────────────────────────────────
 # MESSAGE HANDLER
 # ────────────────────────────────────────────────────────────────────────────────
@@ -159,6 +188,17 @@ class MessageHandler:
             await message.channel.send(f"<@{message.author.id}> {quick}")
             await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", quick)
             return
+
+        # Explicit GIF request — "mambo gif", "send gif of cats", "gif pls: dancing"
+        gif_query = _extract_gif_request(content)
+        if gif_query:
+            from core.gif import search_gif
+            gif_url = await search_gif(gif_query)
+            if gif_url:
+                await message.channel.send(gif_url)
+                await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF: {gif_query}]")
+                return
+            # If no GIF found, fall through to normal reply
         
         # Denial check
         uid_str = str(message.author.id)
