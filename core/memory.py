@@ -1500,6 +1500,16 @@ def get_relationships(user_id, top_k: int = 6) -> str:
     return "\n".join(lines)
 
 
+def get_relationship_names(user_id) -> list[str]:
+    """Return just the names of stored relationships — used for name detection in messages."""
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT related_name FROM relationships WHERE user_id=? ORDER BY strength DESC",
+        (str(user_id),)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
 # ── Relationship Modeling System ───────────────────────────────────────────── #
 
 # Relationship category definitions with keyword signals for classification

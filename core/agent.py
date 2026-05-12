@@ -198,7 +198,9 @@ class AgentLoop:
             ctx.memory = ""
             ctx.active_keys = []
 
-        # Relationships — only when query is about a person
+        # Relationships — fire when message contains a trigger phrase OR a known person's name
+        from .memory import get_relationship_names
+
         _RELATIONSHIP_TRIGGERS = (
             "who is", "tell me about", "what about", "how is", "where is",
             "what's with", "who's", "whos", "do you know", "what do you know about",
@@ -214,7 +216,6 @@ class AgentLoop:
             "kinsa", "kinsa si", "kinsa ang",
         )
         _TITLE_TRIGGERS = (
-            # Only fire cross-user search for role/title queries, NOT person names
             "who is the", "who is king", "who is lord", "who is boss",
             "who is queen", "who is god", "who is goat", "who is legend",
             "who da king", "who da boss", "who da goat", "who da god",
@@ -225,7 +226,15 @@ class AgentLoop:
             "kinsa ang",
         )
         lower = ctx.content.lower()
-        if any(t in lower for t in _RELATIONSHIP_TRIGGERS):
+        has_trigger = any(t in lower for t in _RELATIONSHIP_TRIGGERS)
+
+        # Name detection — check if any stored relationship name appears in the message
+        name_mentioned = False
+        if not has_trigger:
+            known_names = await self._run_sync(get_relationship_names, ctx.user_id)
+            name_mentioned = any(name.lower() in lower for name in known_names if len(name) >= 3)
+
+        if has_trigger or name_mentioned:
             rels = await self._step(
                 trace, "relationships",
                 self._run_sync(get_relationships, ctx.user_id)
