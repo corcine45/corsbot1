@@ -42,14 +42,31 @@ def _pool_set(query: str, urls: list[str]):
     _gif_pool_cache[query] = (deque(urls[:_POOL_SIZE]), time.time())
 
 
+def _normalize_gif_query(query: str) -> str:
+    if query.strip().lower() == "mambo":
+        return "mambo dance"
+    return query
+
+
+def _gif_matches_query(query: str, text: str) -> bool:
+    normalized = query.lower()
+    candidate = text.lower()
+
+    if "mambo" in normalized:
+        return "mambo" in candidate
+
+    return normalized in candidate
+
+
 async def search_gif_tenor(query: str) -> list[str]:
     """Fetch up to _POOL_SIZE GIF URLs from Tenor."""
     urls = []
+    normalized_query = _normalize_gif_query(query)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 "https://tenor.googleapis.com/v2/search",
-                params={"q": query, "key": TENOR_API_KEY, "limit": 20, "contentfilter": "medium"},
+                params={"q": normalized_query, "key": TENOR_API_KEY, "limit": 20, "contentfilter": "medium"},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 data = await resp.json()
@@ -57,7 +74,14 @@ async def search_gif_tenor(query: str) -> list[str]:
         random.shuffle(results)
         for item in results:
             url = item.get("media_formats", {}).get("gif", {}).get("url")
-            if url and url.startswith("https"):
+            metadata = " ".join(
+                filter(None, [
+                    item.get("content_description"),
+                    item.get("title"),
+                    item.get("tags", "") if isinstance(item.get("tags"), str) else "",
+                ])
+            )
+            if url and url.startswith("https") and _gif_matches_query(query, metadata):
                 urls.append(url)
             if len(urls) >= _POOL_SIZE:
                 break
@@ -79,11 +103,12 @@ async def search_gif(query: str) -> str | None:
 
     # Fetch fresh results
     urls = []
+    search_query = _normalize_gif_query(query)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 "https://api.giphy.com/v1/gifs/search",
-                params={"api_key": settings.giphy_api_key, "q": query, "limit": 25, "rating": "pg-13"},
+                params={"api_key": settings.giphy_api_key, "q": search_query, "limit": 25, "rating": "pg-13"},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 data = await resp.json()
@@ -91,7 +116,16 @@ async def search_gif(query: str) -> str | None:
         random.shuffle(gifs)
         for gif in gifs:
             url = gif["images"]["downsized"]["url"]
-            if url and url.startswith("https"):
+            metadata = " ".join(
+                filter(None, [
+                    gif.get("title"),
+                    gif.get("slug"),
+                    gif.get("url"),
+                    gif.get("bitly_gif_url"),
+                    gif.get("embed_url"),
+                ])
+            )
+            if url and url.startswith("https") and _gif_matches_query(query, metadata):
                 urls.append(url)
             if len(urls) >= _POOL_SIZE:
                 break
