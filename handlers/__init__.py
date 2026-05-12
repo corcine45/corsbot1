@@ -45,8 +45,8 @@ import re as _re
 
 # "mambo" anywhere in the message triggers a GIF
 # "2 mambo" or "mambo mambo" sends 2, etc. (capped at 5)
-_MAMBO_RE = _re.compile(r'\bmambo\b', _re.I)
-_MAMBO_COUNT_RE = _re.compile(r'^(\d+)\s+mambo$', _re.I)
+_MAMBO_RE = _re.compile(r'\bmamboo*\b', _re.I)
+_MAMBO_COUNT_RE = _re.compile(r'^(\d+)\s+mamboo*$', _re.I)
 
 def _extract_gif_request(text: str) -> tuple[str, int] | None:
     """Returns ("mambo", count) if message contains mambo, else None."""
