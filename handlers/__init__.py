@@ -412,8 +412,15 @@ class MessageHandler:
 
         if user_member.activity:
             activity = user_member.activity
+            log.debug(f"Activity type: {type(activity).__name__}, name: {getattr(activity, 'name', '?')}")
             if isinstance(activity, discord.Spotify):
-                user_activity = f"Spotify: {activity.title} by {activity.artist}"
+                title = getattr(activity, 'title', None)
+                artist = getattr(activity, 'artist', None)
+                log.debug(f"Spotify detected - title: {title}, artist: {artist}")
+                if title and artist:
+                    user_activity = f"Spotify: {title} by {artist}"
+                else:
+                    user_activity = "Spotify"
             elif hasattr(activity, 'details') and activity.details:
                 if hasattr(activity, 'state') and activity.state:
                     user_activity = f"{activity.name}: {activity.state} - {activity.details}"
