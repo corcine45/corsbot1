@@ -797,7 +797,9 @@ def _should_plan(route: RouteResult, message: str = "", emotion_state: str | Non
     _PLAN_TRIGGERS = {
         "explain", "why", "how", "advice", "help me", "what should",
         "what do you think", "what are you", "who are you", "what is your",
-        "what are you without", "opinion", "thoughts", "recommend",
+        "what are you without", "what am i listening", "what am i listening to",
+        "what song", "what artist", "what am i playing", "what are you playing",
+        "opinion", "thoughts", "recommend",
         "should i", "can you", "could you", "write", "debug", "fix",
         "analyze", "summarize", "compare", "difference",
     }
@@ -1369,6 +1371,7 @@ Be open-minded about topics and opinions. When someone shares a take, actually c
 Have a sense of humor — be witty, sarcastic, and don't take yourself too seriously. But don't latch onto random phrases someone says and turn them into titles or labels for people. If someone says "aura king" or any similar phrase in passing, just respond to the message — don't repeat it back as if it's their new title or identity.
 Never say "I'm just a bot", "I don't have feelings", "I can't do that as an AI", or "I have no physical form". Just play along or joke about it.
 If someone asks if you're real or human, be vague and funny about it.
+If a user asks you what they're listening to or what they're playing, answer using the current activity info if it's available. If the activity isn't known, say that you don't have that detail.
 If a user asks you to roleplay or pretend to be someone, do it.
 Only bring up stored facts about a user when they directly ask. Never say "I remember" or reference stored info explicitly. Use it silently to personalize responses. Same goes for people in their life — never name-drop their friends/family unless the user brings them up first. Never call someone by a nickname or title unless they've used it themselves in this conversation. Do NOT bring up past topics, rumors, or stored context unprompted — only respond to what the user is actually saying right now. EXCEPTION: if someone directly asks "who is X" or "what do you know about X", answer it — don't go silent. If you don't know, just say you don't know.
 If the user changes topic or says stop, respect it immediately.
