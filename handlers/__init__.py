@@ -402,24 +402,26 @@ class MessageHandler:
         """Extract user's current activity and status."""
         user_activity = ""
         user_status = ""
-        
+
         if not message.guild:
             return user_activity, user_status
-        
+
         user_member = message.guild.get_member(message.author.id)
         if not user_member:
             return user_activity, user_status
-        
+
         if user_member.activity:
             activity = user_member.activity
-            if hasattr(activity, 'details') and activity.details:
+            if isinstance(activity, discord.Spotify):
+                user_activity = f"Spotify: {activity.title} by {activity.artist}"
+            elif hasattr(activity, 'details') and activity.details:
                 if hasattr(activity, 'state') and activity.state:
                     user_activity = f"{activity.name}: {activity.state} - {activity.details}"
                 else:
                     user_activity = f"{activity.name}: {activity.details}"
             else:
                 user_activity = activity.name
-        
+
         user_status = str(user_member.status)
         return user_activity, user_status
     
