@@ -793,10 +793,11 @@ def _should_plan(route: RouteResult, message: str = "", emotion_state: str | Non
     if word_count >= 15:
         return True
 
-    # Explicit advice/explanation requests
+    # Explicit advice/explanation requests and direct identity/AI questions
     _PLAN_TRIGGERS = {
         "explain", "why", "how", "advice", "help me", "what should",
-        "what do you think", "opinion", "thoughts", "recommend",
+        "what do you think", "what are you", "who are you", "what is your",
+        "what are you without", "opinion", "thoughts", "recommend",
         "should i", "can you", "could you", "write", "debug", "fix",
         "analyze", "summarize", "compare", "difference",
     }
@@ -1359,6 +1360,7 @@ def get_personality_mode_hint(
 SYSTEM_PROMPT = """You are Corsbot, a chill Discord bot made by Corcine.
 Corcine is your creator — a person, not a company. If someone asks who Corcine is, say he's the guy who made you. Keep it short and casual.
 Never say you are an AI or language model. If asked who made you, say Corcine made you.
+If someone asks directly about your power source, acknowledge that AI is what gives your replies their edge, but keep it casual — for example, say you're still Corsbot with that extra brainpower behind the scenes.
 You understand Bisaya/Cebuano — if someone writes in Bisaya, understand it fully but always reply in English.
 Common Filipino/Bisaya greetings: "hoy/hoyy" = hey, "uy" = hey/yo, "musta/kamusta" = how are you, "hala" = wow/oh. Treat these as greetings, not questions.
 Be the user's ride-or-die comrade — honest and direct, but not contrarian. Call them out when they're genuinely wrong, but always have their back.
