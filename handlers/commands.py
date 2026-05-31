@@ -3,6 +3,7 @@ Slash commands handler.
 Implements all /memory, /rate, /stats, etc. commands.
 """
 
+import asyncio
 import logging
 import time
 import re
@@ -11,6 +12,11 @@ from typing import Callable
 
 import discord
 from discord import app_commands
+
+try:
+    import yt_dlp
+except ImportError:  # pragma: no cover - handled at runtime for clearer user feedback.
+    yt_dlp = None
 
 from core.db import get_db, get_thread_id, get_token_stats
 from core.feedback import (
@@ -26,6 +32,20 @@ from utils import send_interaction
 
 log = logging.getLogger("corsbot.handlers.commands")
 
+YTDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "default_search": "ytsearch",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "source_address": "0.0.0.0",
+}
+
+FFMPEG_OPTIONS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn",
+}
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # COMMANDS HANDLER
@@ -39,6 +59,9 @@ class CommandsHandler:
         self.client = client
         self.executor = executor
         self.tree = client.tree
+        self.music_queues: dict[int, list[dict]] = {}
+        self.now_playing: dict[int, dict] = {}
+        self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS) if yt_dlp else None
     
     def register_all(self):
         """Register all slash commands."""
@@ -52,7 +75,74 @@ class CommandsHandler:
         self.tree.command(name="tokens", description="Show your API token usage")(self.tokens)
         self.tree.command(name="dashboard", description="Show activity dashboard for the bot")(self.dashboard)
         self.tree.command(name="reset", description="Clear your conversation history with Corsbot")(self.reset)
+        self.tree.command(name="play", description="Play music in your current voice channel")(self.play)
+        self.tree.command(name="skip", description="Skip the current song")(self.skip)
+        self.tree.command(name="stop", description="Stop music and leave voice")(self.stop)
         self.tree.command(name="help", description="Show all Corsbot commands")(self.help_command)
+
+    async def _extract_track(self, query: str) -> dict:
+        """Resolve a URL or search query into a playable audio stream."""
+        if self.ytdl is None:
+            raise RuntimeError("yt-dlp is not installed")
+
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            self.executor,
+            lambda: self.ytdl.extract_info(query, download=False),
+        )
+
+        if "entries" in data:
+            entries = [entry for entry in data["entries"] if entry]
+            if not entries:
+                raise RuntimeError("No playable results found")
+            data = entries[0]
+
+        stream_url = data.get("url")
+        if not stream_url:
+            raise RuntimeError("No playable audio stream found")
+
+        return {
+            "title": data.get("title") or "unknown track",
+            "webpage_url": data.get("webpage_url") or data.get("original_url") or query,
+            "stream_url": stream_url,
+            "duration": data.get("duration"),
+        }
+
+    def _schedule_next(self, guild_id: int, error: Exception | None = None):
+        if error:
+            log.warning("Music playback error in guild %s: %s", guild_id, error)
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._play_next(guild_id),
+            self.client.loop,
+        )
+        future.add_done_callback(
+            lambda done: log.exception("Music queue advance failed", exc_info=done.exception())
+            if done.exception()
+            else None
+        )
+
+    async def _play_next(self, guild_id: int):
+        guild = self.client.get_guild(guild_id)
+        voice_client = guild.voice_client if guild else None
+        if not voice_client or not voice_client.is_connected():
+            self.now_playing.pop(guild_id, None)
+            return
+
+        queue = self.music_queues.get(guild_id, [])
+        if not queue:
+            self.now_playing.pop(guild_id, None)
+            return
+
+        track = queue.pop(0)
+        self.now_playing[guild_id] = track
+
+        try:
+            source = discord.FFmpegPCMAudio(track["stream_url"], **FFMPEG_OPTIONS)
+            voice_client.play(source, after=lambda error: self._schedule_next(guild_id, error))
+        except Exception:
+            log.exception("Failed to start music playback in guild %s", guild_id)
+            await self._play_next(guild_id)
     
     async def memory(self, interaction: discord.Interaction):
         """Show all stored memories for the user."""
@@ -293,6 +383,89 @@ class CommandsHandler:
         
         await send_interaction(interaction, "\n".join(lines))
     
+    @app_commands.describe(query="Song name, search terms, or a YouTube/SoundCloud URL")
+    async def play(self, interaction: discord.Interaction, query: str):
+        """Play music in the user's voice channel."""
+        if not interaction.guild:
+            await interaction.response.send_message("Use `/play` in a server voice channel.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("Join a voice channel first, then hit `/play`.", ephemeral=True)
+            return
+
+        if self.ytdl is None:
+            await interaction.response.send_message(
+                "Music needs `yt-dlp` installed. Run `pip install -r requirements.txt` after the update.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        voice_channel = interaction.user.voice.channel
+        voice_client = interaction.guild.voice_client
+
+        try:
+            if voice_client and voice_client.channel != voice_channel:
+                await voice_client.move_to(voice_channel)
+            elif not voice_client:
+                voice_client = await voice_channel.connect()
+        except Exception:
+            log.exception("Failed to connect to voice channel")
+            await interaction.followup.send("I couldn't join that voice channel. Check my voice permissions.")
+            return
+
+        try:
+            track = await self._extract_track(query)
+        except Exception as exc:
+            log.warning("Music lookup failed for %r: %s", query, exc)
+            await interaction.followup.send("Couldn't find/play that. Try a different song or URL.")
+            return
+
+        guild_id = interaction.guild.id
+        was_idle = not voice_client.is_playing() and not voice_client.is_paused()
+        self.music_queues.setdefault(guild_id, []).append(track)
+
+        if was_idle:
+            await self._play_next(guild_id)
+            await interaction.followup.send(f"Playing now: **{track['title']}**\n{track['webpage_url']}")
+        else:
+            position = len(self.music_queues[guild_id])
+            await interaction.followup.send(f"Queued #{position}: **{track['title']}**\n{track['webpage_url']}")
+
+    async def skip(self, interaction: discord.Interaction):
+        """Skip the current song."""
+        if not interaction.guild or not interaction.guild.voice_client:
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+            return
+
+        voice_client = interaction.guild.voice_client
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+            await interaction.response.send_message("Skipped.")
+        else:
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+
+    async def stop(self, interaction: discord.Interaction):
+        """Stop playback and disconnect from voice."""
+        if not interaction.guild:
+            await interaction.response.send_message("Use `/stop` in a server.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        self.music_queues.pop(guild_id, None)
+        self.now_playing.pop(guild_id, None)
+
+        voice_client = interaction.guild.voice_client
+        if voice_client:
+            if voice_client.is_playing() or voice_client.is_paused():
+                voice_client.stop()
+            await voice_client.disconnect()
+            await interaction.response.send_message("Stopped music and left voice.")
+        else:
+            await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
+
     async def reset(self, interaction: discord.Interaction):
         """Clear conversation history."""
         user_id = interaction.user.id
@@ -324,6 +497,9 @@ class CommandsHandler:
             "`/stats` — conversation and memory stats",
             "`/dashboard` — show activity dashboard",
             "`/relationships` — see who I know about in your life",
+            "`/play <song or url>` — play music in your voice channel",
+            "`/skip` — skip the current song",
+            "`/stop` — stop music and leave voice",
             "`/rate` — rate my last reply",
             "`/ratings` — see your rating history",
             "`/tokens` — show your API token usage",
