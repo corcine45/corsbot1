@@ -4,7 +4,9 @@ Implements all /memory, /rate, /stats, etc. commands.
 """
 
 import asyncio
+import json
 import logging
+import random
 import time
 import re
 from collections import Counter
@@ -46,6 +48,87 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
+MUSIC_RECENT_KEY = "music_recent_tracks"
+MUSIC_LIKES_KEY = "music_liked_tracks"
+MUSIC_MAX_STORED = 12
+MUSIC_VIBES = {
+    "sad": "sad emotional songs",
+    "depressed": "sad emotional songs",
+    "cry": "sad emotional songs",
+    "chill": "chill lo-fi music",
+    "relax": "chill relaxing music",
+    "calm": "chill relaxing music",
+    "hype": "hype rap songs",
+    "pump": "hype workout music",
+    "energetic": "hype energetic music",
+    "romantic": "romantic love songs",
+    "love": "romantic love songs",
+    "gaming": "gaming music playlist",
+    "valorant": "valorant gaming music",
+    "minecraft": "minecraft calm music",
+    "sleep": "sleep music",
+    "focus": "focus study music",
+    "study": "focus study music",
+}
+MUSIC_LIBRARY_HINTS = (
+    "my music",
+    "what i like",
+    "what i usually",
+    "usual music",
+    "something i like",
+    "surprise me",
+    "liked song",
+    "liked music",
+    "favorite song",
+    "favourite song",
+)
+
+
+async def music_query_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    """Suggest music prompts, liked songs, and recent plays for /play."""
+    suggestions = [
+        "something i like",
+        "surprise me",
+        "my usual music",
+        "something sad",
+        "something chill",
+        "hype music",
+        "gaming music",
+        "focus music",
+    ]
+
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT value FROM memory WHERE user_id=? AND key IN (?, ?)",
+        (str(interaction.user.id), MUSIC_LIKES_KEY, MUSIC_RECENT_KEY),
+    )
+    for (raw,) in cursor.fetchall():
+        try:
+            tracks = json.loads(raw)
+        except json.JSONDecodeError:
+            tracks = []
+        if isinstance(tracks, list):
+            suggestions.extend(
+                str(track.get("search_query") or track.get("title") or "")
+                for track in tracks
+                if isinstance(track, dict)
+            )
+
+    needle = current.lower().strip()
+    choices = []
+    seen = set()
+    for suggestion in suggestions:
+        suggestion = suggestion.strip()
+        if not suggestion or suggestion.lower() in seen:
+            continue
+        if needle and needle not in suggestion.lower():
+            continue
+        seen.add(suggestion.lower())
+        choices.append(app_commands.Choice(name=suggestion[:100], value=suggestion[:100]))
+        if len(choices) >= 25:
+            break
+    return choices
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # COMMANDS HANDLER
@@ -78,7 +161,137 @@ class CommandsHandler:
         self.tree.command(name="play", description="Play music in your current voice channel")(self.play)
         self.tree.command(name="skip", description="Skip the current song")(self.skip)
         self.tree.command(name="stop", description="Stop music and leave voice")(self.stop)
+        self.tree.command(name="musiclike", description="Save the current song to your music likes")(self.musiclike)
+        self.tree.command(name="musicremember", description="Tell Corsbot a favorite song, artist, or genre")(self.musicremember)
+        self.tree.command(name="recommend", description="Pick music from your likes, history, or a vibe")(self.recommend)
         self.tree.command(name="help", description="Show all Corsbot commands")(self.help_command)
+
+    def _get_memory_value(self, user_id: int | str, key: str, default: str = "") -> str:
+        _, cursor = get_db()
+        cursor.execute("SELECT value FROM memory WHERE user_id=? AND key=?", (str(user_id), key))
+        row = cursor.fetchone()
+        return row[0] if row else default
+
+    def _set_memory_value(self, user_id: int | str, key: str, value: str, memory_type: str = "preference"):
+        conn, cursor = get_db()
+        now = time.time()
+        cursor.execute(
+            """INSERT INTO memory (user_id, key, value, updated_at, memory_type, reinforcement, last_accessed)
+               VALUES (?, ?, ?, ?, ?, 1, ?)
+               ON CONFLICT(user_id, key) DO UPDATE SET
+                   value=excluded.value,
+                   updated_at=excluded.updated_at,
+                   memory_type=excluded.memory_type,
+                   reinforcement=memory.reinforcement+1,
+                   last_accessed=excluded.last_accessed""",
+            (str(user_id), key, value, now, memory_type, now),
+        )
+        conn.commit()
+
+    def _load_music_list(self, user_id: int | str, key: str) -> list[dict]:
+        raw = self._get_memory_value(user_id, key, "[]")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return value if isinstance(value, list) else []
+
+    def _save_music_list(self, user_id: int | str, key: str, tracks: list[dict]):
+        clean_tracks = []
+        seen = set()
+        for track in tracks:
+            title = str(track.get("title") or "").strip()
+            url = str(track.get("webpage_url") or "").strip()
+            if not title:
+                continue
+            dedupe_key = (title.lower(), url)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            clean_tracks.append({
+                "title": title[:160],
+                "webpage_url": url[:300],
+                "search_query": str(track.get("search_query") or title)[:200],
+                "saved_at": float(track.get("saved_at") or time.time()),
+            })
+        self._set_memory_value(user_id, key, json.dumps(clean_tracks[:MUSIC_MAX_STORED]))
+
+    def _remember_recent_track(self, user_id: int | str, track: dict):
+        recent = self._load_music_list(user_id, MUSIC_RECENT_KEY)
+        stored = dict(track)
+        stored["saved_at"] = time.time()
+        self._save_music_list(user_id, MUSIC_RECENT_KEY, [stored, *recent])
+
+    def _like_track(self, user_id: int | str, track: dict):
+        likes = self._load_music_list(user_id, MUSIC_LIKES_KEY)
+        stored = dict(track)
+        stored["saved_at"] = time.time()
+        self._save_music_list(user_id, MUSIC_LIKES_KEY, [stored, *likes])
+
+    def _music_memories(self, user_id: int | str) -> list[str]:
+        _, cursor = get_db()
+        cursor.execute(
+            """SELECT key, value FROM memory
+               WHERE user_id=?
+                 AND (
+                    LOWER(key) LIKE '%music%'
+                    OR LOWER(key) LIKE '%song%'
+                    OR LOWER(key) LIKE '%artist%'
+                    OR LOWER(key) LIKE '%genre%'
+                    OR LOWER(key) LIKE '%band%'
+                    OR LOWER(key) LIKE '%spotify%'
+                 )
+               ORDER BY reinforcement DESC, updated_at DESC
+               LIMIT 8""",
+            (str(user_id),),
+        )
+        return [f"{key}: {value}" for key, value in cursor.fetchall() if value]
+
+    def _query_from_music_library(self, user_id: int | str, query: str = "") -> tuple[str | None, str]:
+        likes = self._load_music_list(user_id, MUSIC_LIKES_KEY)
+        recent = self._load_music_list(user_id, MUSIC_RECENT_KEY)
+        music_memories = self._music_memories(user_id)
+        normalized = query.lower().strip()
+
+        if likes and any(word in normalized for word in ("liked", "like", "favorite", "favourite", "usual", "surprise")):
+            track = random.choice(likes[:6])
+            return track.get("search_query") or track.get("title"), "picked from your liked music"
+
+        if recent and any(word in normalized for word in ("recent", "again", "usual", "surprise")):
+            track = random.choice(recent[:8])
+            return track.get("search_query") or track.get("title"), "picked from your recent music"
+
+        if music_memories:
+            memory = random.choice(music_memories[:5])
+            return f"{memory} song", "picked from music memories"
+
+        if likes:
+            track = random.choice(likes[:6])
+            return track.get("search_query") or track.get("title"), "picked from your liked music"
+
+        if recent:
+            track = random.choice(recent[:8])
+            return track.get("search_query") or track.get("title"), "picked from your recent music"
+
+        return None, ""
+
+    def _resolve_music_query(self, user_id: int | str, query: str) -> tuple[str, str]:
+        normalized = query.lower().strip()
+
+        for hint in MUSIC_LIBRARY_HINTS:
+            if hint in normalized:
+                library_query, reason = self._query_from_music_library(user_id, query)
+                if library_query:
+                    return library_query, reason
+
+        for vibe, search in MUSIC_VIBES.items():
+            if re.search(rf"\b{re.escape(vibe)}\b", normalized):
+                library_query, reason = self._query_from_music_library(user_id, query)
+                if library_query and any(word in normalized for word in ("my", "me", "i like", "usual")):
+                    return f"{library_query} {vibe}", f"{reason}, filtered for {vibe}"
+                return search, f"read '{vibe}' as a vibe"
+
+        return query, ""
 
     async def _extract_track(self, query: str) -> dict:
         """Resolve a URL or search query into a playable audio stream."""
@@ -383,7 +596,8 @@ class CommandsHandler:
         
         await send_interaction(interaction, "\n".join(lines))
     
-    @app_commands.describe(query="Song name, search terms, or a YouTube/SoundCloud URL")
+    @app_commands.describe(query="Song name, search terms, a vibe, or a YouTube/SoundCloud URL")
+    @app_commands.autocomplete(query=music_query_autocomplete)
     async def play(self, interaction: discord.Interaction, query: str):
         """Play music in the user's voice channel."""
         if not interaction.guild:
@@ -416,23 +630,80 @@ class CommandsHandler:
             await interaction.followup.send("I couldn't join that voice channel. Check my voice permissions.")
             return
 
+        resolved_query, reason = self._resolve_music_query(interaction.user.id, query)
+
         try:
-            track = await self._extract_track(query)
+            track = await self._extract_track(resolved_query)
         except Exception as exc:
-            log.warning("Music lookup failed for %r: %s", query, exc)
+            log.warning("Music lookup failed for %r: %s", resolved_query, exc)
             await interaction.followup.send("Couldn't find/play that. Try a different song or URL.")
             return
 
         guild_id = interaction.guild.id
         was_idle = not voice_client.is_playing() and not voice_client.is_paused()
+        track["search_query"] = resolved_query
+        track["requested_by"] = interaction.user.id
         self.music_queues.setdefault(guild_id, []).append(track)
+        self._remember_recent_track(interaction.user.id, track)
 
+        note = f"\n_{reason}_" if reason else ""
         if was_idle:
             await self._play_next(guild_id)
-            await interaction.followup.send(f"Playing now: **{track['title']}**\n{track['webpage_url']}")
+            await interaction.followup.send(f"Playing now: **{track['title']}**\n{track['webpage_url']}{note}")
         else:
             position = len(self.music_queues[guild_id])
-            await interaction.followup.send(f"Queued #{position}: **{track['title']}**\n{track['webpage_url']}")
+            await interaction.followup.send(f"Queued #{position}: **{track['title']}**\n{track['webpage_url']}{note}")
+
+    async def musiclike(self, interaction: discord.Interaction):
+        """Save the current song to the user's liked music."""
+        if not interaction.guild:
+            await interaction.response.send_message("Use `/musiclike` in a server while music is playing.", ephemeral=True)
+            return
+
+        track = self.now_playing.get(interaction.guild.id)
+        if not track:
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+            return
+
+        self._like_track(interaction.user.id, track)
+        await interaction.response.send_message(f"Saved to your music likes: **{track['title']}**", ephemeral=True)
+
+    @app_commands.describe(kind="What kind of music preference this is", value="Song, artist, genre, or playlist vibe")
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="Favorite song", value="favorite_song"),
+            app_commands.Choice(name="Favorite artist", value="favorite_artist"),
+            app_commands.Choice(name="Favorite genre", value="favorite_genre"),
+            app_commands.Choice(name="Playlist vibe", value="music_vibe"),
+        ]
+    )
+    async def musicremember(self, interaction: discord.Interaction, kind: str, value: str):
+        """Store a direct music preference."""
+        cleaned = value.strip()
+        if not cleaned:
+            await interaction.response.send_message("Give me a song, artist, genre, or vibe to remember.", ephemeral=True)
+            return
+
+        self._set_memory_value(interaction.user.id, kind, cleaned[:200])
+        await interaction.response.send_message(f"Remembered `{kind}` = **{cleaned[:200]}**", ephemeral=True)
+
+    @app_commands.describe(vibe="Optional vibe like sad, chill, hype, gaming, focus, or leave blank for your taste")
+    async def recommend(self, interaction: discord.Interaction, vibe: str = ""):
+        """Recommend a playable music query from user taste or a requested vibe."""
+        query = vibe.strip() or "something i like"
+        resolved_query, reason = self._resolve_music_query(interaction.user.id, query)
+
+        if resolved_query == query and not vibe.strip():
+            resolved_query, reason = self._query_from_music_library(interaction.user.id, query)
+
+        if not resolved_query:
+            resolved_query = "chill popular music"
+            reason = "no music taste saved yet, so I picked a safe starter"
+
+        await interaction.response.send_message(
+            f"Try: `/play {resolved_query}`\n_{reason or 'picked from the vibe'}_",
+            ephemeral=True,
+        )
 
     async def skip(self, interaction: discord.Interaction):
         """Skip the current song."""
