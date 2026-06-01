@@ -59,10 +59,36 @@ def _load_settings() -> Settings:
         raise SystemExit(1)
 
     log.info("All environment variables loaded.")
+    # Read values
+    discord_token = os.environ["DISCORD_TOKEN"]
+    groq_api_key = os.environ["GROQ_API_KEY"]
+    giphy_api_key = os.environ["GIPHY_API_KEY"]
+
+    # Fail fast on obvious placeholder keys to avoid confusing 401s at runtime
+    _PLACEHOLDER_INDICATORS = ("your_", "key_here", "changeme", "replace_me", "<", "{{")
+    def _looks_like_placeholder(val: str) -> bool:
+        if not val:
+            return True
+        lower = val.strip().lower()
+        return any(ind in lower for ind in _PLACEHOLDER_INDICATORS)
+
+    bad = []
+    if _looks_like_placeholder(groq_api_key):
+        bad.append("GROQ_API_KEY (appears to be a placeholder)")
+    if _looks_like_placeholder(discord_token):
+        bad.append("DISCORD_TOKEN (appears to be a placeholder)")
+    if _looks_like_placeholder(giphy_api_key):
+        bad.append("GIPHY_API_KEY (appears to be a placeholder)")
+    if bad:
+        for b in bad:
+            log.error(f"Invalid env var: {b}")
+        log.error("Update your environment variables (e.g. .env or host env) with real secrets and restart.")
+        raise SystemExit(1)
+
     return Settings(
-        discord_token  = os.environ["DISCORD_TOKEN"],
-        groq_api_key   = os.environ["GROQ_API_KEY"],
-        giphy_api_key  = os.environ["GIPHY_API_KEY"],
+        discord_token  = discord_token,
+        groq_api_key   = groq_api_key,
+        giphy_api_key  = giphy_api_key,
         tavily_api_key = os.getenv("TAVILY_API_KEY", ""),
         ai_model       = os.getenv("AI_MODEL", "llama-3.3-70b-versatile"),
         vision_model   = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
