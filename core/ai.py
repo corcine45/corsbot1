@@ -1417,7 +1417,7 @@ NEVER invent or reference events, games, or conversations that didn't happen in 
 
 # ---------------- CHAT ---------------- #
 
-def _build_system_prompt(username: str | None, memory: str, relationships: str, web_context: str, impersonation_context: str = "", feedback_context: str = "", channel_name: str = "", reflection: str = "", emotion_hint: str = "", personality_hint: str = "", user_activity: str = "", user_status: str = "", user_state_summary: str = "", conversation_summary: str = "") -> str:
+def _build_system_prompt(username: str | None, memory: str, relationships: str, web_context: str, impersonation_context: str = "", feedback_context: str = "", channel_name: str = "", reflection: str = "", emotion_hint: str = "", personality_hint: str = "", user_activity: str = "", user_status: str = "", user_state_summary: str = "", conversation_summary: str = "", server_members: str = "") -> str:
     # Guard: ensure all string args are actually strings (defensive against tuple leaks)
     memory = memory[0] if isinstance(memory, tuple) else (memory or "")
     relationships = relationships[0] if isinstance(relationships, tuple) else (relationships or "")
@@ -1436,6 +1436,9 @@ def _build_system_prompt(username: str | None, memory: str, relationships: str, 
 
     if channel_name:
         parts.append(f"You are in the #{channel_name} channel.")
+
+    if server_members:
+        parts.append(f"People in this server: {server_members}. You know all of them.")
 
     if conversation_summary:
         parts.append(
@@ -1518,7 +1521,7 @@ def _enforce_brevity(text: str, max_sentences: int = 3) -> str:
     return " ".join(sentences[:max_sentences])
 
 
-def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name="", session_context="", reflection="", emotion_hint="", emotion_state=None, user_activity="", user_status="", user_state_summary="", response_plan: str = "", conversation_summary: str = ""):
+def ai_chat(history, memory, username=None, user_id=None, relationships="", web_context="", impersonation_context="", feedback_context="", channel_name="", session_context="", reflection="", emotion_hint="", emotion_state=None, user_activity="", user_status="", user_state_summary="", response_plan: str = "", conversation_summary: str = "", server_members: str = ""):
     history = trim_history(history)
     memory = truncate_text(memory, MAX_MEMORY_CHARS)
     relationships = truncate_text(relationships, MAX_MEMORY_CHARS)
@@ -1536,7 +1539,7 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
         channel_name, session_context, relationships, user_activity, user_status,
     )
 
-    system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name, reflection, emotion_hint, personality_hint, user_activity, user_status, user_state_summary, conversation_summary)
+    system = _build_system_prompt(username, memory, relationships, web_context, impersonation_context, feedback_context, channel_name, reflection, emotion_hint, personality_hint, user_activity, user_status, user_state_summary, conversation_summary, server_members)
     if session_context and not user_state_summary:
         system += "\n\n" + _build_session_block(session_context)
 

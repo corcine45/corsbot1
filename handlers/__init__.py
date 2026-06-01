@@ -275,6 +275,16 @@ class MessageHandler:
         # Get user activity
         user_activity, user_status = await self._get_user_presence(message, loop)
         
+        # Build member list for small servers (skip bots)
+        server_members = ""
+        if message.guild and len(message.guild.members) <= 30:
+            names = [
+                m.display_name for m in message.guild.members
+                if not m.bot
+            ]
+            if names:
+                server_members = ", ".join(names)
+
         # Build agent context
         ctx = AgentContext(
             user_id=message.author.id,
@@ -291,6 +301,7 @@ class MessageHandler:
             feedback_context=feedback_context,
             user_activity=user_activity,
             user_status=user_status,
+            server_members=server_members,
         )
         
         # Check cache

@@ -74,6 +74,7 @@ class AgentContext:
     # Final output
     reply: str = ""
     response_plan: str = ""   # plan produced by step_generate, stored for debugging
+    server_members: str = ""  # compact member list for small servers
     gif_url: str | None = None
     gif_emotion: str | None = None
 
@@ -445,6 +446,7 @@ class AgentLoop:
                 ctx.user_activity, ctx.user_status, ctx.user_state_summary,
                 plan,               # response_plan
                 ctx.conversation_summary,
+                ctx.server_members,
             )
         )
         if not result:
