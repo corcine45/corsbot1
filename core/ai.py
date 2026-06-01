@@ -636,17 +636,23 @@ def _analyze_intent(message: str, emotion_state: str | None, session_context: st
             [
                 {"role": "system", "content": (
                     "Analyze this Discord message from a user talking to a chill Discord bot. "
+                    "Think like a perceptive friend, not a customer support classifier. "
                     "Output ONLY these fields:\n"
                     "intent: <what the user wants — e.g. vent, get advice, ask a question, share news, debate, joke around, just chatting>\n"
+                    "subtext: <what they may actually mean or want emotionally — or 'none'>\n"
                     "emotional_weight: <low | medium | high> — most casual Discord messages are LOW\n"
                     "needs_acknowledgment: <yes | no> — only yes if they shared something genuinely personal or upsetting\n"
                     "response_type: <banter | information | advice | empathy | opinion | roleplay> — default to banter for casual messages\n"
+                    "stance: <agree | mostly agree | gently push back | ask curious follow-up | answer directly>\n"
+                    "context_need: <what prior context matters — or 'none'>\n"
+                    "human_move: <the natural conversational move: validate, joke, clarify, answer, reassure, challenge lightly>\n"
                     "One short phrase per field. No explanation. "
-                    "IMPORTANT: Do not over-classify casual chat as emotional. Most Discord messages are just people talking."
+                    "IMPORTANT: Do not over-classify casual chat as emotional. Most Discord messages are just people talking. "
+                    "Do not force disagreement if the user's point is reasonable."
                 )},
                 {"role": "user", "content": f"Message: {message}{emotion_block}{context_block}"},
             ],
-            max_tokens=80,
+            max_tokens=140,
             retries=1,
             timeout=8,
         )
@@ -673,18 +679,21 @@ def _make_plan(analysis: str, emotion_hint: str, reflection: str) -> str:
             [
                 {"role": "system", "content": (
                     "Write a brief response plan for a chill Discord bot reply. "
-                    "The bot is a friend, not a therapist. Default to casual and direct. "
+                    "The bot is a thoughtful friend: casual, present, specific, and not performative. "
                     "Output ONLY:\n"
                     "tone: <e.g. casual and direct | playful | blunt | empathetic | dry humor>\n"
-                    "open_with: <e.g. answer directly | match their energy | quick reaction | ask a follow-up>\n"
+                    "open_with: <e.g. answer directly | match their energy | quick reaction | validate first | ask a follow-up>\n"
+                    "human_read: <what the user is really doing emotionally/socially — 1 short phrase>\n"
+                    "stance: <agree | mostly agree | gently push back | clarify | answer directly>\n"
                     "include: <what to cover — 1 short phrase>\n"
-                    "avoid: <what NOT to do — e.g. don't over-explain | don't be preachy | don't be stiff>\n"
+                    "avoid: <what NOT to do — e.g. don't over-explain | don't be preachy | don't be stiff | don't ignore context>\n"
                     "length: <1 sentence | 1-2 sentences | 2-3 sentences>\n"
-                    "One short phrase per field. No explanation. Keep it Discord-appropriate."
+                    "One short phrase per field. No explanation. Keep it Discord-appropriate. "
+                    "Prefer one concrete observation over generic warmth."
                 )},
                 {"role": "user", "content": context},
             ],
-            max_tokens=100,
+            max_tokens=140,
             retries=1,
             timeout=8,
         )
@@ -713,6 +722,9 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
                     "2. Is the tone right (per the plan)?\n"
                     "3. Is it too long (more than 3 sentences for casual chat)?\n"
                     "4. Does it start with 'I' (bad — sounds robotic)?\n"
+                    "5. Does it sound generic, preachy, corporate, or like an essay?\n"
+                    "6. If the user shared an opinion, did it acknowledge the reasonable part before agreeing or pushing back?\n"
+                    "7. Did it ignore important recent context or invent context that was not given?\n"
                     "Reply with ONLY one of:\n"
                     "  PASS\n"
                     "  FAIL: <one-line reason>\n"
@@ -724,7 +736,7 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
                     f"Draft reply:\n{reply}"
                 )},
             ],
-            max_tokens=40,
+            max_tokens=60,
             retries=1,
             timeout=6,
         )
@@ -746,7 +758,8 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
             [
                 {"role": "system", "content": (
                     "Rewrite this Discord bot reply to fix the issue described. "
-                    "Keep it short (1-2 sentences max), casual, and on-point. "
+                    "Keep it short (1-2 sentences max), casual, specific, and on-point. "
+                    "Sound like a thoughtful friend in Discord, not a helper article. "
                     "Do NOT start with 'I'. Do NOT add filler. Just fix the specific problem."
                 )},
                 {"role": "user", "content": (
@@ -802,6 +815,9 @@ def _should_plan(route: RouteResult, message: str = "", emotion_state: str | Non
         "opinion", "thoughts", "recommend",
         "should i", "can you", "could you", "write", "debug", "fix",
         "analyze", "summarize", "compare", "difference",
+        "do you agree", "am i wrong", "is it bad", "is this bad",
+        "overrated", "underrated", "hot take", "my take", "be honest",
+        "which is better", "which is worse", "would you rather",
     }
     if any(t in lower for t in _PLAN_TRIGGERS):
         return True

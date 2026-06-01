@@ -434,9 +434,9 @@ class AgentLoop:
         if not result:
             return None
 
-        # ── Step 9: Safety check + rewrite ───────────────────────────────
-        # Only run for empathy route — too expensive for casual chat.
-        if do_plan and analysis and route.route == "empathy":
+        # ── Step 9: Human check + rewrite ────────────────────────────────
+        # Planned replies get one cheap check for tone, context, and genericness.
+        if do_plan and analysis:
             t0 = time.perf_counter()
             try:
                 verified = await self._run_sync(
