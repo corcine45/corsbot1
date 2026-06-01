@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import random
+import shutil
 import time
 import re
 from collections import Counter
@@ -14,6 +15,8 @@ from typing import Callable
 
 import discord
 from discord import app_commands
+
+from config import settings
 
 try:
     import yt_dlp
@@ -319,6 +322,31 @@ class CommandsHandler:
         self.idle_disconnect_tasks[guild_id] = self.client.loop.create_task(
             self._idle_disconnect(guild_id, delay_seconds)
         )
+
+    def _voice_permission_error(self, guild: discord.Guild, channel: discord.abc.GuildChannel) -> str | None:
+        bot_member = guild.me or guild.get_member(self.client.user.id)
+        if bot_member is None:
+            return None
+
+        perms = channel.permissions_for(bot_member)
+        missing = []
+        if not perms.connect:
+            missing.append("Connect")
+        if not perms.speak:
+            missing.append("Speak")
+
+        if missing:
+            return f"I need **{', '.join(missing)}** permission in **{channel.name}**."
+        return None
+
+    def _voice_connect_error_message(self, error: Exception) -> str:
+        if isinstance(error, discord.ClientException):
+            return f"Discord voice setup failed: `{error}`"
+        if isinstance(error, discord.Forbidden):
+            return "Discord blocked the join. I need **Connect** and **Speak** in that voice channel."
+        if isinstance(error, asyncio.TimeoutError):
+            return "Joining voice timed out. Try again, or move me to another voice channel first."
+        return f"I couldn't join that voice channel: `{type(error).__name__}`."
 
     async def _idle_disconnect(self, guild_id: int, delay_seconds: int):
         try:
@@ -671,15 +699,19 @@ class CommandsHandler:
 
         voice_channel = interaction.user.voice.channel
         voice_client = interaction.guild.voice_client
+        permission_error = self._voice_permission_error(interaction.guild, voice_channel)
+        if permission_error:
+            await interaction.followup.send(permission_error)
+            return
 
         try:
             if voice_client and voice_client.channel != voice_channel:
                 await voice_client.move_to(voice_channel)
             elif not voice_client:
                 voice_client = await voice_channel.connect()
-        except Exception:
+        except Exception as exc:
             log.exception("Failed to connect to voice channel")
-            await interaction.followup.send("I couldn't join that voice channel. Check my voice permissions.")
+            await interaction.followup.send(self._voice_connect_error_message(exc))
             return
 
         resolved_query, reason = self._resolve_music_query(interaction.user.id, query)
@@ -872,6 +904,8 @@ class CommandsHandler:
             f"Servers: **{guild_count}**",
             f"Voice sessions: **{music_servers}**",
             f"yt-dlp: **{'ready' if self.ytdl else 'missing'}**",
+            f"ffmpeg: **{'ready' if shutil.which('ffmpeg') else 'missing'}**",
+            f"Gemini: **{'ready' if settings.gemini_api_key else 'not configured'}**",
         ]
 
         if interaction.guild:

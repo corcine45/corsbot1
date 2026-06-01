@@ -14,7 +14,15 @@ import discord
 
 from core.agent import AgentContext, AgentLoop
 from core.ai import FALLBACK_RESPONSES, is_prompt_injection, is_semantic_jailbreak, sanitize_retrieved_content, is_high_risk_intent
-from core.db import get_thread_id, get_history, store_message, get_db, store_token_usage
+from core.db import (
+    get_thread_id,
+    get_conversation_thread_id,
+    get_history,
+    get_recent_speakers,
+    store_message,
+    get_db,
+    store_token_usage,
+)
 from core.feedback import store_last_reply, get_feedback_context
 from core.logger import get_logger
 from core.memory import (
@@ -106,6 +114,19 @@ class MessageHandler:
         self.quick_replies = quick_replies
         self.response_cache = response_cache or ResponseCache(ttl_seconds=config.get("RESPONSE_CACHE_TTL", 300))
         self.user_cooldowns: dict[int, float] = {}
+
+    async def _store_message_in_threads(self, loop, thread_ids: list[str], role: str, content: str):
+        for thread_id in dict.fromkeys(thread_ids):
+            await loop.run_in_executor(self.executor, store_message, thread_id, role, content)
+
+    def _is_recent_speaker_question(self, content: str) -> bool:
+        text = content.lower()
+        if not any(phrase in text for phrase in ("who were you talking to", "who was it talking to", "who did you talk to", "who were u talking to")):
+            return False
+        return any(
+            phrase in text
+            for phrase in ("last minute", "last min", "past minute", "1 minute", "recently", "just now", "a minute ago")
+        )
     
     async def handle(self, message: discord.Message):
         """Main message handler."""
@@ -143,7 +164,13 @@ class MessageHandler:
             gif_query, gif_count = gif_request
             sent = 0
             loop = asyncio.get_running_loop()
-            thread_id = get_thread_id(
+            personal_thread_id = get_thread_id(
+                message.author.id,
+                message.guild.id if message.guild else None,
+                message.channel.id,
+                is_dm,
+            )
+            thread_id = get_conversation_thread_id(
                 message.author.id,
                 message.guild.id if message.guild else None,
                 message.channel.id,
@@ -157,7 +184,12 @@ class MessageHandler:
                 else:
                     log.warning("gif_not_found", query=gif_query)
             if sent:
-                await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF x{sent}: {gif_query}]")
+                await self._store_message_in_threads(
+                    loop,
+                    [thread_id, personal_thread_id],
+                    "assistant",
+                    f"[GIF x{sent}: {gif_query}]",
+                )
                 return
             # GIF search failed — fall through to normal reply
 
@@ -182,8 +214,14 @@ class MessageHandler:
         # Resolve mentions
         mentioned_users = await self._resolve_mentions(message, content)
         
-        # Get thread ID and store message
-        thread_id = get_thread_id(
+        # Store personal history separately from shared channel context.
+        personal_thread_id = get_thread_id(
+            message.author.id,
+            message.guild.id if message.guild else None,
+            message.channel.id,
+            is_dm,
+        )
+        thread_id = get_conversation_thread_id(
             message.author.id,
             message.guild.id if message.guild else None,
             message.channel.id,
@@ -194,7 +232,7 @@ class MessageHandler:
         
         # Store message and user identity
         attributed_content = f"[{message.author.display_name}]: {content}"
-        await loop.run_in_executor(self.executor, store_message, thread_id, "user", attributed_content)
+        await self._store_message_in_threads(loop, [thread_id, personal_thread_id], "user", attributed_content)
         
         guild_nick = message.author.nick if hasattr(message.author, "nick") else None
         await loop.run_in_executor(
@@ -210,7 +248,7 @@ class MessageHandler:
         quick = get_quick_reply(content, self.quick_replies)
         if quick:
             await message.channel.send(f"<@{message.author.id}> {quick}")
-            await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", quick)
+            await self._store_message_in_threads(loop, [thread_id, personal_thread_id], "assistant", quick)
             return
 
         # Explicit GIF request — mambo anywhere in message
@@ -227,9 +265,31 @@ class MessageHandler:
                 else:
                     log.warning("gif_not_found", query=gif_query)
             if sent:
-                await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF x{sent}: {gif_query}]")
+                await self._store_message_in_threads(
+                    loop,
+                    [thread_id, personal_thread_id],
+                    "assistant",
+                    f"[GIF x{sent}: {gif_query}]",
+                )
                 return
             # GIF search failed — fall through to normal reply
+
+        if self._is_recent_speaker_question(content):
+            speakers = await loop.run_in_executor(
+                self.executor,
+                get_recent_speakers,
+                thread_id,
+                60,
+                [message.author.display_name, message.author.name],
+            )
+            if speakers:
+                names = ", ".join(speakers[:4])
+                reply = f"In the last minute, I was talking to {names}."
+            else:
+                reply = "I don't see anyone else talking to me in the last minute."
+            await message.channel.send(f"<@{message.author.id}> {reply}")
+            await self._store_message_in_threads(loop, [thread_id, personal_thread_id], "assistant", reply)
+            return
         
         # Denial check
         uid_str = str(message.author.id)
@@ -246,7 +306,7 @@ class MessageHandler:
             loop.run_in_executor(self.executor, extract_relationships, message.author.id, attributed_content)
         
         if should_update_reflection(uid_str):
-            asyncio.ensure_future(self._update_reflection_bg(uid_str, thread_id, loop))
+            asyncio.ensure_future(self._update_reflection_bg(uid_str, personal_thread_id, loop))
 
         if should_purge(uid_str):
             loop.run_in_executor(self.executor, purge_stale_memories, uid_str)
@@ -341,7 +401,7 @@ class MessageHandler:
             return
 
         # Store and send reply
-        await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", reply)
+        await self._store_message_in_threads(loop, [thread_id, personal_thread_id], "assistant", reply)
         if not cached_reply:
             store_last_reply(uid_str, reply, getattr(ctx, "emotion_state", None) or "default", active_keys)
 
@@ -360,7 +420,12 @@ class MessageHandler:
         gif_url = getattr(ctx, "gif_url", None)
         if gif_url and not cached_reply:
             await message.channel.send(gif_url)
-            await loop.run_in_executor(self.executor, store_message, thread_id, "assistant", f"[GIF: {gif_emotion}]")
+            await self._store_message_in_threads(
+                loop,
+                [thread_id, personal_thread_id],
+                "assistant",
+                f"[GIF: {gif_emotion}]",
+            )
     
     async def _check_cooldown(self, user_id: int) -> bool:
         """Check if user is on cooldown."""

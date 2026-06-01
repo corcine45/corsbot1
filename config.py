@@ -35,6 +35,8 @@ class Settings:
 
     # Optional
     tavily_api_key: str = ""
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
     ai_model: str = "llama-3.3-70b-versatile"
     vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     tenor_api_key: str = "AIzaSyAyimkuYQYF_FXVALexPuGQctUWRURdCyk"
@@ -90,6 +92,8 @@ def _load_settings() -> Settings:
         groq_api_key   = groq_api_key,
         giphy_api_key  = giphy_api_key,
         tavily_api_key = os.getenv("TAVILY_API_KEY", ""),
+        gemini_api_key = os.getenv("GEMINI_API_KEY", ""),
+        gemini_model   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         ai_model       = os.getenv("AI_MODEL", "llama-3.3-70b-versatile"),
         vision_model   = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
         tenor_api_key  = os.getenv("TENOR_API_KEY", "AIzaSyAyimkuYQYF_FXVALexPuGQctUWRURdCyk"),
@@ -113,6 +117,7 @@ DISCORD_TOKEN      = settings.discord_token
 GROQ_API_KEY       = settings.groq_api_key
 GIPHY_API_KEY      = settings.giphy_api_key
 TAVILY_API_KEY     = settings.tavily_api_key
+GEMINI_API_KEY     = settings.gemini_api_key
 HISTORY_LIMIT      = settings.history_limit
 COOLDOWN_SECONDS   = settings.cooldown_seconds
 RESPONSE_CACHE_TTL = settings.response_cache_ttl
@@ -188,4 +193,5 @@ INTENTS = {
     "message_content": True,
     "members": True,
     "presences": True,
+    "voice_states": True,
 }

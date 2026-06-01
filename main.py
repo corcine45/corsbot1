@@ -33,6 +33,7 @@ class CorsBot(discord.Client):
         intents.message_content = config.INTENTS["message_content"]
         intents.members = config.INTENTS["members"]
         intents.presences = config.INTENTS["presences"]
+        intents.voice_states = config.INTENTS["voice_states"]
         
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)

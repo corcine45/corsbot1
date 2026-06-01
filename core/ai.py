@@ -5,6 +5,7 @@ from groq import Groq
 import os
 import re
 import unicodedata
+import requests
 
 from config import settings
 from core.logger import get_logger
@@ -12,6 +13,7 @@ from core.logger import get_logger
 log = get_logger("corsbot.ai")
 
 AI_MODEL = settings.ai_model
+GEMINI_MODEL = settings.gemini_model
 client_ai = Groq(api_key=settings.groq_api_key)
 
 MAX_HISTORY_MESSAGES = 30
@@ -882,7 +884,92 @@ def _reason(message: str, memory: str, relationships: str, web_context: str, ref
         return ""
 
 
-# ---------------- GROQ WRAPPER ---------------- #
+# ---------------- AI PROVIDER WRAPPERS ---------------- #
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    err = str(error).lower()
+    return "429" in err or "rate_limit" in err or "resource_exhausted" in err
+
+
+def _is_auth_error(error: Exception) -> bool:
+    err = str(error).lower()
+    return "401" in err or "403" in err or "permission_denied" in err or "api key" in err
+
+
+def _gemini_parts(text: str) -> list[dict]:
+    return [{"text": text or ""}]
+
+
+def _messages_to_gemini(messages: list) -> tuple[str, list[dict]]:
+    system_parts = []
+    contents = []
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            system_parts.append(content)
+            continue
+
+        gemini_role = "model" if role == "assistant" else "user"
+        if contents and contents[-1]["role"] == gemini_role:
+            contents[-1]["parts"][0]["text"] += "\n\n" + content
+        else:
+            contents.append({"role": gemini_role, "parts": _gemini_parts(content)})
+
+    return "\n\n".join(system_parts), contents
+
+
+def gemini_call(model: str, messages: list, max_tokens: int, retries: int = 2, timeout: int = 20) -> tuple[str, int]:
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    system_text, contents = _messages_to_gemini(messages)
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.8,
+        },
+    }
+    if system_text:
+        payload["systemInstruction"] = {"parts": _gemini_parts(system_text)}
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    last_err = None
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                url,
+                params={"key": settings.gemini_api_key},
+                json=payload,
+                timeout=timeout,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"Gemini {response.status_code}: {response.text[:300]}")
+
+            data = response.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise RuntimeError(f"Gemini returned no candidates: {str(data)[:300]}")
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            content = "".join(part.get("text", "") for part in parts).strip()
+            if not content:
+                raise RuntimeError(f"Gemini returned an empty response: {str(data)[:300]}")
+
+            usage = data.get("usageMetadata") or {}
+            return content, int(usage.get("totalTokenCount") or 0)
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit_error(e) or _is_auth_error(e):
+                raise
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                log.warning(f"gemini_call attempt {attempt + 1} failed: {type(e).__name__}: {e} — retrying in {wait}s")
+                time.sleep(wait)
+    raise last_err
 
 def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, timeout: int = 15) -> tuple[str, int]:
     """
@@ -905,16 +992,30 @@ def groq_call(model: str, messages: list, max_tokens: int, retries: int = 3, tim
             return content, tokens_used
         except Exception as e:
             last_err = e
-            err_str = str(e)
-            if "429" in err_str or "rate_limit" in err_str.lower():
-                raise
-            if "401" in err_str or "403" in err_str:
+            if _is_rate_limit_error(e) or _is_auth_error(e):
                 raise
             if attempt < retries - 1:
                 wait = 2 ** attempt
                 log.warning(f"groq_call attempt {attempt + 1} failed: {type(e).__name__}: {e} — retrying in {wait}s")
                 time.sleep(wait)
     raise last_err
+
+
+def main_chat_call(route: RouteResult, messages: list) -> tuple[str, int, str]:
+    if settings.gemini_api_key and route.route != "fast":
+        try:
+            content, tokens = gemini_call(GEMINI_MODEL, messages, max_tokens=route.max_tokens)
+            return content, tokens, GEMINI_MODEL
+        except Exception as e:
+            if _is_auth_error(e):
+                log.error(f"[ai_chat] Gemini auth/config failed, falling back to Groq: {e}")
+            elif _is_rate_limit_error(e):
+                log.warning(f"[ai_chat] Gemini rate limited, falling back to Groq: {e}")
+            else:
+                log.warning(f"[ai_chat] Gemini failed, falling back to Groq: {type(e).__name__}: {e}")
+
+    content, tokens = groq_call(route.model, messages, max_tokens=route.max_tokens)
+    return content, tokens, route.model
 
 
 # ---------------- PERSONALITY MODES ---------------- #
@@ -1531,7 +1632,8 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
     # Route: pick model + token budget based on message type
     last_user_msg = next((e["content"] for e in reversed(history) if e["role"] == "user"), "")
     route = route_message(last_user_msg, emotion_state, bool(web_context), history_len=len(history))
-    log.debug(f"[router] route={route.route} model={route.model} tokens={route.max_tokens}")
+    primary_provider = GEMINI_MODEL if settings.gemini_api_key and route.route != "fast" else route.model
+    log.debug(f"[router] route={route.route} model={primary_provider} tokens={route.max_tokens}")
 
     # Personality mode
     personality_hint = get_personality_mode_hint(
@@ -1550,15 +1652,14 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
     messages = [{"role": "system", "content": system}] + history
 
     try:
-        result, tokens_used = groq_call(route.model, messages, max_tokens=route.max_tokens)
+        result, tokens_used, provider_model = main_chat_call(route, messages)
         result = _enforce_brevity(result)
         if user_id:
             from .db import store_token_usage
-            store_token_usage(user_id, tokens_used, route.model)
+            store_token_usage(user_id, tokens_used, provider_model)
         return result
     except Exception as e:
-        err_str = str(e)
-        if "429" in err_str or "rate_limit" in err_str.lower():
+        if _is_rate_limit_error(e):
             if route.model != _MODEL_FAST:
                 log.warning(f"[ai_chat] rate limited on {route.model}, falling back to {_MODEL_FAST}")
                 try:
@@ -1569,8 +1670,7 @@ def ai_chat(history, memory, username=None, user_id=None, relationships="", web_
                         store_token_usage(user_id, tokens_used, _MODEL_FAST)
                     return result
                 except Exception as e2:
-                    err2 = str(e2)
-                    if "429" in err2 or "rate_limit" in err2.lower():
+                    if _is_rate_limit_error(e2):
                         raise
                     log.error(f"[ai_chat] fallback also failed: {e2}")
                     return random.choice(FALLBACK_RESPONSES)

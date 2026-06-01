@@ -4,6 +4,7 @@ import time
 import os
 import logging
 import shutil
+import re
 from pathlib import Path
 
 log = logging.getLogger("corsbot.db")
@@ -235,6 +236,10 @@ def get_thread_id(user_id, guild_id=None, channel_id=None, is_dm=False):
     return f"dm:{user_id}" if is_dm else f"guild:{guild_id}:channel:{channel_id}:user:{user_id}"
 
 
+def get_conversation_thread_id(user_id, guild_id=None, channel_id=None, is_dm=False):
+    return f"dm:{user_id}" if is_dm else f"guild:{guild_id}:channel:{channel_id}"
+
+
 def store_message(thread_id, role, content):
     conn, cursor = get_db()
     cursor.execute(
@@ -255,6 +260,29 @@ def get_history(thread_id, limit=8):
         {"role": r, "content": c if len(c) <= 900 else c[:899] + "…"}
         for r, c in rows
     ]
+
+
+def get_recent_speakers(thread_id, seconds=60, exclude_names=None):
+    exclude = {name.lower() for name in (exclude_names or []) if name}
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT content FROM messages WHERE thread_id=? AND role='user' AND timestamp>=? ORDER BY timestamp DESC",
+        (thread_id, time.time() - seconds),
+    )
+
+    speakers = []
+    seen = set()
+    for (content,) in cursor.fetchall():
+        match = re.match(r"^\[([^\]]+)\]:", content)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        key = name.lower()
+        if not name or key in exclude or key in seen:
+            continue
+        seen.add(key)
+        speakers.append(name)
+    return speakers
 
 
 def store_token_usage(user_id, tokens_used, model=""):
