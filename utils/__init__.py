@@ -192,7 +192,8 @@ def build_response_cache_key(
     memory: str = "",
     relationships: str = "",
     web_context: str = "",
-    feedback_context: str = ""
+    feedback_context: str = "",
+    history_context: str = "",
 ) -> str:
     """Build a cache key from message and context."""
     payload = "\n".join([
@@ -202,6 +203,7 @@ def build_response_cache_key(
         relationships or "",
         web_context or "",
         feedback_context or "",
+        history_context or "",
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

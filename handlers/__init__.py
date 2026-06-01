@@ -302,7 +302,17 @@ class MessageHandler:
             ).fetchone()[0],
         )
         
-        cache_key = build_response_cache_key(thread_id, content, memory_context or "", "", "", feedback_context)
+        history_context = "\n".join(
+            f"{entry.get('role', '')}:{entry.get('content', '')[:180]}"
+            for entry in history[-6:]
+        )
+        cache_key = build_response_cache_key(
+            thread_id,
+            content,
+            memory_context or "",
+            feedback_context=feedback_context,
+            history_context=history_context,
+        )
         cached_reply = self.response_cache.get(cache_key)
         
         if cached_reply:
