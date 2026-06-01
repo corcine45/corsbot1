@@ -136,21 +136,6 @@ class MessageHandler:
         elif ocr_text:
             content = ocr_text
 
-        # Injection guard — three layers:
-        # 1. Regex patterns (fast, zero cost)
-        # 2. Semantic similarity (embedding-based, catches indirect framing)
-        # 3. Intent classifier (LLM-based, catches creative/scored attacks)
-        if is_prompt_injection(content) or is_semantic_jailbreak(content):
-            await message.channel.send(f"<@{message.author.id}> nice try 💀")
-            return
-
-        blocked, intent = await asyncio.get_running_loop().run_in_executor(
-            self.executor, is_high_risk_intent, content
-        )
-        if blocked:
-            await message.channel.send(f"<@{message.author.id}> nice try 💀")
-            return
-
         # Explicit GIF request — mambo anywhere in message
         gif_request = _extract_gif_request(content)
         if gif_request:
@@ -180,6 +165,18 @@ class MessageHandler:
             return
 
         if not should_reply:
+            return
+
+        # Injection guard: regex, semantic similarity, and intent classifier.
+        if is_prompt_injection(content) or is_semantic_jailbreak(content):
+            await message.channel.send(f"<@{message.author.id}> nice try 💀")
+            return
+
+        blocked, intent = await asyncio.get_running_loop().run_in_executor(
+            self.executor, is_high_risk_intent, content
+        )
+        if blocked:
+            await message.channel.send(f"<@{message.author.id}> nice try 💀")
             return
 
         # Resolve mentions

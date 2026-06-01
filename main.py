@@ -15,6 +15,7 @@ import config
 from handlers import MessageHandler
 from handlers.commands import CommandsHandler
 from utils import ResponseCache
+from core.memory import start_faiss_rebuild_background
 from core.presence import describe_activity, record_presence_pattern
 
 log = logging.getLogger("corsbot")
@@ -48,6 +49,7 @@ class CorsBot(discord.Client):
     async def on_ready(self):
         """Called when the bot has connected."""
         log.info(f"✅ Logged in as {self.user}")
+        start_faiss_rebuild_background()
     
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
         """Track presence changes (activity/status)."""

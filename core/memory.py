@@ -75,6 +75,8 @@ import queue as _queue
 _embed_queue: _queue.Queue = _queue.Queue()
 _embed_worker_started = False
 _embed_worker_lock = threading.Lock()
+_faiss_rebuild_started = False
+_faiss_rebuild_lock = threading.Lock()
 
 
 def _embed_worker():
@@ -348,11 +350,29 @@ def faiss_rebuild_from_db():
     for uid, key, value in missing:
         vec = _embed_vec(f"{key}: {value}")
         faiss_upsert(uid, key, vec)
+    if _dirty:
+        _faiss_save()
     log.info("[faiss] rebuild complete")
+
+def start_faiss_rebuild_background():
+    """Index missing memory vectors without blocking bot startup."""
+    global _faiss_rebuild_started
+    if _faiss_rebuild_started:
+        return
+    with _faiss_rebuild_lock:
+        if _faiss_rebuild_started:
+            return
+        t = threading.Thread(
+            target=faiss_rebuild_from_db,
+            daemon=True,
+            name="faiss-rebuild",
+        )
+        t.start()
+        _faiss_rebuild_started = True
+
 
 # Init on import
 _faiss_load()
-faiss_rebuild_from_db()
 
 # ---------------- MEMORY TYPES ---------------- #
 
