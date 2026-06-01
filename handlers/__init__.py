@@ -234,7 +234,7 @@ class MessageHandler:
         # Denial check
         uid_str = str(message.author.id)
         denied_matches = await loop.run_in_executor(
-            self.executor, check_and_delete_denied_facts, message.author.id, content
+            self.executor, check_and_delete_denied_facts, message.author.id, content, thread_id
         )
         if denied_matches:
             await self._handle_denial_confirmation(message, denied_matches)

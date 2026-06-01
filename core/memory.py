@@ -588,7 +588,7 @@ def should_extract(user_id: str) -> bool:
     _msg_counter[user_id] += 1
     return _msg_counter[user_id] % MEMORY_EXTRACT_EVERY == 0
 
-def check_and_delete_denied_facts(user_id, message: str) -> list:
+def check_and_delete_denied_facts(user_id, message: str, thread_id: str | None = None) -> list:
     """If user denies a stored fact, return list of matching (key, value) to confirm deletion.
     Does NOT delete immediately — caller should ask for confirmation first."""
     denial_patterns = [
@@ -671,8 +671,29 @@ def check_and_delete_denied_facts(user_id, message: str) -> list:
             "ORDER BY updated_at DESC LIMIT 5",
             (str(user_id),)
         )
-        matches = [(k, v) for k, v in cursor.fetchall()
-                   if not k.startswith("denied_")]
+        matches = [(k, v) for k, v in cursor.fetchall() if not k.startswith("denied_")]
+
+        # If the user referred to a recent assistant message (e.g. "it wasn't me, it was my friend"),
+        # try to match stored fact values that appeared in the last assistant reply for this thread.
+        if thread_id:
+            try:
+                cursor.execute(
+                    "SELECT content FROM messages WHERE thread_id=? AND role='assistant' ORDER BY timestamp DESC LIMIT 1",
+                    (thread_id,)
+                )
+                last_assistant = cursor.fetchone()
+                if last_assistant and last_assistant[0]:
+                    last_text = last_assistant[0].lower()
+                    # Add any stored facts whose value appears verbatim in the assistant message
+                    for key, value in rows:
+                        if not value:
+                            continue
+                        if key.startswith("denied_"):
+                            continue
+                        if value.lower() in last_text and (key, value) not in matches:
+                            matches.insert(0, (key, value))
+            except Exception:
+                pass
 
     return matches
 
@@ -1116,7 +1137,11 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
         non_identity[key] = (value, memory_type, updated_at, reinforcement, confidence)
 
     scored_facts = []
-    if query and non_identity:
+    explicit = _is_explicit_memory_query(query) if query else False
+
+    # If the user is explicitly asking what the bot remembers, bypass
+    # semantic filtering and return the highest-priority stored facts.
+    if query and non_identity and not explicit:
         expanded = _expand_query(query)
         q1 = _embed_vec(query)
         q2 = _embed_vec(expanded) if expanded != query.lower() else q1
@@ -1133,6 +1158,7 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
             value, memory_type, updated_at, reinforcement, confidence = non_identity[key]
             scored_facts.append((sim * _decay_score(memory_type, updated_at, reinforcement, confidence), key, value))
     else:
+        # No query or explicit request — fall back to priority by decay score
         query_vec = None
         for key, (value, memory_type, updated_at, reinforcement, confidence) in non_identity.items():
             scored_facts.append((_decay_score(memory_type, updated_at, reinforcement, confidence), key, value))
@@ -1332,7 +1358,10 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
         non_identity[key] = (value, memory_type, updated_at, reinforcement, confidence)
 
     scored_facts = []
-    if query and non_identity:
+    explicit = _is_explicit_memory_query(query) if query else False
+
+    # If explicit query, prefer returning the top stored facts by priority
+    if query and non_identity and not explicit:
         expanded = _expand_query(query)
         q1 = _embed_vec(query)
         q2 = _embed_vec(expanded) if expanded != query.lower() else q1
