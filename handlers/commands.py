@@ -144,6 +144,8 @@ class CommandsHandler:
         self.tree = client.tree
         self.music_queues: dict[int, list[dict]] = {}
         self.now_playing: dict[int, dict] = {}
+        self.idle_disconnect_tasks: dict[int, asyncio.Task] = {}
+        self.started_at = time.time()
         self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS) if yt_dlp else None
     
     def register_all(self):
@@ -159,11 +161,15 @@ class CommandsHandler:
         self.tree.command(name="dashboard", description="Show activity dashboard for the bot")(self.dashboard)
         self.tree.command(name="reset", description="Clear your conversation history with Corsbot")(self.reset)
         self.tree.command(name="play", description="Play music in your current voice channel")(self.play)
+        self.tree.command(name="queue", description="Show the current music queue")(self.queue)
+        self.tree.command(name="pause", description="Pause the current song")(self.pause)
+        self.tree.command(name="resume", description="Resume paused music")(self.resume)
         self.tree.command(name="skip", description="Skip the current song")(self.skip)
         self.tree.command(name="stop", description="Stop music and leave voice")(self.stop)
         self.tree.command(name="musiclike", description="Save the current song to your music likes")(self.musiclike)
         self.tree.command(name="musicremember", description="Tell Corsbot a favorite song, artist, or genre")(self.musicremember)
         self.tree.command(name="recommend", description="Pick music from your likes, history, or a vibe")(self.recommend)
+        self.tree.command(name="botstatus", description="Show uptime, latency, and music status")(self.botstatus)
         self.tree.command(name="help", description="Show all Corsbot commands")(self.help_command)
 
     def _get_memory_value(self, user_id: int | str, key: str, default: str = "") -> str:
@@ -293,6 +299,49 @@ class CommandsHandler:
 
         return query, ""
 
+    def _format_duration(self, seconds: int | float | None) -> str:
+        if not seconds:
+            return "unknown"
+        seconds = int(seconds)
+        minutes, secs = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+
+    def _cancel_idle_disconnect(self, guild_id: int):
+        task = self.idle_disconnect_tasks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_idle_disconnect(self, guild_id: int, delay_seconds: int = 120):
+        self._cancel_idle_disconnect(guild_id)
+        self.idle_disconnect_tasks[guild_id] = self.client.loop.create_task(
+            self._idle_disconnect(guild_id, delay_seconds)
+        )
+
+    async def _idle_disconnect(self, guild_id: int, delay_seconds: int):
+        try:
+            await asyncio.sleep(delay_seconds)
+            guild = self.client.get_guild(guild_id)
+            voice_client = guild.voice_client if guild else None
+            queue = self.music_queues.get(guild_id, [])
+            if (
+                voice_client
+                and voice_client.is_connected()
+                and not voice_client.is_playing()
+                and not voice_client.is_paused()
+                and not queue
+            ):
+                self.now_playing.pop(guild_id, None)
+                await voice_client.disconnect()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Idle voice disconnect failed in guild %s", guild_id)
+        finally:
+            self.idle_disconnect_tasks.pop(guild_id, None)
+
     async def _extract_track(self, query: str) -> dict:
         """Resolve a URL or search query into a playable audio stream."""
         if self.ytdl is None:
@@ -340,13 +389,16 @@ class CommandsHandler:
         voice_client = guild.voice_client if guild else None
         if not voice_client or not voice_client.is_connected():
             self.now_playing.pop(guild_id, None)
+            self._cancel_idle_disconnect(guild_id)
             return
 
         queue = self.music_queues.get(guild_id, [])
         if not queue:
             self.now_playing.pop(guild_id, None)
+            self._schedule_idle_disconnect(guild_id)
             return
 
+        self._cancel_idle_disconnect(guild_id)
         track = queue.pop(0)
         self.now_playing[guild_id] = track
 
@@ -644,6 +696,7 @@ class CommandsHandler:
         track["search_query"] = resolved_query
         track["requested_by"] = interaction.user.id
         self.music_queues.setdefault(guild_id, []).append(track)
+        self._cancel_idle_disconnect(guild_id)
         self._remember_recent_track(interaction.user.id, track)
 
         note = f"\n_{reason}_" if reason else ""
@@ -705,6 +758,69 @@ class CommandsHandler:
             ephemeral=True,
         )
 
+    async def queue(self, interaction: discord.Interaction):
+        """Show the current music queue."""
+        if not interaction.guild:
+            await interaction.response.send_message("Use `/queue` in a server.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        current = self.now_playing.get(guild_id)
+        queue = self.music_queues.get(guild_id, [])
+
+        if not current and not queue:
+            await interaction.response.send_message("Nothing is playing or queued right now.", ephemeral=True)
+            return
+
+        lines = ["**Music queue**"]
+        if current:
+            duration = self._format_duration(current.get("duration"))
+            lines.append(f"Now: **{current['title']}** ({duration})")
+        else:
+            lines.append("Now: idle")
+
+        if queue:
+            lines.append("")
+            for idx, track in enumerate(queue[:10], start=1):
+                duration = self._format_duration(track.get("duration"))
+                lines.append(f"{idx}. **{track['title']}** ({duration})")
+            if len(queue) > 10:
+                lines.append(f"...and {len(queue) - 10} more")
+        else:
+            lines.append("Up next: nothing")
+
+        await send_interaction(interaction, "\n".join(lines), ephemeral=False)
+
+    async def pause(self, interaction: discord.Interaction):
+        """Pause the current song."""
+        if not interaction.guild or not interaction.guild.voice_client:
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+            return
+
+        voice_client = interaction.guild.voice_client
+        if voice_client.is_playing():
+            voice_client.pause()
+            await interaction.response.send_message("Paused.")
+        elif voice_client.is_paused():
+            await interaction.response.send_message("Already paused.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+
+    async def resume(self, interaction: discord.Interaction):
+        """Resume paused music."""
+        if not interaction.guild or not interaction.guild.voice_client:
+            await interaction.response.send_message("Nothing is paused right now.", ephemeral=True)
+            return
+
+        voice_client = interaction.guild.voice_client
+        if voice_client.is_paused():
+            voice_client.resume()
+            await interaction.response.send_message("Resumed.")
+        elif voice_client.is_playing():
+            await interaction.response.send_message("Already playing.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Nothing is paused right now.", ephemeral=True)
+
     async def skip(self, interaction: discord.Interaction):
         """Skip the current song."""
         if not interaction.guild or not interaction.guild.voice_client:
@@ -725,6 +841,7 @@ class CommandsHandler:
             return
 
         guild_id = interaction.guild.id
+        self._cancel_idle_disconnect(guild_id)
         self.music_queues.pop(guild_id, None)
         self.now_playing.pop(guild_id, None)
 
@@ -736,6 +853,36 @@ class CommandsHandler:
             await interaction.response.send_message("Stopped music and left voice.")
         else:
             await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
+
+    async def botstatus(self, interaction: discord.Interaction):
+        """Show uptime, latency, and music status."""
+        uptime = self._format_duration(time.time() - self.started_at)
+        latency_ms = round(self.client.latency * 1000) if self.client.latency else 0
+        guild_count = len(self.client.guilds)
+        music_servers = sum(
+            1
+            for guild in self.client.guilds
+            if guild.voice_client and guild.voice_client.is_connected()
+        )
+
+        lines = [
+            "**Corsbot status**",
+            f"Uptime: **{uptime}**",
+            f"Latency: **{latency_ms} ms**",
+            f"Servers: **{guild_count}**",
+            f"Voice sessions: **{music_servers}**",
+            f"yt-dlp: **{'ready' if self.ytdl else 'missing'}**",
+        ]
+
+        if interaction.guild:
+            current = self.now_playing.get(interaction.guild.id)
+            queue_len = len(self.music_queues.get(interaction.guild.id, []))
+            if current:
+                lines.append(f"Here: **{current['title']}** with **{queue_len}** queued")
+            else:
+                lines.append(f"Here: idle with **{queue_len}** queued")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     async def reset(self, interaction: discord.Interaction):
         """Clear conversation history."""
@@ -769,8 +916,12 @@ class CommandsHandler:
             "`/dashboard` — show activity dashboard",
             "`/relationships` — see who I know about in your life",
             "`/play <song or url>` — play music in your voice channel",
+            "`/queue` - show the music queue",
+            "`/pause` - pause the current song",
+            "`/resume` - resume paused music",
             "`/skip` — skip the current song",
             "`/stop` — stop music and leave voice",
+            "`/botstatus` - uptime, latency, and music status",
             "`/rate` — rate my last reply",
             "`/ratings` — see your rating history",
             "`/tokens` — show your API token usage",
