@@ -99,6 +99,15 @@ def _load_settings() -> Settings:
 # Single instance — import this everywhere
 settings = _load_settings()
 
+# Optional Hugging Face token: warn if missing so deployers know to set it
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+if not HF_TOKEN:
+    log.warning(
+        "HF_TOKEN not set — unauthenticated requests to the Hugging Face Hub may be rate-limited "
+        "and downloads may be slower. Set HF_TOKEN in your environment (e.g. Railway Project → Settings → Environment Variables) "
+        "to enable authenticated downloads and higher rate limits."
+    )
+
 # ── Convenience aliases (backwards compat) ───────────────────────────────────
 DISCORD_TOKEN      = settings.discord_token
 GROQ_API_KEY       = settings.groq_api_key

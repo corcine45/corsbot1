@@ -195,8 +195,24 @@ class AgentLoop:
             ctx.memory = ""
             ctx.active_keys = []
         elif ctx.is_impersonating:
+            # Fictional character — clear user memory, inject character roleplay hint
             ctx.memory = ""
             ctx.active_keys = []
+            lower = ctx.content.lower()
+            from handlers import MessageHandler
+            for kw in MessageHandler.IMPERSONATE_KEYWORDS:
+                if kw in lower:
+                    after = lower.split(kw, 1)[-1].strip()
+                    words = after.split()
+                    char_name = words[0].rstrip(".,!?") if words else ""
+                    if char_name:
+                        ctx.impersonation_context = (
+                            f"You are now roleplaying as {char_name}. "
+                            f"Use your knowledge of this character — their personality, speech style, "
+                            f"catchphrases, and mannerisms. Stay fully in character. "
+                            f"Do NOT mix them up with other characters."
+                        )
+                    break
 
         # Relationships — fire when message contains a trigger phrase OR a known person's name
         from .memory import get_relationship_names
