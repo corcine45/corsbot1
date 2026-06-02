@@ -41,6 +41,7 @@ from models import DenialConfirmView
 from utils import (
     build_response_cache_key,
     extract_attachment_text,
+    extract_video_description,
     get_quick_reply,
     resolve_mentions_in_reply,
     send_reply,
@@ -141,7 +142,24 @@ class MessageHandler:
         ocr_text = ""
 
         if message.attachments:
-            ocr_text = await self._extract_attachments(message.attachments)
+            # Get recent history for better image context detection
+            thread_id_for_context = get_conversation_thread_id(
+                message.author.id,
+                message.guild.id if message.guild else None,
+                message.channel.id,
+                is_dm,
+            )
+            loop = asyncio.get_running_loop()
+            recent_history = await loop.run_in_executor(self.executor, get_history, thread_id_for_context, 10)
+            conversation_context = "\n".join(
+                entry.get("content", "") for entry in recent_history[-5:]
+            ) if recent_history else ""
+            
+            ocr_text = await self._extract_attachments(
+                message.attachments,
+                message_content=content,
+                conversation_context=conversation_context,
+            )
 
         if not content and not ocr_text:
             return
@@ -436,21 +454,41 @@ class MessageHandler:
         self.user_cooldowns[user_id] = now
         return True
     
-    async def _extract_attachments(self, attachments) -> str:
-        """Extract text from attachments."""
-        ocr_parts = []
-        for attachment in attachments:
-            extracted = await extract_attachment_text(
-                attachment,
-                self.executor,
-                self.config.get("MAX_IMAGE_BYTES", 8 * 1024 * 1024),
-            )
-            if extracted:
-                ocr_parts.append(extracted)
+    async def _extract_attachments(self, attachments, message_content: str = "", conversation_context: str = "") -> str:
+        """
+        Extract text/descriptions from attachments with context-aware analysis.
+        Handles both images and videos.
         
-        if ocr_parts:
+        Args:
+            attachments: List of Discord attachment objects
+            message_content: The text message that accompanied the attachments
+            conversation_context: Recent conversation history for better analysis
+        """
+        parts = []
+        for attachment in attachments:
+            # Check if it's a video
+            if attachment.content_type and attachment.content_type.startswith("video/"):
+                extracted = await extract_video_description(
+                    attachment,
+                    self.executor,
+                    message_content=message_content,
+                    conversation_context=conversation_context,
+                )
+            else:
+                # Handle images and other attachments
+                extracted = await extract_attachment_text(
+                    attachment,
+                    self.executor,
+                    self.config.get("MAX_IMAGE_BYTES", 8 * 1024 * 1024),
+                    message_content=message_content,
+                    conversation_context=conversation_context,
+                )
+            if extracted:
+                parts.append(extracted)
+        
+        if parts:
             return "\n\n".join(
-                sanitize_retrieved_content(part, "ocr") for part in ocr_parts
+                sanitize_retrieved_content(part, "attachment") for part in parts
             ).strip()
         return ""
     

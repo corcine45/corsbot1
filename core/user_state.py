@@ -152,8 +152,12 @@ def compress_user_state(user_state: dict[str, Any], username: str = "") -> str:
     subject = username or "this user"
     summary = (
         f"Unified runtime profile for {subject}. Use it silently to stay "
-        "consistent; do not explicitly mention stored facts, relationships, "
-        "or inferred state unless the user asks or brings them up.\n\n"
+        "consistent. Only use these details when they are directly relevant "
+        "to the user's current message. Do not explicitly mention stored facts, "
+        "relationships, labels, group names, nicknames, titles, or inferred state "
+        "unless the user asks about that exact detail or names it first in this "
+        "message. For quick reactions, praise, acknowledgements, or topic changes, "
+        "ignore this profile and respond only to the current chat.\n\n"
         + "\n\n".join(lines)
     )
     return _truncate(summary, MAX_SUMMARY_CHARS)
