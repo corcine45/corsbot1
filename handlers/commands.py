@@ -715,6 +715,21 @@ class CommandsHandler:
     @app_commands.autocomplete(query=music_query_autocomplete)
     async def play(self, interaction: discord.Interaction, query: str):
         """Play music in the user's voice channel."""
+        try:
+            await self._play_impl(interaction, query)
+        except Exception as exc:
+            log.exception("Unhandled error in /play")
+            try:
+                msg = f"Something went wrong: `{exc}`"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+    async def _play_impl(self, interaction: discord.Interaction, query: str):
+        """Internal play implementation."""
         if not interaction.guild:
             await interaction.response.send_message("Use `/play` in a server voice channel.", ephemeral=True)
             return
