@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "libopus", "libsodium", "python311Packages.pynacl"]
+nixPkgs = ["ffmpeg", "libopus", "libsodium"]
