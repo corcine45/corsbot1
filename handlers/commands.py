@@ -341,6 +341,7 @@ class CommandsHandler:
 
     def _voice_connect_error_message(self, error: Exception) -> str:
         error_str = str(error).lower()
+        error_repr = repr(error).lower()
         
         if isinstance(error, discord.ClientException):
             return f"Discord voice setup failed: `{error}`"
@@ -360,6 +361,16 @@ class CommandsHandler:
                 "Also make sure `libopus` is installed (usually comes with discord.py's voice deps)."
             )
         
+        # Check for nacl/opus related errors (Discord voice encryption)
+        if "nacl" in error_str or "davey" in error_str or "opus" in error_str or "libsodium" in error_str:
+            return (
+                "❌ **PyNaCl or libopus is missing!**\n"
+                "Discord voice requires these libraries.\n"
+                "• Make sure `PyNaCl` is installed: `pip install PyNaCl`\n"
+                "• Make sure `libopus` is installed on the system\n"
+                "• On Railway: Check that `nixpacks.toml` includes opus libraries"
+            )
+        
         if isinstance(error, RuntimeError):
             # Check for common RuntimeError causes
             if "yt-dlp" in error_str or "youtube" in error_str:
@@ -370,7 +381,7 @@ class CommandsHandler:
                 return "❌ **No playable audio found**. Try a different song or a direct YouTube URL."
             return f"❌ **RuntimeError**: {error}"
         
-        return f"❌ I couldn't join that voice channel: `{type(error).__name__}` — {error}"
+        return f"❌ I couldn't join that voice channel: `{type(error).__name__}` — {error}\nFull error: {error_repr}"
 
     async def _idle_disconnect(self, guild_id: int, delay_seconds: int):
         try:
