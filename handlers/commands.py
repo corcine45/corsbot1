@@ -340,13 +340,37 @@ class CommandsHandler:
         return None
 
     def _voice_connect_error_message(self, error: Exception) -> str:
+        error_str = str(error).lower()
+        
         if isinstance(error, discord.ClientException):
             return f"Discord voice setup failed: `{error}`"
         if isinstance(error, discord.Forbidden):
             return "Discord blocked the join. I need **Connect** and **Speak** in that voice channel."
         if isinstance(error, asyncio.TimeoutError):
             return "Joining voice timed out. Try again, or move me to another voice channel first."
-        return f"I couldn't join that voice channel: `{type(error).__name__}`."
+        
+        # Check for common ffmpeg-related errors
+        if "ffmpeg" in error_str or "ffmpegl" in error_str or "libopus" in error_str:
+            return (
+                "❌ **ffmpeg or libopus is missing!**\n"
+                "I need ffmpeg installed to play music in voice channels.\n"
+                "• **Windows**: Download ffmpeg from https://ffmpeg.org/download.html and add it to PATH\n"
+                "• **Linux**: Run `sudo apt install ffmpeg` or `sudo dnf install ffmpeg`\n"
+                "• **Mac**: Run `brew install ffmpeg`\n"
+                "Also make sure `libopus` is installed (usually comes with discord.py's voice deps)."
+            )
+        
+        if isinstance(error, RuntimeError):
+            # Check for common RuntimeError causes
+            if "yt-dlp" in error_str or "youtube" in error_str:
+                return "❌ **yt-dlp error**: Could not extract video info. The video might be private, deleted, or region-locked."
+            if "not installed" in error_str:
+                return "❌ **yt-dlp is not installed**. Run `pip install yt-dlp` to install it."
+            if "no playable" in error_str or "no results" in error_str:
+                return "❌ **No playable audio found**. Try a different song or a direct YouTube URL."
+            return f"❌ **RuntimeError**: {error}"
+        
+        return f"❌ I couldn't join that voice channel: `{type(error).__name__}` — {error}"
 
     async def _idle_disconnect(self, guild_id: int, delay_seconds: int):
         try:
