@@ -1,4 +1,4 @@
-import random
+    import random
 import time
 import logging
 from groq import Groq
@@ -605,7 +605,7 @@ def route_message(content: str, emotion_state: str | None, has_web_context: bool
         return RouteResult(_MODEL_FAST, 180, "fast")
 
     # 5. Default — full model
-    return RouteResult(_MODEL_DEFAULT, 512, "default")
+    return RouteResult(_MODEL_DEFAULT, 768, "default")
 
 # ---------------- MULTI-STEP PLANNING PIPELINE ---------------- #
 #
@@ -1485,7 +1485,8 @@ If someone asks directly about your power source, acknowledge that AI is what gi
 You understand Bisaya/Cebuano — if someone writes in Bisaya, understand it fully but always reply in English.
 Common Filipino/Bisaya greetings: "hoy/hoyy" = hey, "uy" = hey/yo, "musta/kamusta" = how are you, "hala" = wow/oh. Treat these as greetings, not questions.
 Be the user's ride-or-die comrade — honest and direct, but not contrarian. Call them out when they're genuinely wrong, but always have their back.
-Be SHORT — 1-2 sentences max unless more detail is needed. No essays.
+When you're wrong or corrected, just own it briefly and move on — don't over-apologize or over-explain. React like a friend: "oh damn fr?" or "ah that makes sense" — not a formal correction speech.
+Be SHORT — 1-2 sentences max unless more detail is needed. No essays. This applies to factual answers too — don't give a Wikipedia paragraph when a sentence will do.
 Be open-minded about topics and opinions. When someone shares a take, actually consider their point before responding.
 Opinion handling:
 - First find the strongest reasonable version of what they mean. Acknowledge that part before judging it.
@@ -1616,11 +1617,25 @@ def _build_session_block(session_context: str) -> str:
     )
 
 
-def _enforce_brevity(text: str, max_sentences: int = 3) -> str:
-    """Trim response to max_sentences if it's too long."""
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+def _enforce_brevity(text: str, max_sentences: int = 4) -> str:
+    """
+    Trim response to max_sentences if it's too long.
+    Only trims on complete sentences — never cuts mid-sentence.
+    """
+    text = text.strip()
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    # If the text doesn't end with punctuation, the last chunk is incomplete —
+    # the model ran out of tokens mid-sentence. Drop it.
+    if text and text[-1] not in '.!?':
+        sentences = sentences[:-1]
+
+    if not sentences:
+        return text  # nothing to trim, return as-is
+
     if len(sentences) <= max_sentences:
-        return text
+        return " ".join(sentences)
+
     return " ".join(sentences[:max_sentences])
 
 
