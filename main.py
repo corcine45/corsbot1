@@ -4,9 +4,9 @@ Orchestrates Discord client, handlers, and core systems.
 """
 
 import asyncio
-import logging
 import ctypes
 import ctypes.util
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -14,14 +14,15 @@ import discord
 from discord import app_commands
 
 import config
+from core.instructions import get_pending_online_instructions, mark_instruction_fired
+from core.memory import start_faiss_rebuild_background
+from core.presence import describe_activity, record_presence_pattern
 from handlers import MessageHandler
 from handlers.commands import CommandsHandler
 from utils import ResponseCache
-from core.memory import start_faiss_rebuild_background
-from core.presence import describe_activity, record_presence_pattern
-from core.instructions import get_pending_online_instructions, mark_instruction_fired
 
 log = logging.getLogger("corsbot")
+
 
 # ── Load libopus explicitly for Railway/Linux ────────────────────────────────
 def _load_opus():
@@ -45,6 +46,7 @@ def _load_opus():
             continue
     log.warning("Could not load libopus — voice will not work")
 
+
 _load_opus()
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -54,21 +56,21 @@ _load_opus()
 
 class CorsBot(discord.Client):
     """Discord client for Corsbot."""
-    
+
     def __init__(self, executor: ThreadPoolExecutor, response_cache: ResponseCache):
         intents = discord.Intents.default()
         intents.message_content = config.INTENTS["message_content"]
         intents.members = config.INTENTS["members"]
         intents.presences = config.INTENTS["presences"]
         intents.voice_states = config.INTENTS["voice_states"]
-        
+
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.executor = executor
         self.response_cache = response_cache
         self.message_handler = None
         self.commands_handler = None
-    
+
     async def setup_hook(self):
         """Called before the bot connects."""
         try:
@@ -76,10 +78,11 @@ class CorsBot(discord.Client):
             log.info("✅ Slash commands synced.")
         except Exception as e:
             import traceback
+
             print(f"FATAL: setup_hook failed: {e}")
             traceback.print_exc()
             raise
-    
+
     async def on_ready(self):
         """Called when the bot has connected."""
         try:
@@ -87,10 +90,11 @@ class CorsBot(discord.Client):
             start_faiss_rebuild_background()
         except Exception as e:
             import traceback
+
             print(f"FATAL: on_ready failed: {e}")
             traceback.print_exc()
         start_faiss_rebuild_background()
-    
+
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
         """Track presence changes (activity/status)."""
         if before.activity != after.activity:
@@ -104,10 +108,16 @@ class CorsBot(discord.Client):
                 loop = asyncio.get_running_loop()
                 loop.run_in_executor(
                     self.executor,
-                    partial(record_presence_pattern, after.id, "activity", activity_str, is_social=is_social),
+                    partial(
+                        record_presence_pattern,
+                        after.id,
+                        "activity",
+                        activity_str,
+                        is_social=is_social,
+                    ),
                 )
                 log.debug(f"{after.name} presence pattern updated: {activity_str}")
-    
+
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         """Track status changes and fire deferred instructions."""
         if before.status != after.status:
@@ -121,24 +131,40 @@ class CorsBot(discord.Client):
                     "status",
                     status,
                 )
-            log.debug(f"{after.name}'s status changed: {before.status} → {after.status}")
+            log.debug(
+                f"{after.name}'s status changed: {before.status} → {after.status}"
+            )
 
             # Fire deferred "when X comes online" instructions
-            if str(after.status) in ("online", "idle", "dnd") and str(before.status) == "offline":
+            if (
+                str(after.status) in ("online", "idle", "dnd")
+                and str(before.status) == "offline"
+            ):
                 await self._fire_online_instructions(after)
-    
-    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ):
         """Track voice chat activity."""
         if before.channel == after.channel or after.channel is None:
             return
-        
+
         is_social = len([m for m in after.channel.members if not m.bot]) > 1
         loop = asyncio.get_running_loop()
         loop.run_in_executor(
             self.executor,
-            partial(record_presence_pattern, member.id, "voice", "voice chat", is_social=is_social),
+            partial(
+                record_presence_pattern,
+                member.id,
+                "voice",
+                "voice chat",
+                is_social=is_social,
+            ),
         )
-    
+
     async def on_message(self, message: discord.Message):
         """Handle incoming messages."""
         if self.message_handler:
@@ -147,18 +173,24 @@ class CorsBot(discord.Client):
     async def _fire_online_instructions(self, member: discord.Member):
         """Check and fire any deferred instructions for a member coming online."""
         try:
-            instructions = get_pending_online_instructions(member.guild.id, member.display_name)
+            instructions = get_pending_online_instructions(
+                member.guild.id,
+                member.id,
+                member.display_name,
+            )
             for inst in instructions:
                 try:
                     channel = self.get_channel(int(inst["channel_id"]))
                     if channel:
-                        await channel.send(
-                            f"<@{member.id}> {inst['action']}"
-                        )
+                        await channel.send(f"<@{member.id}> {inst['action']}")
                         mark_instruction_fired(inst["id"])
-                        log.info(f"[instructions] fired for {member.display_name}: {inst['action'][:60]}")
+                        log.info(
+                            f"[instructions] fired for {member.display_name}: {inst['action'][:60]}"
+                        )
                 except Exception as e:
-                    log.warning(f"[instructions] failed to fire for {member.display_name}: {e}")
+                    log.warning(
+                        f"[instructions] failed to fire for {member.display_name}: {e}"
+                    )
         except Exception as e:
             log.warning(f"[instructions] error checking for {member.display_name}: {e}")
 
@@ -173,9 +205,9 @@ def create_bot() -> CorsBot:
     try:
         executor = ThreadPoolExecutor(max_workers=4)
         response_cache = ResponseCache(ttl_seconds=config.RESPONSE_CACHE_TTL)
-        
+
         bot = CorsBot(executor, response_cache)
-        
+
         bot.message_handler = MessageHandler(
             client=bot,
             executor=executor,
@@ -188,13 +220,14 @@ def create_bot() -> CorsBot:
             quick_replies=config.QUICK_REPLIES,
             response_cache=response_cache,
         )
-        
+
         bot.commands_handler = CommandsHandler(bot, executor)
         bot.commands_handler.register_all()
-        
+
         return bot
     except Exception as e:
         import traceback
+
         print(f"FATAL: create_bot() failed: {e}")
         traceback.print_exc()
         raise
@@ -211,5 +244,6 @@ if __name__ == "__main__":
         bot.run(config.DISCORD_TOKEN)
     except Exception as e:
         import traceback
+
         print(f"FATAL STARTUP ERROR: {e}")
         traceback.print_exc()

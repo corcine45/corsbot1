@@ -8,9 +8,10 @@ Currently supported triggers:
 - online: fires when a guild member's status changes to online/idle/dnd
 """
 
+import logging
 import re
 import time
-import logging
+
 from core.db import get_db
 from core.logger import get_logger
 
@@ -18,8 +19,14 @@ log = get_logger("corsbot.instructions")
 
 # Patterns to detect "when X comes online" type requests
 _ONLINE_PATTERNS = [
-    re.compile(r"when\s+(.+?)\s+(?:comes?\s+online|goes?\s+online|is\s+online|gets?\s+online|logs?\s+in|comes?\s+back)", re.I),
-    re.compile(r"(?:next\s+time|once)\s+(.+?)\s+(?:comes?\s+online|is\s+online|logs?\s+in)", re.I),
+    re.compile(
+        r"when\s+(.+?)\s+(?:comes?\s+online|goes?\s+online|is\s+online|gets?\s+online|logs?\s+in|comes?\s+back)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:next\s+time|once)\s+(.+?)\s+(?:comes?\s+online|is\s+online|logs?\s+in)",
+        re.I,
+    ),
 ]
 
 
@@ -44,34 +51,61 @@ def parse_deferred_instruction(content: str) -> tuple[str, str] | None:
     return None
 
 
-def store_instruction(requester_id: int, guild_id: int, channel_id: int,
-                      trigger_type: str, trigger_target: str, action: str):
+def store_instruction(
+    requester_id: int,
+    guild_id: int,
+    channel_id: int,
+    trigger_type: str,
+    trigger_target: str,
+    action: str,
+    trigger_target_id: int | None = None,
+):
     """Store a deferred instruction in the DB."""
     conn, cursor = get_db()
     cursor.execute(
         """INSERT INTO deferred_instructions
-           (requester_id, guild_id, channel_id, trigger_type, trigger_target, action, created_at, fired)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
-        (str(requester_id), str(guild_id), str(channel_id),
-         trigger_type, trigger_target.lower(), action, time.time()),
+           (requester_id, guild_id, channel_id, trigger_type, trigger_target, trigger_target_id, action, created_at, fired)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+        (
+            str(requester_id),
+            str(guild_id),
+            str(channel_id),
+            trigger_type,
+            trigger_target.lower(),
+            str(trigger_target_id) if trigger_target_id else None,
+            action,
+            time.time(),
+        ),
     )
     conn.commit()
-    log.info(f"[instructions] stored: when '{trigger_target}' {trigger_type} → {action[:60]}")
+    target_label = (
+        f"{trigger_target} ({trigger_target_id})"
+        if trigger_target_id
+        else trigger_target
+    )
+    log.info(
+        f"[instructions] stored: when '{target_label}' {trigger_type} → {action[:60]}"
+    )
 
 
-def get_pending_online_instructions(guild_id: int, member_name: str) -> list[dict]:
+def get_pending_online_instructions(
+    guild_id: int, member_id: int, member_name: str
+) -> list[dict]:
     """
-    Fetch unfired instructions that should trigger when member_name comes online.
-    Matches by display name (case-insensitive).
+    Fetch unfired instructions that should trigger when a member comes online.
+    Prefer exact member ID matches; also allow legacy/name-based matches.
     """
     _, cursor = get_db()
     cursor.execute(
         """SELECT id, requester_id, channel_id, action
            FROM deferred_instructions
            WHERE guild_id=? AND trigger_type='online'
-             AND LOWER(trigger_target)=LOWER(?)
-             AND fired=0""",
-        (str(guild_id), member_name.lower()),
+             AND fired=0
+             AND (
+                trigger_target_id=?
+                OR (trigger_target_id IS NULL AND LOWER(trigger_target)=LOWER(?))
+             )""",
+        (str(guild_id), str(member_id), member_name.lower()),
     )
     rows = cursor.fetchall()
     return [

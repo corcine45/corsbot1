@@ -1,23 +1,42 @@
+import logging
+import os
+import re
+import shutil
 import sqlite3
 import threading
 import time
-import os
-import logging
-import shutil
-import re
 from pathlib import Path
 
 log = logging.getLogger("corsbot.db")
 
 # Use /app for Railway persistent volume, fall back to local for dev
-DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parents[1]
+DATA_DIR = (
+    Path("/data") if Path("/data").exists() else Path(__file__).resolve().parents[1]
+)
 DB_PATH = DATA_DIR / "brain.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_RETENTION = 5
 SCHEMA_VERSION = 8
 
-IDENTITY_KEYS = {"name", "age", "location", "job", "display_name", "birthday", "gender", "nationality"}
-TEMPORARY_KEYS = {"mood", "currently", "doing", "feeling", "status", "playing_now", "watching_now"}
+IDENTITY_KEYS = {
+    "name",
+    "age",
+    "location",
+    "job",
+    "display_name",
+    "birthday",
+    "gender",
+    "nationality",
+}
+TEMPORARY_KEYS = {
+    "mood",
+    "currently",
+    "doing",
+    "feeling",
+    "status",
+    "playing_now",
+    "watching_now",
+}
 
 _local = threading.local()
 _backup_done = False
@@ -126,6 +145,14 @@ def initialize_schema(cursor):
             fired INTEGER DEFAULT 0
         )
     """)
+    deferred_instruction_cols = [
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(deferred_instructions)").fetchall()
+    ]
+    if "trigger_target_id" not in deferred_instruction_cols:
+        cursor.execute(
+            "ALTER TABLE deferred_instructions ADD COLUMN trigger_target_id TEXT"
+        )
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
@@ -139,7 +166,9 @@ def initialize_schema(cursor):
             timestamp REAL
         )
     """)
-    feedback_cols = [row[1] for row in cursor.execute("PRAGMA table_info(feedback)").fetchall()]
+    feedback_cols = [
+        row[1] for row in cursor.execute("PRAGMA table_info(feedback)").fetchall()
+    ]
     if "guild_id" not in feedback_cols:
         cursor.execute("ALTER TABLE feedback ADD COLUMN guild_id TEXT")
 
@@ -189,22 +218,28 @@ def initialize_schema(cursor):
                 key, value = fact.split("=", 1)
                 cursor.execute(
                     "INSERT OR IGNORE INTO memory (user_id, key, value, updated_at) VALUES (?, ?, ?, ?)",
-                    (user_id, key.strip().lower(), value.strip(), time.time())
+                    (user_id, key.strip().lower(), value.strip(), time.time()),
                 )
         cursor.execute("DROP TABLE memory_old")
-        cols = [row[1] for row in cursor.execute("PRAGMA table_info(memory)").fetchall()]
+        cols = [
+            row[1] for row in cursor.execute("PRAGMA table_info(memory)").fetchall()
+        ]
 
     if "embedding" not in cols:
         cursor.execute("ALTER TABLE memory ADD COLUMN embedding BLOB")
         cols.append("embedding")
     if "memory_type" not in cols:
-        cursor.execute("ALTER TABLE memory ADD COLUMN memory_type TEXT DEFAULT 'preference'")
+        cursor.execute(
+            "ALTER TABLE memory ADD COLUMN memory_type TEXT DEFAULT 'preference'"
+        )
         cols.append("memory_type")
     if "reinforcement" not in cols:
         cursor.execute("ALTER TABLE memory ADD COLUMN reinforcement INTEGER DEFAULT 1")
         cols.append("reinforcement")
     if "sensitivity" not in cols:
-        cursor.execute("ALTER TABLE memory ADD COLUMN sensitivity TEXT DEFAULT 'normal'")
+        cursor.execute(
+            "ALTER TABLE memory ADD COLUMN sensitivity TEXT DEFAULT 'normal'"
+        )
         cols.append("sensitivity")
     if "confidence" not in cols:
         cursor.execute("ALTER TABLE memory ADD COLUMN confidence REAL DEFAULT 1.0")
@@ -213,27 +248,42 @@ def initialize_schema(cursor):
         cursor.execute("ALTER TABLE memory ADD COLUMN last_accessed REAL DEFAULT 0")
         cols.append("last_accessed")
         # Backfill: set last_accessed = updated_at for existing rows
-        cursor.execute("UPDATE memory SET last_accessed = updated_at WHERE last_accessed = 0")
+        cursor.execute(
+            "UPDATE memory SET last_accessed = updated_at WHERE last_accessed = 0"
+        )
 
     cursor.execute(
         f"UPDATE memory SET memory_type='identity' WHERE (memory_type IS NULL OR memory_type='') AND LOWER(key) IN ({','.join('?' for _ in IDENTITY_KEYS)})",
-        tuple(IDENTITY_KEYS)
+        tuple(IDENTITY_KEYS),
     )
     cursor.execute(
         f"UPDATE memory SET memory_type='temporary' WHERE (memory_type IS NULL OR memory_type='') AND LOWER(key) IN ({','.join('?' for _ in TEMPORARY_KEYS)})",
-        tuple(TEMPORARY_KEYS)
+        tuple(TEMPORARY_KEYS),
     )
-    cursor.execute("UPDATE memory SET memory_type='preference' WHERE memory_type IS NULL OR memory_type=''")
+    cursor.execute(
+        "UPDATE memory SET memory_type='preference' WHERE memory_type IS NULL OR memory_type=''"
+    )
 
     if version < SCHEMA_VERSION:
         cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     # Indexes for performance
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, timestamp)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, timestamp)"
+    )
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(user_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_relationships_user ON relationships(user_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_usage_user ON tokens_usage(user_id, timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_presence_patterns_user ON presence_patterns(user_id, updated_at)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_relationships_user ON relationships(user_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tokens_usage_user ON tokens_usage(user_id, timestamp)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_presence_patterns_user ON presence_patterns(user_id, updated_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deferred_instructions_target_id ON deferred_instructions(guild_id, trigger_type, trigger_target_id, fired)"
+    )
 
 
 def get_db():
@@ -247,7 +297,11 @@ def get_db():
 
 
 def get_thread_id(user_id, guild_id=None, channel_id=None, is_dm=False):
-    return f"dm:{user_id}" if is_dm else f"guild:{guild_id}:channel:{channel_id}:user:{user_id}"
+    return (
+        f"dm:{user_id}"
+        if is_dm
+        else f"guild:{guild_id}:channel:{channel_id}:user:{user_id}"
+    )
 
 
 def get_conversation_thread_id(user_id, guild_id=None, channel_id=None, is_dm=False):
@@ -271,8 +325,7 @@ def get_history(thread_id, limit=8):
     )
     rows = cursor.fetchall()[::-1]
     return [
-        {"role": r, "content": c if len(c) <= 900 else c[:899] + "…"}
-        for r, c in rows
+        {"role": r, "content": c if len(c) <= 900 else c[:899] + "…"} for r, c in rows
     ]
 
 
@@ -312,28 +365,25 @@ def store_token_usage(user_id, tokens_used, model=""):
 def get_token_stats(user_id):
     """Get token usage stats for a user (total and today)."""
     _, cursor = get_db()
-    
+
     # Total tokens
     cursor.execute(
         "SELECT COALESCE(SUM(tokens_used), 0) FROM tokens_usage WHERE user_id=?",
-        (str(user_id),)
+        (str(user_id),),
     )
     total = cursor.fetchone()[0]
-    
+
     # Tokens today (last 24 hours)
     now = time.time()
     today_start = now - (24 * 3600)
     cursor.execute(
         "SELECT COALESCE(SUM(tokens_used), 0) FROM tokens_usage WHERE user_id=? AND timestamp > ?",
-        (str(user_id), today_start)
+        (str(user_id), today_start),
     )
     today = cursor.fetchone()[0]
-    
+
     # Count of requests
-    cursor.execute(
-        "SELECT COUNT(*) FROM tokens_usage WHERE user_id=?",
-        (str(user_id),)
-    )
+    cursor.execute("SELECT COUNT(*) FROM tokens_usage WHERE user_id=?", (str(user_id),))
     requests = cursor.fetchone()[0]
-    
+
     return {"total": total, "today": today, "requests": requests}

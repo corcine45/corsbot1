@@ -34,6 +34,7 @@ log = get_logger("corsbot.agent")
 
 # ── Context ──────────────────────────────────────────────────────────────── #
 
+
 @dataclass
 class AgentContext:
     """All inputs and intermediate state for one agent run."""
@@ -50,7 +51,7 @@ class AgentContext:
     mentioned_users: dict = field(default_factory=dict)
     is_impersonating: bool = False
     user_activity: str = ""  # What the user is playing/listening to
-    user_status: str = ""    # online, idle, offline, dnd
+    user_status: str = ""  # online, idle, offline, dnd
 
     # Step outputs (filled during run)
     raw_emotion_state: str | None = None
@@ -64,7 +65,7 @@ class AgentContext:
     presence_patterns: str = ""
     web_context: str = ""
     session_context: str = ""
-    conversation_summary: str = ""   # rolling summary of older messages
+    conversation_summary: str = ""  # rolling summary of older messages
     user_state: dict = field(default_factory=dict)
     user_state_summary: str = ""
     feedback_context: str = ""
@@ -73,7 +74,7 @@ class AgentContext:
 
     # Final output
     reply: str = ""
-    response_plan: str = ""   # plan produced by step_generate, stored for debugging
+    response_plan: str = ""  # plan produced by step_generate, stored for debugging
     server_members: str = ""  # compact member list for small servers
     gif_url: str | None = None
     gif_emotion: str | None = None
@@ -81,11 +82,12 @@ class AgentContext:
 
 # ── Trace ─────────────────────────────────────────────────────────────────── #
 
+
 @dataclass
 class StepTrace:
     name: str
     duration_ms: float
-    status: str          # "ok" | "skipped" | "failed"
+    status: str  # "ok" | "skipped" | "failed"
     detail: str = ""
 
 
@@ -107,6 +109,7 @@ class AgentTrace:
 
 # ── Agent ─────────────────────────────────────────────────────────────────── #
 
+
 class AgentLoop:
     """
     Orchestrates the full response pipeline for a single message.
@@ -116,7 +119,9 @@ class AgentLoop:
         ctx, trace = await agent.run(ctx)
     """
 
-    def __init__(self, executor: Executor, event_loop: asyncio.AbstractEventLoop | None = None):
+    def __init__(
+        self, executor: Executor, event_loop: asyncio.AbstractEventLoop | None = None
+    ):
         self.executor = executor
         self._loop = event_loop
 
@@ -155,7 +160,12 @@ class AgentLoop:
 
     async def step_classify(self, ctx: AgentContext, trace: AgentTrace):
         """Step 1: Classify emotion. Synchronous — no I/O."""
-        from .emotion import classify_emotion, apply_emotional_momentum, get_emotion_style_hint
+        from .emotion import (
+            apply_emotional_momentum,
+            classify_emotion,
+            get_emotion_style_hint,
+        )
+
         t0 = time.perf_counter()
         ctx.raw_emotion_state = classify_emotion(ctx.content)
         ctx.emotion_state, ctx.emotion_momentum = apply_emotional_momentum(
@@ -171,14 +181,18 @@ class AgentLoop:
     async def step_memory(self, ctx: AgentContext, trace: AgentTrace):
         """Step 2: Retrieve memory, relationships, and reflection."""
         from .memory import (
-            get_memory_with_keys, get_memory, get_relationships,
-            search_memory_by_value, get_reflection,
+            get_memory,
+            get_memory_with_keys,
+            get_reflection,
+            get_relationships,
+            search_memory_by_value,
         )
 
         # Core memory
         result = await self._step(
-            trace, "memory",
-            self._run_sync(get_memory_with_keys, ctx.user_id, ctx.content, 3)
+            trace,
+            "memory",
+            self._run_sync(get_memory_with_keys, ctx.user_id, ctx.content, 3),
         )
         if result:
             ctx.memory, ctx.active_keys = result
@@ -188,8 +202,7 @@ class AgentLoop:
             target_id = next(iter(ctx.mentioned_users))
             target_name = ctx.mentioned_users[target_id]
             target_mem = await self._step(
-                trace, "impersonate_memory",
-                self._run_sync(get_memory, target_id)
+                trace, "impersonate_memory", self._run_sync(get_memory, target_id)
             )
             if target_mem:
                 ctx.impersonation_context = f"Facts about {target_name} to help you impersonate them:\n{target_mem}"
@@ -201,6 +214,7 @@ class AgentLoop:
             ctx.active_keys = []
             lower = ctx.content.lower()
             from handlers import MessageHandler
+
             for kw in MessageHandler.IMPERSONATE_KEYWORDS:
                 if kw in lower:
                     after = lower.split(kw, 1)[-1].strip()
@@ -215,46 +229,91 @@ class AgentLoop:
                         )
                     break
 
-        # Relationships — fire when message contains a trigger phrase OR a known person's name
+        # Relationships — only retrieve when the user is explicitly asking about a person
         from .memory import get_relationship_names
 
         _RELATIONSHIP_TRIGGERS = (
-            "who is", "tell me about", "what about", "how is", "where is",
-            "what's with", "who's", "whos", "do you know", "what do you know about",
-            "anything about", "info on", "info about", "what can you tell me about",
-            "who tf is", "who da hell is", "who the hell is", "who are they",
-            "what's their deal", "whats their deal", "who even is",
-            "what's up with", "whats up with", "what happened to",
-            "how's", "hows", "where's", "wheres", "what's going on with",
-            "whats going on with", "you know", "you know about",
-            "heard of", "heard about", "know anything about",
-            "what do you think of", "what do you think about",
-            "who dat", "who dat is", "who dis", "who is dis",
-            "kinsa", "kinsa si", "kinsa ang",
+            "who is",
+            "tell me about",
+            "what about",
+            "how is",
+            "where is",
+            "what's with",
+            "who's",
+            "whos",
+            "do you know",
+            "what do you know about",
+            "anything about",
+            "info on",
+            "info about",
+            "what can you tell me about",
+            "who tf is",
+            "who da hell is",
+            "who the hell is",
+            "who are they",
+            "what's their deal",
+            "whats their deal",
+            "who even is",
+            "what's up with",
+            "whats up with",
+            "what happened to",
+            "how's",
+            "hows",
+            "where's",
+            "wheres",
+            "what's going on with",
+            "whats going on with",
+            "you know",
+            "you know about",
+            "heard of",
+            "heard about",
+            "know anything about",
+            "what do you think of",
+            "what do you think about",
+            "who dat",
+            "who dat is",
+            "who dis",
+            "who is dis",
+            "kinsa",
+            "kinsa si",
+            "kinsa ang",
         )
         _TITLE_TRIGGERS = (
-            "who is the", "who is king", "who is lord", "who is boss",
-            "who is queen", "who is god", "who is goat", "who is legend",
-            "who da king", "who da boss", "who da goat", "who da god",
-            "who da best", "who da real", "who da one", "who da legend",
-            "who declared", "who said they", "who called themselves",
-            "who holds", "who owns", "who got the title", "who is titled",
-            "who's the", "whos the", "who's da", "whos da",
+            "who is the",
+            "who is king",
+            "who is lord",
+            "who is boss",
+            "who is queen",
+            "who is god",
+            "who is goat",
+            "who is legend",
+            "who da king",
+            "who da boss",
+            "who da goat",
+            "who da god",
+            "who da best",
+            "who da real",
+            "who da one",
+            "who da legend",
+            "who declared",
+            "who said they",
+            "who called themselves",
+            "who holds",
+            "who owns",
+            "who got the title",
+            "who is titled",
+            "who's the",
+            "whos the",
+            "who's da",
+            "whos da",
             "kinsa ang",
         )
         lower = ctx.content.lower()
         has_trigger = any(t in lower for t in _RELATIONSHIP_TRIGGERS)
 
-        # Name detection — check if any stored relationship name appears in the message
-        name_mentioned = False
-        if not has_trigger:
-            known_names = await self._run_sync(get_relationship_names, ctx.user_id)
-            name_mentioned = any(name.lower() in lower for name in known_names if len(name) >= 3)
-
-        if has_trigger or name_mentioned:
+        if has_trigger:
             rels = await self._step(
-                trace, "relationships",
-                self._run_sync(get_relationships, ctx.user_id)
+                trace, "relationships", self._run_sync(get_relationships, ctx.user_id)
             )
             ctx.relationships = rels or ""
             # Cross-user search: only for role/title queries, not person-name lookups.
@@ -262,8 +321,9 @@ class AgentLoop:
             # stored facts as if they're confirmed truth.
             if any(t in lower for t in _TITLE_TRIGGERS):
                 cross = await self._step(
-                    trace, "cross_user_search",
-                    self._run_sync(search_memory_by_value, ctx.content)
+                    trace,
+                    "cross_user_search",
+                    self._run_sync(search_memory_by_value, ctx.content),
                 )
                 if cross:
                     ctx.relationships = (ctx.relationships + "\n" + cross).strip()
@@ -272,21 +332,22 @@ class AgentLoop:
 
         # Reflection
         reflection = await self._step(
-            trace, "reflection",
-            self._run_sync(get_reflection, ctx.uid_str)
+            trace, "reflection", self._run_sync(get_reflection, ctx.uid_str)
         )
         ctx.reflection = reflection or ""
 
         from .presence import get_presence_patterns
+
         presence_patterns = await self._step(
-            trace, "presence_patterns",
-            self._run_sync(get_presence_patterns, ctx.uid_str)
+            trace,
+            "presence_patterns",
+            self._run_sync(get_presence_patterns, ctx.uid_str),
         )
         ctx.presence_patterns = presence_patterns or ""
 
     async def step_search(self, ctx: AgentContext, trace: AgentTrace):
         """Step 3: Web search if the message needs real-time info."""
-        from .search import needs_web_search, web_search, build_search_query
+        from .search import build_search_query, needs_web_search, web_search
 
         if not needs_web_search(ctx.content) or ctx.mentioned_users:
             trace.add("search", 0, "skipped")
@@ -308,8 +369,17 @@ class AgentLoop:
 
     async def step_session(self, ctx: AgentContext, trace: AgentTrace):
         """Step 4: Update conversation state + fetch rolling summary."""
-        from .session import add_message, should_refresh, analyze_state, get_state_prompt
-        from .summarizer import should_summarize, summarize_thread, get_history_with_summary
+        from .session import (
+            add_message,
+            analyze_state,
+            get_state_prompt,
+            should_refresh,
+        )
+        from .summarizer import (
+            get_history_with_summary,
+            should_summarize,
+            summarize_thread,
+        )
 
         t0 = time.perf_counter()
         add_message(ctx.user_id, ctx.content)
@@ -317,7 +387,9 @@ class AgentLoop:
         # Trigger summarization in background if threshold reached
         if should_summarize(ctx.thread_id):
             asyncio.ensure_future(
-                self.loop.run_in_executor(self.executor, summarize_thread, ctx.thread_id)
+                self.loop.run_in_executor(
+                    self.executor, summarize_thread, ctx.thread_id
+                )
             )
 
         if should_refresh(ctx.user_id):
@@ -326,9 +398,7 @@ class AgentLoop:
         ctx.session_context = get_state_prompt(ctx.user_id)
 
         # Replace raw history with summary + recent messages
-        summary, recent = await self._run_sync(
-            get_history_with_summary, ctx.thread_id
-        )
+        summary, recent = await self._run_sync(get_history_with_summary, ctx.thread_id)
         ctx.conversation_summary = summary
         if recent:
             ctx.history = recent  # override the full history passed in
@@ -345,7 +415,11 @@ class AgentLoop:
         ctx.user_state = build_user_state_from_context(ctx)
         ctx.user_state_summary = compress_user_state(ctx.user_state, ctx.username)
         ms = (time.perf_counter() - t0) * 1000
-        detail = f"{len(ctx.user_state_summary)} chars" if ctx.user_state_summary else "empty"
+        detail = (
+            f"{len(ctx.user_state_summary)} chars"
+            if ctx.user_state_summary
+            else "empty"
+        )
         trace.add("user_state", ms, "ok", detail)
 
     async def step_generate(self, ctx: AgentContext, trace: AgentTrace) -> str | None:
@@ -357,14 +431,25 @@ class AgentLoop:
         still returns the original draft.
         """
         from .ai import (
-            ai_chat, _analyze_intent, _make_plan, _reason,
-            _verify_reply, _should_plan, route_message,
+            _analyze_intent,
+            _make_plan,
+            _reason,
+            _should_plan,
+            _verify_reply,
+            ai_chat,
+            route_message,
         )
 
         last_user_msg = next(
-            (e["content"] for e in reversed(ctx.history) if e["role"] == "user"), ctx.content
+            (e["content"] for e in reversed(ctx.history) if e["role"] == "user"),
+            ctx.content,
         )
-        route = route_message(last_user_msg, ctx.emotion_state, bool(ctx.web_context), history_len=len(ctx.history))
+        route = route_message(
+            last_user_msg,
+            ctx.emotion_state,
+            bool(ctx.web_context),
+            history_len=len(ctx.history),
+        )
         do_plan = _should_plan(route, last_user_msg, ctx.emotion_state)
 
         # ── Steps 5+6: Reason + Intent (parallel) ───────────────────────
@@ -372,34 +457,50 @@ class AgentLoop:
         reasoning = ""
         analysis = ""
         if do_plan:
-            has_context = any([ctx.memory, ctx.relationships, ctx.web_context, ctx.reflection])
+            has_context = any(
+                [ctx.memory, ctx.relationships, ctx.web_context, ctx.reflection]
+            )
             t0 = time.perf_counter()
             try:
                 coros = []
                 if has_context:
-                    coros.append(self._run_sync(
-                        _reason,
-                        last_user_msg, ctx.memory, ctx.relationships,
-                        ctx.web_context, ctx.reflection, ctx.emotion_state,
-                    ))
+                    coros.append(
+                        self._run_sync(
+                            _reason,
+                            last_user_msg,
+                            ctx.memory,
+                            ctx.relationships,
+                            ctx.web_context,
+                            ctx.reflection,
+                            ctx.emotion_state,
+                        )
+                    )
                 else:
-                    coros.append(asyncio.coroutine(lambda: "")() if False else asyncio.sleep(0))
+                    coros.append(
+                        asyncio.coroutine(lambda: "")() if False else asyncio.sleep(0)
+                    )
 
-                coros.append(self._run_sync(
-                    _analyze_intent,
-                    last_user_msg, ctx.emotion_state, ctx.session_context,
-                ))
+                coros.append(
+                    self._run_sync(
+                        _analyze_intent,
+                        last_user_msg,
+                        ctx.emotion_state,
+                        ctx.session_context,
+                    )
+                )
 
                 results = await asyncio.gather(*coros, return_exceptions=True)
 
                 if has_context:
                     reasoning = results[0] if isinstance(results[0], str) else ""
-                    analysis  = results[1] if isinstance(results[1], str) else ""
+                    analysis = results[1] if isinstance(results[1], str) else ""
                 else:
                     analysis = results[1] if isinstance(results[1], str) else ""
 
                 ms = (time.perf_counter() - t0) * 1000
-                trace.add("reason", ms, "ok", reasoning[:60] if reasoning else "skipped")
+                trace.add(
+                    "reason", ms, "ok", reasoning[:60] if reasoning else "skipped"
+                )
                 trace.add("intent", ms, "ok", analysis[:60] if analysis else "empty")
             except Exception as e:
                 ms = (time.perf_counter() - t0) * 1000
@@ -421,7 +522,9 @@ class AgentLoop:
             try:
                 plan = await self._run_sync(
                     _make_plan,
-                    plan_context, ctx.emotion_hint, ctx.reflection,
+                    plan_context,
+                    ctx.emotion_hint,
+                    ctx.reflection,
                 )
                 ms = (time.perf_counter() - t0) * 1000
                 trace.add("plan", ms, "ok", plan[:60] if plan else "empty")
@@ -434,20 +537,30 @@ class AgentLoop:
         # ── Step 8: Draft ────────────────────────────────────────────────
         # Generate the actual reply, injecting the plan as guidance.
         result = await self._step(
-            trace, "draft",
+            trace,
+            "draft",
             self._run_sync(
                 ai_chat,
-                ctx.history, ctx.memory,
-                ctx.username, ctx.user_id,
-                ctx.relationships, ctx.web_context,
-                ctx.impersonation_context, ctx.feedback_context,
-                ctx.channel_name, ctx.session_context,
-                ctx.reflection, ctx.emotion_hint, ctx.emotion_state,
-                ctx.user_activity, ctx.user_status, ctx.user_state_summary,
-                plan,               # response_plan
+                ctx.history,
+                ctx.memory,
+                ctx.username,
+                ctx.user_id,
+                ctx.relationships,
+                ctx.web_context,
+                ctx.impersonation_context,
+                ctx.feedback_context,
+                ctx.channel_name,
+                ctx.session_context,
+                ctx.reflection,
+                ctx.emotion_hint,
+                ctx.emotion_state,
+                ctx.user_activity,
+                ctx.user_status,
+                ctx.user_state_summary,
+                plan,  # response_plan
                 ctx.conversation_summary,
                 ctx.server_members,
-            )
+            ),
         )
         if not result:
             return None
@@ -458,7 +571,10 @@ class AgentLoop:
             t0 = time.perf_counter()
             try:
                 verified = await self._run_sync(
-                    _verify_reply, result, analysis, plan,
+                    _verify_reply,
+                    result,
+                    analysis,
+                    plan,
                 )
                 ms = (time.perf_counter() - t0) * 1000
                 rewritten = verified != result
@@ -512,13 +628,15 @@ class AgentLoop:
         if ctx.reply:
             # Track bot's response in session for future message context
             from .session import add_bot_message
+
             await self._run_sync(add_bot_message, ctx.user_id, ctx.reply)
             await self.step_post(ctx, trace)
         else:
             trace.add("post", 0, "skipped", "no reply")
 
         trace.total_ms = (time.perf_counter() - t_start) * 1000
-        log.info("agent_run_complete",
+        log.info(
+            "agent_run_complete",
             user_id=ctx.user_id,
             guild_id=ctx.guild_id,
             latency_ms=round(trace.total_ms),
