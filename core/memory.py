@@ -1952,7 +1952,7 @@ def search_memory_by_value(query: str, top_k: int = 5) -> str:
         fact_text = f"{key}: {value}"
         fact_vec = _embed_vec(fact_text)
         sim = float(np.dot(query_vec, fact_vec))
-        if sim > 0.3:
+        if sim > 0.65:  # Increased from 0.3 to prevent irrelevant context retrieval
             scored.append((sim, user_id, key, value))
 
     scored.sort(reverse=True)

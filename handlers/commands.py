@@ -173,6 +173,7 @@ class CommandsHandler:
         self.tree.command(name="musicremember", description="Tell Corsbot a favorite song, artist, or genre")(self.musicremember)
         self.tree.command(name="recommend", description="Pick music from your likes, history, or a vibe")(self.recommend)
         self.tree.command(name="botstatus", description="Show uptime, latency, and music status")(self.botstatus)
+        self.tree.command(name="online", description="Show who's currently online in the server")(self.online)
         self.tree.command(name="help", description="Show all Corsbot commands")(self.help_command)
 
     def _get_memory_value(self, user_id: int | str, key: str, default: str = "") -> str:
@@ -968,6 +969,46 @@ class CommandsHandler:
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+    async def online(self, interaction: discord.Interaction):
+        """Show who's currently online in the server."""
+        if not interaction.guild:
+            await interaction.response.send_message("Use `/online` in a server.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        online_members = [m for m in guild.members if not m.bot and m.status != discord.Status.offline]
+
+        if not online_members:
+            await interaction.response.send_message("No one is online right now.", ephemeral=True)
+            return
+
+        # Sort by status (online > idle > dnd) then by name
+        status_order = {discord.Status.online: 0, discord.Status.idle: 1, discord.Status.dnd: 2}
+        online_members.sort(key=lambda m: (status_order.get(m.status, 3), m.display_name.lower()))
+
+        lines = [f"🟢 **Online in {guild.name}** ({len(online_members)} members)"]
+
+        for member in online_members[:25]:  # Limit to 25 to avoid hitting message length limits
+            status_emoji = {
+                discord.Status.online: "🟢",
+                discord.Status.idle: "🌙",
+                discord.Status.dnd: "🔴",
+            }.get(member.status, "⚪")
+
+            activity = ""
+            if member.activity:
+                if isinstance(member.activity, discord.Spotify):
+                    activity = f" — 🎵 {member.activity.artist}"
+                elif hasattr(member.activity, 'name'):
+                    activity = f" — {member.activity.name}"
+
+            lines.append(f"{status_emoji} **{member.display_name}**{activity}")
+
+        if len(online_members) > 25:
+            lines.append(f"...and {len(online_members) - 25} more")
+
+        await send_interaction(interaction, "\n".join(lines), ephemeral=False)
+
     async def reset(self, interaction: discord.Interaction):
         """Clear conversation history."""
         user_id = interaction.user.id
@@ -999,6 +1040,7 @@ class CommandsHandler:
             "`/stats` — conversation and memory stats",
             "`/dashboard` — show activity dashboard",
             "`/relationships` — see who I know about in your life",
+            "`/online` — show who's currently online in the server",
             "`/play <song or url>` — play music in your voice channel",
             "`/queue` - show the music queue",
             "`/pause` - pause the current song",
@@ -1010,5 +1052,7 @@ class CommandsHandler:
             "`/ratings` — see your rating history",
             "`/tokens` — show your API token usage",
             "`/help` — show this list",
+            "",
+            "💡 **Tip**: Say 'when <name> comes online, tell them <message>' to set a delayed message!",
         ]
         await send_interaction(interaction, "\n".join(lines))

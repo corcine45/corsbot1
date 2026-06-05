@@ -25,6 +25,7 @@ from core.db import (
 )
 from core.feedback import store_last_reply, get_feedback_context
 from core.logger import get_logger
+from core.instructions import parse_deferred_instruction, store_instruction
 from core.memory import (
     check_and_delete_denied_facts,
     delete_denied_fact,
@@ -291,6 +292,24 @@ class MessageHandler:
                 )
                 return
             # GIF search failed — fall through to normal reply
+
+        # Deferred instruction detection — "when X comes online, do Y"
+        if message.guild:
+            parsed = parse_deferred_instruction(content)
+            if parsed:
+                trigger_target, action = parsed
+                store_instruction(
+                    message.author.id,
+                    message.guild.id,
+                    message.channel.id,
+                    "online",
+                    trigger_target,
+                    action,
+                )
+                await message.channel.send(
+                    f"<@{message.author.id}> got it — I'll say something when **{trigger_target}** comes online 👀"
+                )
+                return
 
         if self._is_recent_speaker_question(content):
             speakers = await loop.run_in_executor(

@@ -19,6 +19,7 @@ from handlers.commands import CommandsHandler
 from utils import ResponseCache
 from core.memory import start_faiss_rebuild_background
 from core.presence import describe_activity, record_presence_pattern
+from core.instructions import get_pending_online_instructions, mark_instruction_fired
 
 log = logging.getLogger("corsbot")
 
@@ -108,7 +109,7 @@ class CorsBot(discord.Client):
                 log.debug(f"{after.name} presence pattern updated: {activity_str}")
     
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        """Track status changes."""
+        """Track status changes and fire deferred instructions."""
         if before.status != after.status:
             status = str(after.status)
             if status != "offline":
@@ -121,6 +122,10 @@ class CorsBot(discord.Client):
                     status,
                 )
             log.debug(f"{after.name}'s status changed: {before.status} → {after.status}")
+
+            # Fire deferred "when X comes online" instructions
+            if str(after.status) in ("online", "idle", "dnd") and str(before.status) == "offline":
+                await self._fire_online_instructions(after)
     
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         """Track voice chat activity."""
@@ -138,6 +143,24 @@ class CorsBot(discord.Client):
         """Handle incoming messages."""
         if self.message_handler:
             await self.message_handler.handle(message)
+
+    async def _fire_online_instructions(self, member: discord.Member):
+        """Check and fire any deferred instructions for a member coming online."""
+        try:
+            instructions = get_pending_online_instructions(member.guild.id, member.display_name)
+            for inst in instructions:
+                try:
+                    channel = self.get_channel(int(inst["channel_id"]))
+                    if channel:
+                        await channel.send(
+                            f"<@{member.id}> {inst['action']}"
+                        )
+                        mark_instruction_fired(inst["id"])
+                        log.info(f"[instructions] fired for {member.display_name}: {inst['action'][:60]}")
+                except Exception as e:
+                    log.warning(f"[instructions] failed to fire for {member.display_name}: {e}")
+        except Exception as e:
+            log.warning(f"[instructions] error checking for {member.display_name}: {e}")
 
 
 # ────────────────────────────────────────────────────────────────────────────────

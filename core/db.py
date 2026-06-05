@@ -14,7 +14,7 @@ DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve()
 DB_PATH = DATA_DIR / "brain.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_RETENTION = 5
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 IDENTITY_KEYS = {"name", "age", "location", "job", "display_name", "birthday", "gender", "nationality"}
 TEMPORARY_KEYS = {"mood", "currently", "doing", "feeling", "status", "playing_now", "watching_now"}
@@ -110,6 +110,20 @@ def initialize_schema(cursor):
             summary TEXT,
             message_count INTEGER DEFAULT 0,
             updated_at REAL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS deferred_instructions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            requester_id TEXT,
+            guild_id TEXT,
+            channel_id TEXT,
+            trigger_type TEXT,
+            trigger_target TEXT,
+            action TEXT,
+            created_at REAL,
+            fired INTEGER DEFAULT 0
         )
     """)
 
