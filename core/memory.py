@@ -14,7 +14,7 @@ from .ai import groq_call
 
 # ---------------- EMBEDDER ---------------- #
 
-EMBED_DIM = 768
+EMBED_DIM = 384  # all-MiniLM-L6-v2 output dimension
 _embedder: SentenceTransformer | None = None
 _embedder_lock = threading.Lock()
 
