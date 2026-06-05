@@ -5,6 +5,8 @@ Orchestrates Discord client, handlers, and core systems.
 
 import asyncio
 import logging
+import ctypes
+import ctypes.util
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -19,6 +21,30 @@ from core.memory import start_faiss_rebuild_background
 from core.presence import describe_activity, record_presence_pattern
 
 log = logging.getLogger("corsbot")
+
+# ── Load libopus explicitly for Railway/Linux ────────────────────────────────
+def _load_opus():
+    if discord.opus.is_loaded():
+        return
+    # Common paths on Nix/Railway
+    candidates = [
+        "libopus.so.0",
+        "libopus.so",
+        "/nix/store/libopus/lib/libopus.so.0",  # nixpacks path pattern
+        ctypes.util.find_library("opus"),
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            discord.opus.load_opus(path)
+            log.info(f"Loaded opus from: {path}")
+            return
+        except Exception:
+            continue
+    log.warning("Could not load libopus — voice will not work")
+
+_load_opus()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CLIENT SETUP
