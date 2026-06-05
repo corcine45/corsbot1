@@ -135,30 +135,34 @@ class CorsBot(discord.Client):
 
 def create_bot() -> CorsBot:
     """Create and configure the bot instance."""
-    executor = ThreadPoolExecutor(max_workers=4)
-    response_cache = ResponseCache(ttl_seconds=config.RESPONSE_CACHE_TTL)
-    
-    bot = CorsBot(executor, response_cache)
-    
-    # Initialize message handler
-    bot.message_handler = MessageHandler(
-        client=bot,
-        executor=executor,
-        config={
-            "HISTORY_LIMIT": config.HISTORY_LIMIT,
-            "COOLDOWN_SECONDS": config.COOLDOWN_SECONDS,
-            "RESPONSE_CACHE_TTL": config.RESPONSE_CACHE_TTL,
-            "MAX_IMAGE_BYTES": config.MAX_IMAGE_BYTES,
-        },
-        quick_replies=config.QUICK_REPLIES,
-        response_cache=response_cache,
-    )
-    
-    # Initialize commands handler
-    bot.commands_handler = CommandsHandler(bot, executor)
-    bot.commands_handler.register_all()
-    
-    return bot
+    try:
+        executor = ThreadPoolExecutor(max_workers=4)
+        response_cache = ResponseCache(ttl_seconds=config.RESPONSE_CACHE_TTL)
+        
+        bot = CorsBot(executor, response_cache)
+        
+        bot.message_handler = MessageHandler(
+            client=bot,
+            executor=executor,
+            config={
+                "HISTORY_LIMIT": config.HISTORY_LIMIT,
+                "COOLDOWN_SECONDS": config.COOLDOWN_SECONDS,
+                "RESPONSE_CACHE_TTL": config.RESPONSE_CACHE_TTL,
+                "MAX_IMAGE_BYTES": config.MAX_IMAGE_BYTES,
+            },
+            quick_replies=config.QUICK_REPLIES,
+            response_cache=response_cache,
+        )
+        
+        bot.commands_handler = CommandsHandler(bot, executor)
+        bot.commands_handler.register_all()
+        
+        return bot
+    except Exception as e:
+        import traceback
+        print(f"FATAL: create_bot() failed: {e}")
+        traceback.print_exc()
+        raise
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -167,5 +171,10 @@ def create_bot() -> CorsBot:
 
 
 if __name__ == "__main__":
-    bot = create_bot()
-    bot.run(config.DISCORD_TOKEN)
+    try:
+        bot = create_bot()
+        bot.run(config.DISCORD_TOKEN)
+    except Exception as e:
+        import traceback
+        print(f"FATAL STARTUP ERROR: {e}")
+        traceback.print_exc()
