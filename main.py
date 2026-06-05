@@ -70,12 +70,24 @@ class CorsBot(discord.Client):
     
     async def setup_hook(self):
         """Called before the bot connects."""
-        await self.tree.sync()
-        log.info("✅ Slash commands synced.")
+        try:
+            await self.tree.sync()
+            log.info("✅ Slash commands synced.")
+        except Exception as e:
+            import traceback
+            print(f"FATAL: setup_hook failed: {e}")
+            traceback.print_exc()
+            raise
     
     async def on_ready(self):
         """Called when the bot has connected."""
-        log.info(f"✅ Logged in as {self.user}")
+        try:
+            log.info(f"✅ Logged in as {self.user}")
+            start_faiss_rebuild_background()
+        except Exception as e:
+            import traceback
+            print(f"FATAL: on_ready failed: {e}")
+            traceback.print_exc()
         start_faiss_rebuild_background()
     
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
