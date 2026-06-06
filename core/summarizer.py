@@ -21,10 +21,10 @@ from core.logger import get_logger
 log = get_logger("corsbot.summarizer")
 
 # How many messages to keep verbatim (always injected as-is)
-RECENT_MESSAGES = 10
+RECENT_MESSAGES = 20
 
 # Summarize when total history exceeds this
-SUMMARIZE_THRESHOLD = 20
+SUMMARIZE_THRESHOLD = 30
 
 # How many messages to include in each summarization batch
 SUMMARIZE_BATCH = 30

@@ -2121,6 +2121,9 @@ def _build_system_prompt(
             f"The conversation history may contain messages from other users — "
             f"always address {username} directly in your reply."
         )
+        parts.append(
+            "Do not mention, address, or bring up any other server member unless they appear in the current user message, are present in the recent chat history, or the user is explicitly asking about them."
+        )
 
     if channel_name:
         parts.append(f"You are in the #{channel_name} channel.")
