@@ -66,6 +66,9 @@ class AgentContext:
     web_context: str = ""
     session_context: str = ""
     conversation_summary: str = ""  # rolling summary of older messages
+    task_mode: str = ""
+    task_clues: list[str] = field(default_factory=list)
+    search_query: str = ""
     user_state: dict = field(default_factory=dict)
     user_state_summary: str = ""
     feedback_context: str = ""
@@ -347,13 +350,64 @@ class AgentLoop:
 
     async def step_search(self, ctx: AgentContext, trace: AgentTrace):
         """Step 3: Web search if the message needs real-time info."""
-        from .search import build_search_query, needs_web_search, web_search
+        from .search import (
+            build_search_query,
+            build_song_search_query_from_clues,
+            collect_song_clues,
+            extract_song_artist_hint,
+            is_song_followup_message,
+            is_song_identification_turn,
+            merge_song_clue_lines,
+            needs_web_search,
+            web_search,
+        )
+        from .session import (
+            clear_song_task_state,
+            get_song_task_state,
+            update_song_task_state,
+        )
 
-        if not needs_web_search(ctx.content) or ctx.mentioned_users:
+        active_song = get_song_task_state(ctx.user_id)
+        song_guess_mode = (
+            is_song_identification_turn(ctx.content, ctx.history)
+            or (active_song.active and is_song_followup_message(ctx.content))
+        )
+
+        if (
+            not needs_web_search(ctx.content) and not song_guess_mode
+        ) or ctx.mentioned_users:
+            if active_song.active and not song_guess_mode:
+                clear_song_task_state(ctx.user_id)
             trace.add("search", 0, "skipped")
             return
 
-        query = build_search_query(ctx.content)
+        if song_guess_mode:
+            ctx.task_mode = "song_guess"
+            new_clues = collect_song_clues(ctx.content, ctx.history)
+            ctx.task_clues = (
+                merge_song_clue_lines(active_song.clues, new_clues, max_lines=8)
+                if active_song.active
+                else new_clues
+            )
+            artist_hint = active_song.artist_hint or extract_song_artist_hint(
+                ctx.content, ctx.history
+            )
+            query = build_song_search_query_from_clues(ctx.task_clues, artist_hint)
+            if not query:
+                query = build_search_query(ctx.content)
+            if ctx.task_clues or artist_hint:
+                update_song_task_state(
+                    ctx.user_id,
+                    ctx.task_clues,
+                    artist_hint=artist_hint,
+                )
+            else:
+                clear_song_task_state(ctx.user_id)
+        else:
+            query = build_search_query(ctx.content)
+            if active_song.active:
+                clear_song_task_state(ctx.user_id)
+        ctx.search_query = query
         t0 = time.perf_counter()
         try:
             result = await web_search(query)
@@ -450,7 +504,22 @@ class AgentLoop:
             bool(ctx.web_context),
             history_len=len(ctx.history),
         )
-        do_plan = _should_plan(route, last_user_msg, ctx.emotion_state)
+        do_plan = (
+            _should_plan(route, last_user_msg, ctx.emotion_state)
+            or ctx.task_mode == "song_guess"
+        )
+
+        task_hint = ""
+        if ctx.task_mode == "song_guess":
+            lines = "\n".join(f"- {line}" for line in ctx.task_clues[:6])
+            task_hint = (
+                "Active task: identify a song from lyric clues across multiple user turns. "
+                "Stay on that task instead of treating each short line literally. "
+                "Use the clue bundle, any artist hint, and any web results. "
+                "If uncertain, give one best guess only and ask for one more lyric line."
+            )
+            if lines:
+                task_hint += f"\nRecent clue lines:\n{lines}"
 
         # ── Steps 5+6: Reason + Intent (parallel) ───────────────────────
         # Both are independent — run concurrently to save ~150-180ms.
@@ -480,10 +549,14 @@ class AgentLoop:
                         asyncio.coroutine(lambda: "")() if False else asyncio.sleep(0)
                     )
 
+                analysis_input = last_user_msg
+                if task_hint:
+                    analysis_input += "\n\n" + task_hint
+
                 coros.append(
                     self._run_sync(
                         _analyze_intent,
-                        last_user_msg,
+                        analysis_input,
                         ctx.emotion_state,
                         ctx.session_context,
                     )
@@ -518,6 +591,8 @@ class AgentLoop:
             plan_context = analysis
             if reasoning:
                 plan_context = f"{analysis}\n\nReasoning:\n{reasoning}"
+            if task_hint:
+                plan_context = (plan_context + "\n\n" + task_hint).strip()
             t0 = time.perf_counter()
             try:
                 plan = await self._run_sync(
@@ -536,6 +611,11 @@ class AgentLoop:
 
         # ── Step 8: Draft ────────────────────────────────────────────────
         # Generate the actual reply, injecting the plan as guidance.
+        response_plan = plan
+        if task_hint:
+            response_plan = (task_hint + ("\n\n" + plan if plan else "")).strip()
+        ctx.response_plan = response_plan
+
         result = await self._step(
             trace,
             "draft",
@@ -557,7 +637,7 @@ class AgentLoop:
                 ctx.user_activity,
                 ctx.user_status,
                 ctx.user_state_summary,
-                plan,  # response_plan
+                response_plan,
                 ctx.conversation_summary,
                 ctx.server_members,
             ),
@@ -574,7 +654,7 @@ class AgentLoop:
                     _verify_reply,
                     result,
                     analysis,
-                    plan,
+                    response_plan,
                 )
                 ms = (time.perf_counter() - t0) * 1000
                 rewritten = verified != result

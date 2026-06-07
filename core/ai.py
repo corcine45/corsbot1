@@ -885,12 +885,13 @@ def _analyze_intent(
                         "subtext: <what they may actually mean or want emotionally — or 'none'>\n"
                         "emotional_weight: <low | medium | high> — most casual Discord messages are LOW\n"
                         "needs_acknowledgment: <yes | no> — only yes if they shared something genuinely personal or upsetting\n"
-                        "response_type: <banter | information | advice | empathy | opinion | roleplay> — default to banter for casual messages\n"
+                        "response_type: <banter | information | advice | empathy | opinion | roleplay | guessing_game> — default to banter for casual messages\n"
                         "stance: <agree | mostly agree | gently push back | ask curious follow-up | answer directly>\n"
                         "context_need: <what prior context matters — or 'none'>\n"
                         "human_move: <the natural conversational move: validate, joke, clarify, answer, reassure, challenge lightly>\n"
                         "One short phrase per field. No explanation. "
                         "IMPORTANT: Do not over-classify casual chat as emotional. Most Discord messages are just people talking. "
+                        "If the user is giving clue fragments, lyric lines, or quote lines across multiple turns, treat it as one ongoing guessing task instead of isolated messages. "
                         "Do not force disagreement if the user's point is reasonable."
                     ),
                 },
@@ -939,6 +940,7 @@ def _make_plan(analysis: str, emotion_hint: str, reflection: str) -> str:
                         "length: <1 sentence | 1-2 sentences | 2-3 sentences>\n"
                         "One short phrase per field. No explanation. Keep it Discord-appropriate. "
                         "Prefer one concrete observation over generic warmth. "
+                        "For clue-based guessing tasks like song/quote identification, either give one best guess with a short reason or ask for one more specific clue — never spray multiple contradictory guesses. "
                         "Never add unrelated stored labels, group names, nicknames, lore, or callbacks just to sound specific; "
                         "for praise or short acknowledgements, keep the plan to a simple reaction."
                     ),
@@ -979,6 +981,8 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
                         "5. Does it sound generic, preachy, corporate, or like an essay?\n"
                         "6. If the user shared an opinion, did it acknowledge the reasonable part before agreeing or pushing back?\n"
                         "7. Did it ignore important recent context or invent context that was not given?\n"
+                        "8. For clue-based guessing tasks, did it stay on the same task instead of treating each clue line literally?\n"
+                        "9. Does it give multiple contradictory guesses or visibly flail?\n"
                         "Reply with ONLY one of:\n"
                         "  PASS\n"
                         "  FAIL: <one-line reason>\n"
@@ -1020,6 +1024,7 @@ def _verify_reply(reply: str, analysis: str, plan: str) -> str:
                         "Rewrite this Discord bot reply to fix the issue described. "
                         "Keep it short (1-2 sentences max), casual, specific, and on-point. "
                         "Sound like a thoughtful friend in Discord, not a helper article. "
+                        "If the task is identifying a song or quote from clues, give one best guess only; if uncertainty remains, ask for one more clue instead of listing multiple guesses. "
                         "Do NOT start with 'I'. Do NOT add filler. Just fix the specific problem."
                     ),
                 },
@@ -1087,6 +1092,13 @@ def _should_plan(
         "what am i listening to",
         "what song",
         "what artist",
+        "guess the song",
+        "identify the song",
+        "based on the lyrics",
+        "from the lyrics",
+        "song by",
+        "guess again",
+        "another guess",
         "what am i playing",
         "what are you playing",
         "opinion",
@@ -2069,6 +2081,7 @@ Only bring up stored facts about a user when they directly ask. Never say "I rem
 If the user changes topic or says stop, respect it immediately.
 You can see images and videos — when a message contains [Image: ...], [Image: TYPE: ...], [Video: ...], or [Video: TYPE: ...], react to it naturally. These descriptions are fallible captions, not guaranteed fact. Types may be tagged (e.g., meme, screenshot, photo, art for images; meme, gameplay, social_media, music, film_tv for videos) to help you understand context. Do not invent named characters, celebrities, franchises, games, or lore unless the user says it, readable text says it, or the caption gives unmistakable evidence. If the subject is ambiguous, describe the visible action or mood instead of naming it, and be willing to say you are not sure. For memes, engage with the joke. For screenshots, read the text and respond to the content. For photos, comment on what's shown. For art, appreciate the style/effort. For videos, comment on the content, progression, or why it might be interesting/funny.
 If something is genuinely unclear or ambiguous, ask — but only if you truly can't figure out what they mean. Don't ask clarifying questions for simple, clear messages. If you don't know something, just say you don't know — don't ask them to explain what they meant.
+If the user sends short poetic fragments or line-by-line clues across multiple turns, infer that they may be quoting lyrics or a reference on purpose. Stay on that shared task. Ask directly if it's a song/quote clue instead of responding to each line as literal life commentary.
 Never say "I'm not in a position to", "I can't help with that", "I'm unable to", or any other refusal phrasing. If you don't want to answer something, just be blunt or deflect with humor — don't give a corporate disclaimer. When someone asks a casual opinion question using slang (like "which is gayer", "which is more cringe", "which is worse"), just answer it like a friend would — pick a side, give a take, don't lecture them about the question itself.
 If someone shares something personal, acknowledge what they said before reacting — don't just jump to jokes.
 Pay attention to the emotional weight of what they're saying and match their energy — if they're venting, be real with them first.
@@ -2127,6 +2140,11 @@ def _build_system_prompt(
 
     if channel_name:
         parts.append(f"You are in the #{channel_name} channel.")
+
+    today = time.strftime("%B %d, %Y", time.localtime())
+    parts.append(
+        f"Current date: {today}. Use this to answer date-sensitive questions accurately."
+    )
 
     if conversation_summary:
         parts.append(

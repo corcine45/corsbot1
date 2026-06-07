@@ -42,6 +42,7 @@ log = logging.getLogger("corsbot.session")
 
 CONFIDENCE_THRESHOLD = 0.55   # fields below this are not injected
 SESSION_TIMEOUT      = 1800   # 30 min → full expiry
+SONG_TASK_TIMEOUT    = 900    # 15 min → keep song-guess state alive
 DECAY_PARTIAL_AT     = 900    # 15 min → partial weight starts
 REFRESH_EVERY        = 4      # re-analyze every N messages
 MESSAGE_WINDOW       = 12     # messages fed to the analyzer
@@ -188,6 +189,14 @@ class UserState:
 # ── Session store ─────────────────────────────────────────────────────────── #
 
 @dataclass
+class SongTaskState:
+    active: bool = False
+    clues: list[str] = field(default_factory=list)
+    artist_hint: str = ""
+    updated_at: float = field(default_factory=time.time)
+
+
+@dataclass
 class _Session:
     conv:              ConversationState = field(default_factory=ConversationState)
     user:              UserState         = field(default_factory=UserState)
@@ -197,6 +206,7 @@ class _Session:
     last_conv_fp:      str               = ""   # fingerprint of last injected conv state
     last_user_fp:      str               = ""   # fingerprint of last injected user state
     last_analyzed_fp:  str               = ""   # fingerprint of messages at last analyze_state call
+    song_task:         SongTaskState     = field(default_factory=SongTaskState)
 
 
 _sessions: dict[int, _Session] = defaultdict(_Session)
@@ -207,6 +217,10 @@ def _is_expired(user_id: int) -> bool:
     if not sess:
         return True
     return (time.time() - sess.last_seen) > SESSION_TIMEOUT
+
+
+def _song_task_is_expired(song_task: SongTaskState) -> bool:
+    return not song_task.active or (time.time() - song_task.updated_at) > SONG_TASK_TIMEOUT
 
 
 def _get_or_create(user_id: int) -> _Session:
@@ -252,6 +266,44 @@ def should_refresh(user_id: int) -> bool:
 def get_recent_messages(user_id: int) -> list[str]:
     sess = _sessions.get(user_id)
     return sess.messages if sess else []
+
+
+def get_song_task_state(user_id: int) -> SongTaskState:
+    sess = _sessions.get(user_id)
+    if not sess:
+        return SongTaskState()
+    if _song_task_is_expired(sess.song_task):
+        sess.song_task = SongTaskState()
+        return sess.song_task
+    return sess.song_task
+
+
+def update_song_task_state(
+    user_id: int,
+    clues: list[str],
+    artist_hint: str = "",
+    active: bool = True,
+):
+    sess = _get_or_create(user_id)
+    sess.song_task = SongTaskState(
+        active=active,
+        clues=clues[-8:],
+        artist_hint=artist_hint or sess.song_task.artist_hint,
+        updated_at=time.time(),
+    )
+    sess.last_seen = time.time()
+    log.debug(
+        f"[session] updated song task user={user_id} active={active} clues={len(sess.song_task.clues)} artist_hint={artist_hint!r}"
+    )
+
+
+def clear_song_task_state(user_id: int):
+    sess = _sessions.get(user_id)
+    if not sess:
+        return
+    sess.song_task = SongTaskState()
+    sess.last_seen = time.time()
+    log.debug(f"[session] cleared song task state user={user_id}")
 
 
 def set_state(user_id: int, conv: ConversationState, user: UserState):
