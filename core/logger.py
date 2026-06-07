@@ -117,6 +117,12 @@ def configure_logging(level: str = "INFO", json_logs: bool = True):
     # Remove any existing handlers
     root.handlers.clear()
 
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(root.level)
 

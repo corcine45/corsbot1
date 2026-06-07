@@ -310,7 +310,13 @@ class MessageHandler:
             return
 
         # Injection guard: regex, semantic similarity, and intent classifier.
-        if is_prompt_injection(content) or is_semantic_jailbreak(content):
+        try:
+            injection_blocked = is_prompt_injection(content) or is_semantic_jailbreak(content)
+        except Exception as exc:
+            log.warning("injection_guard_failed", error=str(exc))
+            injection_blocked = False
+
+        if injection_blocked:
             await message.channel.send(f"<@{message.author.id}> nice try 💀")
             return
 
