@@ -68,4 +68,9 @@ Troubleshooting
 - HF Hub rate limits / slow downloads: add `HF_TOKEN` to authenticate downloads.
 - If the bot still fails to start, capture logs in Railway and check `Missing env var` or `Invalid env var` messages emitted by `config.py`.
 
+Docker deployment
+- This repo includes a `Dockerfile` that installs `ffmpeg`, `libopus`, and voice dependencies for Discord.
+- On Railway, use a Docker deployment or select the Docker builder so the `Dockerfile` is used instead of Railpack.
+- If you prefer Nixpacks, make sure the project builder is set to Nixpacks and `nixpacks.toml` is present.
+
 If you'd like, I can also add a `gitignore` reminder (do not commit `.env`) or a CI check to ensure env vars are configured before deploy.
