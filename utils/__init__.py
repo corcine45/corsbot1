@@ -128,19 +128,54 @@ async def send_interaction(interaction, text: str, ephemeral: bool = True):
 # MENTION RESOLUTION
 # ────────────────────────────────────────────────────────────────────────────────
 
-def resolve_mentions_in_reply(reply: str, guild) -> str:
+def resolve_mentions_in_reply(reply: str, guild, user_id: int = None) -> str:
     """Replace @name mentions with Discord mention format."""
     if not guild:
         return reply
-    
+
+    # Build a lookup of member names to IDs
+    member_lookup = {}
+    for member in guild.members:
+        if member.bot:
+            continue
+        # Store both display name and username
+        member_lookup[member.display_name.lower()] = member.id
+        member_lookup[member.name.lower()] = member.id
+
+    # Also check stored nicknames from memory for the requesting user
+    if user_id:
+        from core.db import get_db
+        _, cursor = get_db()
+        cursor.execute(
+            "SELECT key, value FROM memory WHERE user_id=? AND key IN ('nickname', 'server_nickname')",
+            (str(user_id),)
+        )
+        for key, value in cursor.fetchall():
+            if value:
+                # Map nickname to this user's ID for self-mentions
+                member_lookup[value.lower()] = user_id
+
     def replace_mention(match):
-        name = match.group(1).lower()
-        for member in guild.members:
-            if member.display_name.lower() == name or member.name.lower() == name:
-                return f"<@{member.id}>"
+        name = match.group(1).lower().strip()
+        if name in member_lookup:
+            return f"<@{member_lookup[name]}>"
         return match.group(0)
-    
-    return re.sub(r"@([\w\s]+)", replace_mention, reply)
+
+    # First handle explicit @mentions
+    reply = re.sub(r"@([\w\s]+)", replace_mention, reply)
+
+    # Then handle names that appear without @ but are clearly addressing someone
+    # Pattern: "Name," at start of sentence or "Name:" for addressing
+    def replace_name_mention(match):
+        name = match.group(1).lower().strip()
+        if name in member_lookup:
+            return f"<@{member_lookup[name]}>"
+        return match.group(0)
+
+    # Match patterns like "Bennn," or "Bennn:" at sentence starts
+    reply = re.sub(r"(?<=^|[.!?]\s)([A-Z][a-zA-Z]+)[,:]", replace_name_mention, reply)
+
+    return reply
 
 
 # ────────────────────────────────────────────────────────────────────────────────

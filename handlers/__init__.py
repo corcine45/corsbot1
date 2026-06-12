@@ -595,7 +595,7 @@ class MessageHandler:
                 active_keys,
             )
 
-        reply = resolve_mentions_in_reply(reply, message.guild)
+        reply = resolve_mentions_in_reply(reply, message.guild, message.author.id)
         await send_reply(message.channel, f"<@{message.author.id}> {reply}")
 
         # Emoji reaction

@@ -10,9 +10,7 @@ def _clean_subject(subject: str) -> str:
     subject = (subject or "").strip()
     if not subject:
         return ""
-    # Spotify song details change constantly; compress to the app, not the track.
-    if subject.lower().startswith("spotify"):
-        return "Spotify"
+    # Keep Spotify song details to show what the user is listening to
     return subject[:80]
 
 
@@ -107,8 +105,10 @@ def describe_activity(activity) -> str:
     if not activity:
         return ""
     name = getattr(activity, "name", "") or ""
-    if name.lower() == "spotify":
-        return "Spotify"
+    details = getattr(activity, "details", "") or ""
+    # For Spotify, include song/artist details if available
+    if name.lower() == "spotify" and details:
+        return f"{name}: {details}"
     return name
 
 
