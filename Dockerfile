@@ -17,7 +17,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip && \
-    python -m pip install --no-cache-dir torch==2.12.0+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
+    python -m pip install --no-cache-dir torch==2.12.0 -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY . .
