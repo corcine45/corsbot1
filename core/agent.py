@@ -74,6 +74,7 @@ class AgentContext:
     feedback_context: str = ""
     impersonation_context: str = ""
     history: list = field(default_factory=list)
+    route: Any = None
 
     # Final output
     reply: str = ""
@@ -421,7 +422,9 @@ class AgentLoop:
             trace.add("search", ms, "error", str(e))
             log.warning("search_failed", query=query, error=str(e))
 
-    async def step_session(self, ctx: AgentContext, trace: AgentTrace):
+    async def step_session(
+        self, ctx: AgentContext, trace: AgentTrace, fetch_context: bool = True
+    ):
         """Step 4: Update conversation state + fetch rolling summary."""
         from .session import (
             add_message,
@@ -437,6 +440,11 @@ class AgentLoop:
 
         t0 = time.perf_counter()
         add_message(ctx.user_id, ctx.content)
+
+        if not fetch_context:
+            ms = (time.perf_counter() - t0) * 1000
+            trace.add("session", ms, "ok", "store-only")
+            return
 
         # Trigger summarization in background if threshold reached
         if should_summarize(ctx.thread_id):
@@ -498,7 +506,7 @@ class AgentLoop:
             (e["content"] for e in reversed(ctx.history) if e["role"] == "user"),
             ctx.content,
         )
-        route = route_message(
+        route = ctx.route or route_message(
             last_user_msg,
             ctx.emotion_state,
             bool(ctx.web_context),
@@ -697,10 +705,26 @@ class AgentLoop:
         t_start = time.perf_counter()
 
         await self.step_classify(ctx, trace)
-        await self.step_memory(ctx, trace)
         await self.step_search(ctx, trace)
-        await self.step_session(ctx, trace)
-        await self.step_user_state(ctx, trace)
+
+        from .ai import route_message
+
+        ctx.route = route_message(
+            ctx.content,
+            ctx.emotion_state,
+            bool(ctx.web_context),
+            history_len=len(ctx.history),
+        )
+        trace.add("route", 0, "ok", ctx.route.route)
+
+        if ctx.route.route == "fast" and not ctx.is_impersonating:
+            trace.add("memory", 0, "skipped", "fast route")
+            await self.step_session(ctx, trace, fetch_context=False)
+            trace.add("user_state", 0, "skipped", "fast route")
+        else:
+            await self.step_memory(ctx, trace)
+            await self.step_session(ctx, trace)
+            await self.step_user_state(ctx, trace)
 
         reply = await self.step_generate(ctx, trace)
         ctx.reply = reply or ""

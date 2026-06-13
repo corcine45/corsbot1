@@ -346,6 +346,27 @@ class MessageHandler:
 
         loop = asyncio.get_running_loop()
 
+        # Quick reply check
+        quick = get_quick_reply(content, self.quick_replies)
+        if quick:
+            attributed_content = f"[{message.author.display_name}]: {content}"
+            await self._store_message_in_threads(
+                loop, [thread_id, personal_thread_id], "user", attributed_content
+            )
+            await loop.run_in_executor(
+                self.executor,
+                store_user_name,
+                message.author.id,
+                message.author.display_name,
+                message.author.name,
+                message.author.nick if hasattr(message.author, "nick") else None,
+            )
+            await message.channel.send(f"<@{message.author.id}> {quick}")
+            await self._store_message_in_threads(
+                loop, [thread_id, personal_thread_id], "assistant", quick
+            )
+            return
+
         # Store message and user identity
         attributed_content = f"[{message.author.display_name}]: {content}"
         await self._store_message_in_threads(
@@ -361,39 +382,6 @@ class MessageHandler:
             message.author.name,
             guild_nick,
         )
-
-        # Quick reply check
-        quick = get_quick_reply(content, self.quick_replies)
-        if quick:
-            await message.channel.send(f"<@{message.author.id}> {quick}")
-            await self._store_message_in_threads(
-                loop, [thread_id, personal_thread_id], "assistant", quick
-            )
-            return
-
-        # Explicit GIF request — mambo anywhere in message
-        gif_request = _extract_gif_request(content)
-        if gif_request:
-            from core.gif import search_gif
-
-            gif_query, gif_count = gif_request
-            sent = 0
-            for _ in range(gif_count):
-                gif_url = await search_gif(gif_query)
-                if gif_url:
-                    await message.channel.send(gif_url)
-                    sent += 1
-                else:
-                    log.warning("gif_not_found", query=gif_query)
-            if sent:
-                await self._store_message_in_threads(
-                    loop,
-                    [thread_id, personal_thread_id],
-                    "assistant",
-                    f"[GIF x{sent}: {gif_query}]",
-                )
-                return
-            # GIF search failed — fall through to normal reply
 
         # Deferred instruction detection — "when X comes online, do Y"
         if message.guild:
