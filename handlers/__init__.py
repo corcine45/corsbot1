@@ -486,22 +486,36 @@ class MessageHandler:
             kw in content.lower() for kw in self.IMPERSONATE_KEYWORDS
         )
 
-        # Fetch context
-        history = await loop.run_in_executor(
-            self.executor, get_history, thread_id, self.config["HISTORY_LIMIT"]
-        )
+        # Fetch context in parallel
         channel_name = (
             message.channel.name if hasattr(message.channel, "name") else "dm"
         )
-        feedback_context = await loop.run_in_executor(
-            self.executor,
-            get_feedback_context,
-            uid_str,
-            message.guild.id if message.guild else None,
-        )
 
-        # Get user activity
-        user_activity, user_status = await self._get_user_presence(message, loop)
+        def _fetch_memory_context():
+            return (
+                get_db()[1]
+                .execute(
+                    "SELECT GROUP_CONCAT(value, ', ') FROM memory WHERE user_id=? LIMIT 5",
+                    (uid_str,),
+                )
+                .fetchone()[0]
+            )
+
+        history, feedback_context, (user_activity, user_status), memory_context = (
+            await asyncio.gather(
+                loop.run_in_executor(
+                    self.executor, get_history, thread_id, self.config["HISTORY_LIMIT"]
+                ),
+                loop.run_in_executor(
+                    self.executor,
+                    get_feedback_context,
+                    uid_str,
+                    message.guild.id if message.guild else None,
+                ),
+                self._get_user_presence(message, loop),
+                loop.run_in_executor(self.executor, _fetch_memory_context),
+            )
+        )
 
         # Build member list for small servers (skip bots)
         server_members = ""
@@ -530,18 +544,6 @@ class MessageHandler:
         )
 
         # Check cache
-        memory_context = await loop.run_in_executor(
-            self.executor,
-            lambda: (
-                get_db()[1]
-                .execute(
-                    "SELECT GROUP_CONCAT(value, ', ') FROM memory WHERE user_id=? LIMIT 5",
-                    (uid_str,),
-                )
-                .fetchone()[0]
-            ),
-        )
-
         history_context = "\n".join(
             f"{entry.get('role', '')}:{entry.get('content', '')[:180]}"
             for entry in history[-6:]
@@ -554,14 +556,16 @@ class MessageHandler:
             history_context=history_context,
         )
         cached_reply = self.response_cache.get(cache_key)
+        agent = None
 
         if cached_reply:
             reply = cached_reply
             active_keys = []
         else:
-            # Run agent
             agent = AgentLoop(self.executor, loop)
-            reply, active_keys = await self._run_agent(message, agent, ctx, loop)
+            reply, active_keys, ctx = await self._run_agent(
+                message, agent, ctx, loop
+            )
             if reply:
                 self.response_cache.set(cache_key, reply)
 
@@ -585,6 +589,9 @@ class MessageHandler:
 
         reply = resolve_mentions_in_reply(reply, message.guild, message.author.id)
         await send_reply(message.channel, f"<@{message.author.id}> {reply}")
+
+        if agent and not cached_reply and reply:
+            await agent.step_post(ctx, None)
 
         # Emoji reaction
         gif_emotion = getattr(ctx, "gif_emotion", None) if not cached_reply else None
@@ -739,7 +746,7 @@ class MessageHandler:
         agent: AgentLoop,
         ctx: AgentContext,
         loop: asyncio.AbstractEventLoop,
-    ) -> tuple[str, list]:
+    ) -> tuple[str, list, AgentContext]:
         """Run the agent and handle errors."""
         typing_ctx = None
         try:
@@ -750,7 +757,7 @@ class MessageHandler:
 
         try:
             ctx, trace = await agent.run(ctx)
-            return ctx.reply, ctx.active_keys
+            return ctx.reply, ctx.active_keys, ctx
         except Exception as e:
             err = str(e)
             if "429" in err or "rate_limit" in err.lower():
@@ -769,7 +776,7 @@ class MessageHandler:
                     guild_id=message.guild.id if message.guild else None,
                     error=str(e),
                 )
-            return "", []
+            return "", [], ctx
         finally:
             if typing_ctx is not None:
                 try:

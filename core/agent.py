@@ -191,15 +191,28 @@ class AgentLoop:
             get_relationships,
             search_memory_by_value,
         )
+        from .presence import get_presence_patterns
 
-        # Core memory
-        result = await self._step(
-            trace,
-            "memory",
-            self._run_sync(get_memory_with_keys, ctx.user_id, ctx.content, 3),
+        mem_result, reflection, presence_patterns = await asyncio.gather(
+            self._step(
+                trace,
+                "memory",
+                self._run_sync(get_memory_with_keys, ctx.user_id, ctx.content, 3),
+            ),
+            self._step(
+                trace, "reflection", self._run_sync(get_reflection, ctx.uid_str)
+            ),
+            self._step(
+                trace,
+                "presence_patterns",
+                self._run_sync(get_presence_patterns, ctx.uid_str),
+            ),
         )
-        if result:
-            ctx.memory, ctx.active_keys = result
+
+        if mem_result:
+            ctx.memory, ctx.active_keys = mem_result
+        ctx.reflection = reflection or ""
+        ctx.presence_patterns = presence_patterns or ""
 
         # Impersonation: swap memory for target user's facts
         if ctx.is_impersonating and ctx.mentioned_users:
@@ -333,21 +346,6 @@ class AgentLoop:
                     ctx.relationships = (ctx.relationships + "\n" + cross).strip()
         else:
             trace.add("relationships", 0, "skipped")
-
-        # Reflection
-        reflection = await self._step(
-            trace, "reflection", self._run_sync(get_reflection, ctx.uid_str)
-        )
-        ctx.reflection = reflection or ""
-
-        from .presence import get_presence_patterns
-
-        presence_patterns = await self._step(
-            trace,
-            "presence_patterns",
-            self._run_sync(get_presence_patterns, ctx.uid_str),
-        )
-        ctx.presence_patterns = presence_patterns or ""
 
     async def step_search(self, ctx: AgentContext, trace: AgentTrace):
         """Step 3: Web search if the message needs real-time info."""
@@ -493,8 +491,7 @@ class AgentLoop:
         still returns the original draft.
         """
         from .ai import (
-            _analyze_intent,
-            _make_plan,
+            _analyze_and_plan,
             _reason,
             _should_plan,
             _verify_reply,
@@ -529,14 +526,18 @@ class AgentLoop:
             if lines:
                 task_hint += f"\nRecent clue lines:\n{lines}"
 
-        # ── Steps 5+6: Reason + Intent (parallel) ───────────────────────
-        # Both are independent — run concurrently to save ~150-180ms.
+        # ── Steps 5-7: Reason + analyze/plan (parallel where possible) ──
         reasoning = ""
         analysis = ""
+        plan = ""
         if do_plan:
             has_context = any(
                 [ctx.memory, ctx.relationships, ctx.web_context, ctx.reflection]
             )
+            analysis_input = last_user_msg
+            if task_hint:
+                analysis_input += "\n\n" + task_hint
+
             t0 = time.perf_counter()
             try:
                 coros = []
@@ -553,20 +554,16 @@ class AgentLoop:
                         )
                     )
                 else:
-                    coros.append(
-                        asyncio.coroutine(lambda: "")() if False else asyncio.sleep(0)
-                    )
-
-                analysis_input = last_user_msg
-                if task_hint:
-                    analysis_input += "\n\n" + task_hint
+                    coros.append(asyncio.sleep(0))
 
                 coros.append(
                     self._run_sync(
-                        _analyze_intent,
+                        _analyze_and_plan,
                         analysis_input,
                         ctx.emotion_state,
                         ctx.session_context,
+                        ctx.emotion_hint,
+                        ctx.reflection,
                     )
                 )
 
@@ -574,47 +571,28 @@ class AgentLoop:
 
                 if has_context:
                     reasoning = results[0] if isinstance(results[0], str) else ""
-                    analysis = results[1] if isinstance(results[1], str) else ""
+                    plan_result = results[1] if isinstance(results[1], tuple) else ("", "")
                 else:
-                    analysis = results[1] if isinstance(results[1], str) else ""
+                    plan_result = results[1] if isinstance(results[1], tuple) else ("", "")
+
+                analysis, plan = plan_result
+                if reasoning and plan:
+                    plan = f"Reasoning:\n{reasoning}\n\n{plan}"
 
                 ms = (time.perf_counter() - t0) * 1000
                 trace.add(
                     "reason", ms, "ok", reasoning[:60] if reasoning else "skipped"
                 )
                 trace.add("intent", ms, "ok", analysis[:60] if analysis else "empty")
+                trace.add("plan", ms, "ok", plan[:60] if plan else "empty")
             except Exception as e:
                 ms = (time.perf_counter() - t0) * 1000
                 trace.add("reason", ms, "failed", str(e)[:60])
                 trace.add("intent", ms, "failed", str(e)[:60])
+                trace.add("plan", ms, "failed", str(e)[:60])
         else:
             trace.add("reason", 0, "skipped")
             trace.add("intent", 0, "skipped")
-
-        # ── Step 7: Plan ─────────────────────────────────────────────────
-        # Turn analysis + reasoning into a concrete response plan.
-        plan = ""
-        if do_plan and analysis:
-            # Merge reasoning into the plan context
-            plan_context = analysis
-            if reasoning:
-                plan_context = f"{analysis}\n\nReasoning:\n{reasoning}"
-            if task_hint:
-                plan_context = (plan_context + "\n\n" + task_hint).strip()
-            t0 = time.perf_counter()
-            try:
-                plan = await self._run_sync(
-                    _make_plan,
-                    plan_context,
-                    ctx.emotion_hint,
-                    ctx.reflection,
-                )
-                ms = (time.perf_counter() - t0) * 1000
-                trace.add("plan", ms, "ok", plan[:60] if plan else "empty")
-            except Exception as e:
-                ms = (time.perf_counter() - t0) * 1000
-                trace.add("plan", ms, "failed", str(e)[:60])
-        else:
             trace.add("plan", 0, "skipped")
 
         # ── Step 8: Draft ────────────────────────────────────────────────
@@ -654,8 +632,13 @@ class AgentLoop:
             return None
 
         # ── Step 9: Human check + rewrite ────────────────────────────────
-        # Planned replies get one cheap check for tone, context, and genericness.
-        if do_plan and analysis:
+        # Skip for low-stakes default-route replies — saves one LLM round trip.
+        skip_safety = route.route == "default" and (
+            len(last_user_msg.split()) < 12
+            and "emotional_weight: high" not in (analysis or "").lower()
+            and "response_type: empathy" not in (analysis or "").lower()
+        )
+        if do_plan and analysis and not skip_safety:
             t0 = time.perf_counter()
             try:
                 verified = await self._run_sync(
@@ -677,8 +660,8 @@ class AgentLoop:
 
         return result
 
-    async def step_post(self, ctx: AgentContext, trace: AgentTrace):
-        """Step 6: Pick GIF based on message emotion."""
+    async def step_post(self, ctx: AgentContext, trace: AgentTrace | None = None):
+        """Pick GIF based on message emotion. Call after the text reply is sent."""
         from .emotion import pick_gif_for_message
 
         t0 = time.perf_counter()
@@ -691,7 +674,8 @@ class AgentLoop:
             ctx.gif_emotion = None
             log.warning("gif_failed", user_id=ctx.user_id, error=str(e))
         ms = (time.perf_counter() - t0) * 1000
-        trace.add("post", ms, "ok", ctx.gif_emotion or "no gif")
+        if trace is not None:
+            trace.add("post", ms, "ok", ctx.gif_emotion or "no gif")
 
     # ── Main run ─────────────────────────────────────────────────────────── #
 
@@ -722,19 +706,19 @@ class AgentLoop:
             await self.step_session(ctx, trace, fetch_context=False)
             trace.add("user_state", 0, "skipped", "fast route")
         else:
-            await self.step_memory(ctx, trace)
-            await self.step_session(ctx, trace)
+            await asyncio.gather(
+                self.step_memory(ctx, trace),
+                self.step_session(ctx, trace),
+            )
             await self.step_user_state(ctx, trace)
 
         reply = await self.step_generate(ctx, trace)
         ctx.reply = reply or ""
 
         if ctx.reply:
-            # Track bot's response in session for future message context
             from .session import add_bot_message
 
             await self._run_sync(add_bot_message, ctx.user_id, ctx.reply)
-            await self.step_post(ctx, trace)
         else:
             trace.add("post", 0, "skipped", "no reply")
 

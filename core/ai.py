@@ -784,7 +784,7 @@ class RouteResult:
     def __init__(self, model: str, max_tokens: int, route: str):
         self.model = model
         self.max_tokens = max_tokens
-        self.route = route  # "fast" | "empathy" | "search" | "default"
+        self.route = route  # "fast" | "light" | "empathy" | "search" | "default"
 
 
 def route_message(
@@ -798,10 +798,11 @@ def route_message(
     2. empathy  — depressed / anxious / lonely → full model, higher token budget
     3. greeting — pure greeting with NO conversation history → fast model
     4. fast     — very short casual, no question, no active conversation
-    5. default  — everything else → full model, standard budget
+    5. light    — short casual follow-ups in an active thread (still uses history)
+    6. default  — everything else → full model, scaled token budget
 
-    Key rule: if there's conversation history, even short messages use the full
-    model — "nf3" in a chess game needs context, not a fast route.
+    Key rule: ambiguous short replies like chess moves skip the light route because
+    they don't match casual triggers — "nf3" stays on the full model.
     """
     # 1. Search route
     if has_web_context:
@@ -838,8 +839,19 @@ def route_message(
     ):
         return RouteResult(_MODEL_FAST, 180, "fast")
 
-    # 5. Default — full model
-    return RouteResult(_MODEL_DEFAULT, 768, "default")
+    # 5. Light route — quick banter mid-conversation (8b + history, no planning)
+    if (
+        history_len > 0
+        and word_count <= 6
+        and has_casual
+        and not has_deep
+        and not is_question
+    ):
+        return RouteResult(_MODEL_FAST, 140, "light")
+
+    # 6. Default — full model, tighter budget for shorter messages
+    max_tokens = 768 if word_count >= 25 else 512 if word_count >= 12 else 384
+    return RouteResult(_MODEL_DEFAULT, max_tokens, "default")
 
 
 # ---------------- MULTI-STEP PLANNING PIPELINE ---------------- #
@@ -908,6 +920,75 @@ def _analyze_intent(
     except Exception as e:
         log.warning(f"[plan] analyze failed: {e}")
         return ""
+
+
+def _analyze_and_plan(
+    message: str,
+    emotion_state: str | None,
+    session_context: str,
+    emotion_hint: str,
+    reflection: str,
+) -> tuple[str, str]:
+    """
+    Combined intent analysis + response plan in one LLM call (~150ms saved vs two calls).
+    Returns (analysis, plan).
+    """
+    context_block = (
+        f"\nConversation state: {session_context}" if session_context else ""
+    )
+    emotion_block = f"\nDetected emotion: {emotion_state}" if emotion_state else ""
+    tone_block = f"\nTone guidance: {emotion_hint}" if emotion_hint else ""
+    insight_block = f"\nUser insight: {reflection}" if reflection else ""
+    try:
+        content, _ = groq_call(
+            _PLAN_MODEL,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Analyze this Discord message and write a brief response plan for a chill bot. "
+                        "Think like a perceptive friend, not customer support.\n"
+                        "Output EXACTLY two sections:\n\n"
+                        "ANALYSIS:\n"
+                        "intent: <what the user wants>\n"
+                        "subtext: <what they may mean emotionally — or 'none'>\n"
+                        "emotional_weight: <low | medium | high>\n"
+                        "needs_acknowledgment: <yes | no>\n"
+                        "response_type: <banter | information | advice | empathy | opinion | roleplay | guessing_game>\n"
+                        "stance: <agree | mostly agree | gently push back | ask curious follow-up | answer directly>\n"
+                        "human_move: <validate | joke | clarify | answer | reassure | challenge lightly>\n\n"
+                        "PLAN:\n"
+                        "tone: <casual and direct | playful | blunt | empathetic | dry humor>\n"
+                        "open_with: <answer directly | match energy | quick reaction | validate first>\n"
+                        "include: <what to cover — 1 short phrase>\n"
+                        "avoid: <what NOT to do — 1 short phrase>\n"
+                        "length: <1 sentence | 1-2 sentences | 2-3 sentences>\n"
+                        "One short phrase per field. No extra explanation. "
+                        "Do not over-classify casual chat as emotional."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Message: {message}{emotion_block}{context_block}"
+                        f"{tone_block}{insight_block}"
+                    ),
+                },
+            ],
+            max_tokens=220,
+            retries=1,
+            timeout=8,
+        )
+        text = (content or "").strip()
+        if "PLAN:" in text.upper():
+            idx = text.upper().index("PLAN:")
+            analysis = text[:idx].replace("ANALYSIS:", "", 1).strip()
+            plan = text[idx:].replace("PLAN:", "", 1).strip()
+            return analysis, plan
+        return text, ""
+    except Exception as e:
+        log.warning(f"[plan] analyze_and_plan failed: {e}")
+        return "", ""
 
 
 def _make_plan(analysis: str, emotion_hint: str, reflection: str) -> str:
@@ -1057,7 +1138,7 @@ def _should_plan(
 
     Short casual messages on the default route (e.g. "nf3", "same bro") don't need planning.
     """
-    if route.route == "fast":
+    if route.route in ("fast", "light"):
         return False
 
     # Always plan for empathy and search
@@ -1340,7 +1421,7 @@ def groq_call(
 
 
 def main_chat_call(route: RouteResult, messages: list) -> tuple[str, int, str]:
-    if settings.gemini_api_key and route.route != "fast":
+    if settings.gemini_api_key and route.route not in ("fast", "light"):
         try:
             content, tokens = gemini_call(
                 GEMINI_MODEL, messages, max_tokens=route.max_tokens
