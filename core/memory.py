@@ -590,19 +590,29 @@ _PROMPT_EXCLUDED_KEYS = {
 }
 
 
-def _is_about_other_person(key: str, value: str) -> bool:
+def _is_about_other_person(key: str, value: str, query: str = "") -> bool:
     """
     Returns True if this fact appears to be about another person rather than the user.
     Keys like 'bennn_aura', 'crisumiles_role', or values referencing other people
     should not be injected into the prompt as facts about the current user.
+
+    However, if the query explicitly mentions a person name, allow facts about that person.
     """
     # If the key contains an underscore and the prefix looks like a name (capitalized word)
     # it was probably stored as "PersonName_attribute"
     import re as _re
 
-    if _re.match(r"^[a-z]{3,}[_][a-z]", key):
-        return True
-    return False
+    if not _re.match(r"^[a-z]{3,}[_][a-z]", key):
+        return False
+
+    # Extract the person name from the key (prefix before underscore)
+    person_name = key.split("_")[0]
+
+    # If the query mentions this person, allow the fact
+    if query and person_name.lower() in query.lower():
+        return False
+
+    return True
 
 
 def _deduplicate_facts(
@@ -1455,7 +1465,7 @@ def get_memory(user_id, query: str = "", top_k: int = 8) -> str:
     ) in fact_lookup.items():
         if key in _PROMPT_EXCLUDED_KEYS:
             continue
-        if _is_about_other_person(key, value):
+        if _is_about_other_person(key, value, query):
             continue
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
@@ -1585,7 +1595,7 @@ def get_memory_prioritized(
     for key, (value, memory_type, updated_at, reinforcement) in fact_lookup.items():
         if key in _PROMPT_EXCLUDED_KEYS:
             continue
-        if _is_about_other_person(key, value):
+        if _is_about_other_person(key, value, query):
             continue
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
@@ -1776,7 +1786,7 @@ def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
     ) in fact_lookup.items():
         if key in _PROMPT_EXCLUDED_KEYS:
             continue
-        if _is_about_other_person(key, value):
+        if _is_about_other_person(key, value, query):
             continue
         half_life = DECAY.get(memory_type)
         if half_life and (now - updated_at) > half_life * 3:
