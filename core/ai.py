@@ -810,7 +810,7 @@ def route_message(
 
     # 2. Empathy route
     if emotion_state in _EMPATHY_STATES:
-        return RouteResult(_MODEL_EMPATHY, 300, "empathy")
+        return RouteResult(_MODEL_EMPATHY, 512, "empathy")
 
     lower = content.lower().strip()
     words = lower.split()
@@ -850,7 +850,7 @@ def route_message(
         return RouteResult(_MODEL_FAST, 140, "light")
 
     # 6. Default — full model, tighter budget for shorter messages
-    max_tokens = 768 if word_count >= 25 else 512 if word_count >= 12 else 384
+    max_tokens = 1024 if word_count >= 25 else 768 if word_count >= 12 else 512
     return RouteResult(_MODEL_DEFAULT, max_tokens, "default")
 
 
