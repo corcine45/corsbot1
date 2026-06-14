@@ -23,7 +23,18 @@ try:
 except ImportError:  # pragma: no cover - handled at runtime for clearer user feedback.
     yt_dlp = None
 
-from core.db import get_db, get_thread_id, get_token_stats
+from core.db import get_db, get_guild_token_stats, get_thread_id, get_token_stats
+from core.guild_settings import (
+    get_guild_settings,
+    memory_user_key,
+    toggle_channel_opt_out,
+    update_guild_settings,
+)
+from core.music_store import delete_guild_music, load_all_music, save_guild_music
+from core.reminders import get_user_pending_reminders, store_reminder
+from core.traces import get_last_guild_trace, get_recent_guild_traces
+from core.transcribe import transcribe_discord_attachment
+from core.weekly_dm import set_weekly_dm_preference
 from core.feedback import (
     get_feedback_stats,
     get_last_reply,
@@ -33,7 +44,7 @@ from core.feedback import (
 )
 from core.memory import delete_denied_fact
 from models import DenialConfirmView
-from utils import send_interaction
+from utils import resolve_message_channel, send_interaction
 
 log = logging.getLogger("corsbot.handlers.commands")
 
@@ -150,6 +161,7 @@ class CommandsHandler:
         self.idle_disconnect_tasks: dict[int, asyncio.Task] = {}
         self.started_at = time.time()
         self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS) if yt_dlp else None
+        self._load_persisted_music()
     
     def register_all(self):
         """Register all slash commands."""
@@ -162,6 +174,10 @@ class CommandsHandler:
         self.tree.command(name="ratings", description="See your rating history for Corsbot")(self.ratings)
         self.tree.command(name="tokens", description="Show your API token usage")(self.tokens)
         self.tree.command(name="dashboard", description="Show activity dashboard for the bot")(self.dashboard)
+        self.tree.command(name="remind", description="Set a reminder to ping you later")(self.remind)
+        self.tree.command(name="reminders", description="List your pending reminders")(self.reminders)
+        self.tree.command(name="transcribe", description="Transcribe audio from a replied message")(self.transcribe)
+        self.tree.command(name="memory-digest", description="Toggle weekly memory recap DMs")(self.memory_digest)
         self.tree.command(name="reset", description="Clear your conversation history with Corsbot")(self.reset)
         self.tree.command(name="play", description="Play music in your current voice channel")(self.play)
         self.tree.command(name="queue", description="Show the current music queue")(self.queue)
@@ -173,6 +189,8 @@ class CommandsHandler:
         self.tree.command(name="musicremember", description="Tell Corsbot a favorite song, artist, or genre")(self.musicremember)
         self.tree.command(name="recommend", description="Pick music from your likes, history, or a vibe")(self.recommend)
         self.tree.command(name="botstatus", description="Show uptime, latency, and music status")(self.botstatus)
+        self.tree.command(name="trace", description="Show recent agent pipeline traces (admin)")(self.trace)
+        self.tree.command(name="serverconfig", description="Configure per-server bot behavior (admin)")(self.serverconfig)
         self.tree.command(name="online", description="Show who's currently online in the server")(self.online)
         self.tree.command(name="help", description="Show all Corsbot commands")(self.help_command)
 
@@ -464,7 +482,15 @@ class CommandsHandler:
 
         self._cancel_idle_disconnect(guild_id)
         track = queue.pop(0)
+        try:
+            track = await self._ensure_stream(track)
+        except Exception:
+            log.warning("Failed to re-resolve track in guild %s", guild_id)
+            await self._play_next(guild_id)
+            return
+
         self.now_playing[guild_id] = track
+        self._persist_music(guild_id)
 
         try:
             source = discord.FFmpegPCMAudio(track["stream_url"], **FFMPEG_OPTIONS)
@@ -473,13 +499,37 @@ class CommandsHandler:
             log.exception("Failed to start music playback in guild %s", guild_id)
             await self._play_next(guild_id)
     
+    def _load_persisted_music(self):
+        for guild_id, data in load_all_music().items():
+            self.music_queues[guild_id] = data.get("queue") or []
+            if data.get("now_playing"):
+                self.now_playing[guild_id] = data["now_playing"]
+
+    def _persist_music(self, guild_id: int):
+        save_guild_music(
+            guild_id,
+            self.music_queues.get(guild_id, []),
+            self.now_playing.get(guild_id),
+        )
+
+    async def _ensure_stream(self, track: dict) -> dict:
+        if track.get("stream_url"):
+            return track
+        query = track.get("search_query") or track.get("webpage_url") or track.get("title")
+        if not query:
+            raise RuntimeError("No query to re-resolve track")
+        fresh = await self._extract_track(query)
+        track.update(fresh)
+        return track
+
     async def memory(self, interaction: discord.Interaction):
         """Show all stored memories for the user."""
         user_id = interaction.user.id
+        scoped_id = memory_user_key(user_id, interaction.guild_id)
         _, cursor = get_db()
         cursor.execute(
             "SELECT key, value, memory_type, reinforcement, updated_at FROM memory WHERE user_id=? ORDER BY memory_type, key",
-            (str(user_id),),
+            (scoped_id,),
         )
         rows = cursor.fetchall()
         
@@ -624,7 +674,7 @@ class CommandsHandler:
             apply_good_rating(str(user_id), entry["mood"], entry["memory_keys"])
             await interaction.response.send_message("glad you liked it 🙏", ephemeral=True)
         else:
-            apply_bad_rating(str(user_id), entry["mood"])
+            apply_bad_rating(str(user_id), entry["mood"], entry["memory_keys"])
             await interaction.response.send_message("noted, i'll do better 🫡", ephemeral=True)
     
     async def ratings(self, interaction: discord.Interaction):
@@ -660,56 +710,110 @@ class CommandsHandler:
     
     async def dashboard(self, interaction: discord.Interaction):
         """Show activity dashboard (admin only)."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "Use `/dashboard` in a server.", ephemeral=True
+            )
+            return
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("Admins only 🔒", ephemeral=True)
             return
-        
+
+        guild_id = interaction.guild_id
+        guild_prefix = f"guild:{guild_id}%"
         _, cursor = get_db()
-        cursor.execute("SELECT content FROM messages WHERE role='user'")
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM messages WHERE thread_id LIKE ? AND role='user'",
+            (guild_prefix,),
+        )
+        guild_messages = cursor.fetchone()[0]
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM memory WHERE user_id IN (SELECT DISTINCT user_id FROM messages WHERE thread_id LIKE ?)",
+            (guild_prefix,),
+        )
+        # Simpler: count memory for guild members
+        member_ids = [m.id for m in interaction.guild.members if not m.bot]
+        memory_facts = 0
+        if member_ids:
+            placeholders = ",".join("?" for _ in member_ids)
+            cursor.execute(
+                f"SELECT COUNT(*) FROM memory WHERE user_id IN ({placeholders})",
+                [str(mid) for mid in member_ids],
+            )
+            memory_facts = cursor.fetchone()[0]
+
+        from core.reminders import count_pending_reminders
+
+        pending_reminders = count_pending_reminders(guild_id)
+
+        token_stats = get_guild_token_stats(guild_id, member_ids)
+
+        cursor.execute(
+            "SELECT rating, COUNT(*) FROM feedback WHERE guild_id=? GROUP BY rating",
+            (str(guild_id),),
+        )
+        feedback_rows = dict(cursor.fetchall())
+        good = feedback_rows.get("good", 0)
+        bad = feedback_rows.get("bad", 0)
+
+        cursor.execute("SELECT content FROM messages WHERE role='user' AND thread_id LIKE ?", (guild_prefix,))
         rows = cursor.fetchall()
-        
-        # Count users
+
         user_counts = Counter()
         for (content,) in rows:
             match = re.match(r"^\[([^\]]+)\]:", content)
             if match:
                 user_counts[match.group(1)] += 1
-        
+
         top_users = user_counts.most_common(5)
-        
-        # Top topics
+
         cursor.execute(
             "SELECT key, COUNT(*) FROM memory GROUP BY key ORDER BY COUNT(*) DESC LIMIT 5"
         )
         top_topics = cursor.fetchall()
-        
-        # Top relationships
+
         cursor.execute(
             "SELECT relation, COUNT(*) FROM relationships GROUP BY relation ORDER BY COUNT(*) DESC LIMIT 5"
         )
         top_relations = cursor.fetchall()
-        
-        lines = ["📊 **Dashboard**"]
-        
+
+        last_trace = get_last_guild_trace(guild_id)
+
+        lines = [
+            "📊 **Server Dashboard**",
+            f"💬 Messages: **{guild_messages:,}**",
+            f"🧠 Memory facts (members): **{memory_facts:,}**",
+            f"⏰ Pending reminders: **{pending_reminders}**",
+            f"🪙 Tokens today: **{token_stats['today']:,}** · total **{token_stats['total']:,}**",
+            f"⭐ Ratings: ✅ {good} · ❌ {bad}",
+        ]
+
         if top_users:
-            lines.append("**Most active users:**")
+            lines.append("\n**Most active users:**")
             for name, count in top_users:
                 lines.append(f"• {name}: {count} messages")
         else:
-            lines.append("No user activity recorded yet.")
-        
+            lines.append("\nNo user activity recorded yet.")
+
         if top_topics:
-            lines.append("\n**Popular topics:**")
+            lines.append("\n**Popular memory keys:**")
             for key, count in top_topics:
                 lines.append(f"• {key}: {count} facts")
-        else:
-            lines.append("\nNo memory topics recorded yet.")
-        
+
         if top_relations:
             lines.append("\n**Common relationships:**")
             for relation, count in top_relations:
                 lines.append(f"• {relation}: {count} mentions")
-        
+
+        if last_trace:
+            ago = int(time.time() - last_trace["created_at"])
+            lines.append(
+                f"\n**Last agent trace** ({ago}s ago, {last_trace['latency_ms']}ms, route={last_trace['route']}):"
+            )
+            lines.append(f"`{last_trace['trace_summary'][:300]}`")
+
         await send_interaction(interaction, "\n".join(lines))
     
     @app_commands.describe(query="Song name, search terms, a vibe, or a YouTube/SoundCloud URL")
@@ -780,6 +884,7 @@ class CommandsHandler:
         track["requested_by"] = interaction.user.id
         self.music_queues.setdefault(guild_id, []).append(track)
         self._cancel_idle_disconnect(guild_id)
+        self._persist_music(guild_id)
         self._remember_recent_track(interaction.user.id, track)
 
         note = f"\n_{reason}_" if reason else ""
@@ -927,6 +1032,7 @@ class CommandsHandler:
         self._cancel_idle_disconnect(guild_id)
         self.music_queues.pop(guild_id, None)
         self.now_playing.pop(guild_id, None)
+        delete_guild_music(guild_id)
 
         voice_client = interaction.guild.voice_client
         if voice_client:
@@ -938,7 +1044,7 @@ class CommandsHandler:
             await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
 
     async def botstatus(self, interaction: discord.Interaction):
-        """Show uptime, latency, and music status."""
+        """Show uptime, latency, music, and pipeline health."""
         uptime = self._format_duration(time.time() - self.started_at)
         latency_ms = round(self.client.latency * 1000) if self.client.latency else 0
         guild_count = len(self.client.guilds)
@@ -948,12 +1054,15 @@ class CommandsHandler:
             if guild.voice_client and guild.voice_client.is_connected()
         )
 
+        from core.reminders import count_pending_reminders
+
         lines = [
             "**Corsbot status**",
             f"Uptime: **{uptime}**",
             f"Latency: **{latency_ms} ms**",
             f"Servers: **{guild_count}**",
             f"Voice sessions: **{music_servers}**",
+            f"Pending reminders: **{count_pending_reminders()}**",
             f"yt-dlp: **{'ready' if self.ytdl else 'missing'}**",
             f"ffmpeg: **{'ready' if shutil.which('ffmpeg') else 'missing'}**",
             f"Gemini: **{'ready' if settings.gemini_api_key else 'not configured'}**",
@@ -967,7 +1076,122 @@ class CommandsHandler:
             else:
                 lines.append(f"Here: idle with **{queue_len}** queued")
 
+            gs = get_guild_settings(interaction.guild.id)
+            if gs.get("personality"):
+                lines.append(f"Server personality: **{gs['personality']}**")
+            if gs.get("memory_isolated"):
+                lines.append("Memory: **isolated per server**")
+
+            last_trace = get_last_guild_trace(interaction.guild.id)
+            if last_trace:
+                ago = int(time.time() - last_trace["created_at"])
+                lines.append(
+                    f"Last trace ({ago}s ago, {last_trace['latency_ms']}ms, {last_trace['route']}):"
+                )
+                lines.append(f"`{last_trace['trace_summary'][:220]}`")
+
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    async def trace(self, interaction: discord.Interaction):
+        """Show recent agent pipeline traces (admin only)."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "Use `/trace` in a server.", ephemeral=True
+            )
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Admins only 🔒", ephemeral=True)
+            return
+
+        traces = get_recent_guild_traces(interaction.guild.id, limit=3)
+        if not traces:
+            await interaction.response.send_message(
+                "No agent traces recorded for this server yet.", ephemeral=True
+            )
+            return
+
+        lines = ["**Recent agent traces**"]
+        for i, trace in enumerate(traces, 1):
+            ago = int(time.time() - trace["created_at"])
+            lines.append(
+                f"\n**#{i}** — <@{trace['user_id']}> · {trace['latency_ms']}ms · route `{trace['route']}` · {ago}s ago"
+            )
+            lines.append(f"`{trace['trace_summary'][:350]}`")
+
+        await send_interaction(interaction, "\n".join(lines))
+
+    @app_commands.describe(
+        personality="Override server personality (default = auto)",
+        memory_isolated="Keep memories separate per server",
+        opt_out_channel="Opt this channel out of bot replies",
+    )
+    @app_commands.choices(
+        personality=[
+            app_commands.Choice(name="Auto (default)", value=""),
+            app_commands.Choice(name="Casual", value="casual"),
+            app_commands.Choice(name="Supportive", value="supportive"),
+            app_commands.Choice(name="Chaotic", value="chaotic"),
+            app_commands.Choice(name="Analytical", value="analytical"),
+            app_commands.Choice(name="Playful", value="playful"),
+            app_commands.Choice(name="Serious", value="serious"),
+        ]
+    )
+    async def serverconfig(
+        self,
+        interaction: discord.Interaction,
+        personality: app_commands.Choice[str] | None = None,
+        memory_isolated: bool | None = None,
+        opt_out_channel: bool | None = None,
+    ):
+        """Configure per-server bot behavior (admin only)."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "Use `/serverconfig` in a server.", ephemeral=True
+            )
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Admins only 🔒", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        changes = []
+
+        if personality is not None:
+            update_guild_settings(guild_id, personality=personality.value)
+            label = personality.value or "auto"
+            changes.append(f"personality → **{label}**")
+
+        if memory_isolated is not None:
+            update_guild_settings(guild_id, memory_isolated=memory_isolated)
+            changes.append(
+                f"memory isolation → **{'on' if memory_isolated else 'off'}**"
+            )
+
+        if opt_out_channel is not None:
+            toggle_channel_opt_out(guild_id, interaction.channel_id, opt_out_channel)
+            changes.append(
+                f"this channel → **{'opted out' if opt_out_channel else 'opted in'}**"
+            )
+
+        if not changes:
+            gs = get_guild_settings(guild_id)
+            await interaction.response.send_message(
+                "\n".join(
+                    [
+                        "**Server config**",
+                        f"Personality: **{gs.get('personality') or 'auto'}**",
+                        f"Memory isolated: **{'yes' if gs.get('memory_isolated') else 'no'}**",
+                        "Use options to change settings.",
+                    ]
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Updated:\n" + "\n".join(f"• {c}" for c in changes),
+            ephemeral=True,
+        )
 
     async def online(self, interaction: discord.Interaction):
         """Show who's currently online in the server."""
@@ -1009,15 +1233,95 @@ class CommandsHandler:
 
         await send_interaction(interaction, "\n".join(lines), ephemeral=False)
 
+    @app_commands.describe(
+        minutes="How many minutes until the reminder",
+        message="What to remind you about",
+    )
+    async def remind(self, interaction: discord.Interaction, minutes: int, message: str):
+        """Set a timed reminder."""
+        if minutes < 1 or minutes > 10080:
+            await interaction.response.send_message(
+                "Set between 1 minute and 7 days (10080 min).", ephemeral=True
+            )
+            return
+        fire_at = time.time() + (minutes * 60)
+        store_reminder(
+            interaction.user.id,
+            interaction.guild_id,
+            interaction.channel_id,
+            message.strip(),
+            fire_at,
+        )
+        await interaction.response.send_message(
+            f"⏰ I'll ping you in **{minutes}** min: {message.strip()[:200]}",
+            ephemeral=False,
+        )
+
+    async def reminders(self, interaction: discord.Interaction):
+        """List pending reminders."""
+        pending = get_user_pending_reminders(interaction.user.id)
+        if not pending:
+            await interaction.response.send_message(
+                "No pending reminders.", ephemeral=True
+            )
+            return
+        lines = ["⏰ **Your reminders:**"]
+        for rem in pending:
+            mins_left = max(0, round((rem["fire_at"] - time.time()) / 60))
+            lines.append(f"• `#{rem['id']}` in ~{mins_left}m — {rem['message'][:80]}")
+        lines.append("\nUse `/remind` to add more.")
+        await send_interaction(interaction, "\n".join(lines))
+
+    @app_commands.describe(enabled="Turn weekly memory recap DMs on or off")
+    async def memory_digest(self, interaction: discord.Interaction, enabled: bool):
+        """Toggle weekly memory recap DMs."""
+        set_weekly_dm_preference(interaction.user.id, enabled)
+        if enabled:
+            msg = "Weekly memory recaps are **on** — I'll DM you what I remember about once a week."
+        else:
+            msg = "Weekly memory recaps are **off**. `/memory-digest enabled:True` to turn back on."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    async def transcribe(self, interaction: discord.Interaction):
+        """Transcribe the most recent audio attachment in this channel."""
+        await interaction.response.defer(ephemeral=True)
+
+        parts = []
+        target_author = None
+        async for msg in interaction.channel.history(limit=25):
+            if not msg.attachments:
+                continue
+            for attachment in msg.attachments:
+                text = await transcribe_discord_attachment(attachment)
+                if text:
+                    target_author = msg.author.display_name
+                    parts.append(text)
+            if parts:
+                break
+
+        if not parts:
+            await interaction.followup.send(
+                "No recent audio found in this channel to transcribe.",
+                ephemeral=True,
+            )
+            return
+
+        transcript = "\n".join(parts)
+        await interaction.followup.send(
+            f"🎙️ **Transcript** ({target_author}):\n{transcript[:1900]}",
+            ephemeral=True,
+        )
+
     async def reset(self, interaction: discord.Interaction):
         """Clear conversation history."""
         user_id = interaction.user.id
-        is_dm = isinstance(interaction.channel, discord.DMChannel)
+        ch = resolve_message_channel(interaction.channel)
         thread_id = get_thread_id(
             user_id,
-            interaction.guild_id if interaction.guild else None,
-            interaction.channel_id,
-            is_dm,
+            ch["guild_id"],
+            ch["channel_id"],
+            ch["is_dm"],
+            discord_thread_id=ch["discord_thread_id"],
         )
         
         conn, cursor = get_db()
@@ -1038,7 +1342,11 @@ class CommandsHandler:
             "`/forgetall` — wipe all your memories",
             "`/reset` — clear your conversation history",
             "`/stats` — conversation and memory stats",
-            "`/dashboard` — show activity dashboard",
+            "`/dashboard` — server activity dashboard (admin)",
+            "`/remind` — set a timed reminder",
+            "`/reminders` — list your pending reminders",
+            "`/memory-digest` — toggle weekly memory recap DMs",
+            "`/transcribe` — transcribe audio (also auto on voice messages)",
             "`/relationships` — see who I know about in your life",
             "`/online` — show who's currently online in the server",
             "`/play <song or url>` — play music in your voice channel",
@@ -1047,12 +1355,21 @@ class CommandsHandler:
             "`/resume` - resume paused music",
             "`/skip` — skip the current song",
             "`/stop` — stop music and leave voice",
-            "`/botstatus` - uptime, latency, and music status",
+            "`/musiclike` — save the current song to your likes",
+            "`/musicremember` — tell me a favorite song or genre",
+            "`/recommend` — music pick from your taste or a vibe",
+            "`/botstatus` - uptime, latency, traces, and music status",
+            "`/trace` — recent agent pipeline traces (admin)",
+            "`/serverconfig` — per-server personality, memory, opt-out (admin)",
             "`/rate` — rate my last reply",
             "`/ratings` — see your rating history",
             "`/tokens` — show your API token usage",
             "`/help` — show this list",
             "",
-            "💡 **Tip**: Say 'when <name> comes online, tell them <message>' to set a delayed message!",
+            "💡 **Tips**:",
+            "• Say `remind me in 30 minutes to ...` or use `/remind`",
+            "• Say `when <name> comes online, tell them <message>` for delayed pings",
+            "• In threads, I'll keep replying without needing @every time",
+            "• Send voice messages — I'll transcribe and respond",
         ]
         await send_interaction(interaction, "\n".join(lines))

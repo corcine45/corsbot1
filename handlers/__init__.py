@@ -52,6 +52,7 @@ from utils import (
     extract_video_description,
     get_quick_reply,
     resolve_mentions_in_reply,
+    resolve_message_channel,
     send_reply,
 )
 
@@ -217,20 +218,38 @@ class MessageHandler:
         if message.author == self.client.user:
             return
 
-        is_dm = isinstance(message.channel, discord.DMChannel)
+        ch = resolve_message_channel(message.channel)
+        is_dm = ch["is_dm"]
+        discord_thread_id = ch["discord_thread_id"]
+        channel_id = ch["channel_id"]
+        guild_id = ch["guild_id"]
         should_reply = is_dm or (self.client.user in message.mentions)
 
         # Extract content and OCR text early so mambo GIFs can auto-trigger in public chat.
         content = message.content.strip()
         ocr_text = ""
 
+        # Transcribe voice/audio attachments
+        for attachment in message.attachments:
+            from core.transcribe import is_audio_attachment, transcribe_discord_attachment
+
+            if is_audio_attachment(attachment.filename, attachment.content_type):
+                transcript = await transcribe_discord_attachment(attachment)
+                if transcript:
+                    content = (
+                        f"{content}\n\n[Voice: {transcript}]".strip()
+                        if content
+                        else f"[Voice: {transcript}]"
+                    )
+
         if message.attachments:
             # Get recent history for better image context detection
             thread_id_for_context = get_conversation_thread_id(
                 message.author.id,
-                message.guild.id if message.guild else None,
-                message.channel.id,
+                guild_id,
+                channel_id,
                 is_dm,
+                discord_thread_id=discord_thread_id,
             )
             loop = asyncio.get_running_loop()
             recent_history = await loop.run_in_executor(
@@ -276,15 +295,17 @@ class MessageHandler:
             loop = asyncio.get_running_loop()
             personal_thread_id = get_thread_id(
                 message.author.id,
-                message.guild.id if message.guild else None,
-                message.channel.id,
+                guild_id,
+                channel_id,
                 is_dm,
+                discord_thread_id=discord_thread_id,
             )
             thread_id = get_conversation_thread_id(
                 message.author.id,
-                message.guild.id if message.guild else None,
-                message.channel.id,
+                guild_id,
+                channel_id,
                 is_dm,
+                discord_thread_id=discord_thread_id,
             )
             for _ in range(gif_count):
                 gif_url = await search_gif(gif_query)
@@ -303,11 +324,47 @@ class MessageHandler:
                 return
             # GIF search failed — fall through to normal reply
 
-        if should_reply and not await self._check_cooldown(message.author.id):
-            return
+        loop = asyncio.get_running_loop()
+        personal_thread_id = get_thread_id(
+            message.author.id,
+            guild_id,
+            channel_id,
+            is_dm,
+            discord_thread_id=discord_thread_id,
+        )
+        thread_id = get_conversation_thread_id(
+            message.author.id,
+            guild_id,
+            channel_id,
+            is_dm,
+            discord_thread_id=discord_thread_id,
+        )
+
+        # Thread-aware: keep replying in active bot threads without re-mentioning
+        if ch["is_thread"] and not should_reply:
+            history = await loop.run_in_executor(
+                self.executor, get_history, thread_id, 1
+            )
+            if history:
+                should_reply = True
 
         if not should_reply:
             return
+
+        from core.guild_settings import is_channel_opted_out, memory_user_key
+
+        if is_channel_opted_out(guild_id, channel_id):
+            return
+
+        uid_str = str(message.author.id)
+        memory_uid = memory_user_key(message.author.id, guild_id)
+
+        if not await self._check_cooldown(message.author.id):
+            return
+
+        from core.proactivity import note_user_interaction
+
+        note_user_interaction(message.author.id, message.channel.id, guild_id)
 
         # Injection guard: regex, semantic similarity, and intent classifier.
         try:
@@ -329,22 +386,6 @@ class MessageHandler:
 
         # Resolve mentions
         content, mentioned_users = await self._resolve_mentions(message, content)
-
-        # Store personal history separately from shared channel context.
-        personal_thread_id = get_thread_id(
-            message.author.id,
-            message.guild.id if message.guild else None,
-            message.channel.id,
-            is_dm,
-        )
-        thread_id = get_conversation_thread_id(
-            message.author.id,
-            message.guild.id if message.guild else None,
-            message.channel.id,
-            is_dm,
-        )
-
-        loop = asyncio.get_running_loop()
 
         # Quick reply check
         quick = get_quick_reply(content, self.quick_replies)
@@ -382,6 +423,25 @@ class MessageHandler:
             message.author.name,
             guild_nick,
         )
+
+        # Scheduled reminder — "remind me in 30 minutes to ..."
+        from core.reminders import parse_reminder, store_reminder
+
+        parsed_reminder = parse_reminder(content)
+        if parsed_reminder:
+            fire_at, reminder_msg = parsed_reminder
+            store_reminder(
+                message.author.id,
+                guild_id,
+                message.channel.id,
+                reminder_msg,
+                fire_at,
+            )
+            mins = max(1, round((fire_at - time.time()) / 60))
+            await message.channel.send(
+                f"<@{message.author.id}> got it — I'll ping you in ~{mins} min: **{reminder_msg[:120]}**"
+            )
+            return
 
         # Deferred instruction detection — "when X comes online, do Y"
         if message.guild:
@@ -435,7 +495,6 @@ class MessageHandler:
             return
 
         # Denial check
-        uid_str = str(message.author.id)
         denied_matches = await loop.run_in_executor(
             self.executor,
             check_and_delete_denied_facts,
@@ -450,13 +509,21 @@ class MessageHandler:
         # Background tasks
         if should_extract(uid_str):
             loop.run_in_executor(
-                self.executor, extract_memory, message.author.id, content
+                self.executor, extract_memory, memory_uid, content
             )
             loop.run_in_executor(
                 self.executor,
                 extract_relationships,
-                message.author.id,
+                memory_uid,
                 attributed_content,
+            )
+            from core.memory import extract_relationship_categories_from_message
+
+            loop.run_in_executor(
+                self.executor,
+                extract_relationship_categories_from_message,
+                memory_uid,
+                content,
             )
 
         if should_update_reflection(uid_str):
@@ -496,7 +563,7 @@ class MessageHandler:
                 get_db()[1]
                 .execute(
                     "SELECT GROUP_CONCAT(value, ', ') FROM memory WHERE user_id=? LIMIT 5",
-                    (uid_str,),
+                    (memory_uid,),
                 )
                 .fetchone()[0]
             )
@@ -528,6 +595,7 @@ class MessageHandler:
         ctx = AgentContext(
             user_id=message.author.id,
             uid_str=uid_str,
+            memory_user_id=memory_uid,
             content=content,
             attributed_content=attributed_content,
             thread_id=thread_id,

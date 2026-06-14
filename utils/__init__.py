@@ -12,6 +12,8 @@ import base64
 import logging
 from typing import Optional
 
+import discord
+
 from config import settings
 
 log = logging.getLogger("corsbot.utils")
@@ -97,6 +99,26 @@ _PHOTO_CONTEXT_KEYWORDS = {
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# CHANNEL CONTEXT
+# ────────────────────────────────────────────────────────────────────────────────
+
+def resolve_message_channel(channel) -> dict:
+    """Normalize DM/thread/channel IDs for thread-aware storage."""
+    is_dm = isinstance(channel, discord.DMChannel)
+    is_thread = isinstance(channel, discord.Thread)
+    discord_thread_id = channel.id if is_thread else None
+    channel_id = channel.parent_id if is_thread else channel.id
+    guild_id = channel.guild.id if getattr(channel, "guild", None) else None
+    return {
+        "is_dm": is_dm,
+        "is_thread": is_thread,
+        "discord_thread_id": discord_thread_id,
+        "channel_id": channel_id,
+        "guild_id": guild_id,
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # MESSAGE SENDING
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -167,13 +189,15 @@ def resolve_mentions_in_reply(reply: str, guild, user_id: int = None) -> str:
     # Then handle names that appear without @ but are clearly addressing someone
     # Pattern: "Name," at start of sentence or "Name:" for addressing
     def replace_name_mention(match):
-        name = match.group(1).lower().strip()
+        prefix = match.group(1)
+        name = match.group(2).lower().strip()
+        punct = match.group(3)
         if name in member_lookup:
-            return f"<@{member_lookup[name]}>"
+            return f"{prefix}<@{member_lookup[name]}>{punct}"
         return match.group(0)
 
-    # Match patterns like "Bennn," or "Bennn:" at sentence starts
-    reply = re.sub(r"(?<=^|[.!?]\s)([A-Z][a-zA-Z]+)[,:]", replace_name_mention, reply)
+    # Match "Name," or "Name:" at sentence starts (no variable-width lookbehind)
+    reply = re.sub(r"(^|[.!?]\s)([A-Z][a-zA-Z]+)([,:])", replace_name_mention, reply)
 
     return reply
 

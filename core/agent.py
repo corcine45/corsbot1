@@ -48,6 +48,7 @@ class AgentContext:
     channel_name: str = ""
     username: str = ""
     guild_id: int | None = None
+    memory_user_id: str = ""
     mentioned_users: dict = field(default_factory=dict)
     is_impersonating: bool = False
     user_activity: str = ""  # What the user is playing/listening to
@@ -186,26 +187,42 @@ class AgentLoop:
         """Step 2: Retrieve memory, relationships, and reflection."""
         from .memory import (
             get_memory,
-            get_memory_with_keys,
+            get_memory_prioritized_with_keys,
             get_reflection,
             get_relationships,
+            get_social_awareness_context,
             search_memory_by_value,
         )
         from .presence import get_presence_patterns
+        from .session import get_current_topic
 
-        mem_result, reflection, presence_patterns = await asyncio.gather(
+        topic = get_current_topic(ctx.user_id)
+
+        mem_result, reflection, presence_patterns, social_ctx = await asyncio.gather(
             self._step(
                 trace,
                 "memory",
-                self._run_sync(get_memory_with_keys, ctx.user_id, ctx.content, 3),
+                self._run_sync(
+                    get_memory_prioritized_with_keys,
+                    ctx.memory_user_id or ctx.uid_str,
+                    ctx.content,
+                    topic,
+                    ctx.emotion_state or "",
+                    1200,
+                ),
             ),
             self._step(
-                trace, "reflection", self._run_sync(get_reflection, ctx.uid_str)
+                trace, "reflection", self._run_sync(get_reflection, ctx.memory_user_id or ctx.uid_str)
             ),
             self._step(
                 trace,
                 "presence_patterns",
                 self._run_sync(get_presence_patterns, ctx.uid_str),
+            ),
+            self._step(
+                trace,
+                "social_awareness",
+                self._run_sync(get_social_awareness_context, ctx.memory_user_id or ctx.uid_str),
             ),
         )
 
@@ -213,6 +230,12 @@ class AgentLoop:
             ctx.memory, ctx.active_keys = mem_result
         ctx.reflection = reflection or ""
         ctx.presence_patterns = presence_patterns or ""
+        if social_ctx:
+            ctx.relationships = (
+                (ctx.relationships + "\n\n" + social_ctx).strip()
+                if ctx.relationships
+                else social_ctx
+            )
 
         # Impersonation: swap memory for target user's facts
         if ctx.is_impersonating and ctx.mentioned_users:
@@ -330,7 +353,7 @@ class AgentLoop:
 
         if has_trigger:
             rels = await self._step(
-                trace, "relationships", self._run_sync(get_relationships, ctx.user_id)
+                trace, "relationships", self._run_sync(get_relationships, ctx.memory_user_id or ctx.uid_str)
             )
             ctx.relationships = rels or ""
             # Cross-user search: only for role/title queries, not person-name lookups.
@@ -626,6 +649,7 @@ class AgentLoop:
                 response_plan,
                 ctx.conversation_summary,
                 ctx.server_members,
+                ctx.guild_id,
             ),
         )
         if not result:
@@ -719,6 +743,15 @@ class AgentLoop:
             from .session import add_bot_message
 
             await self._run_sync(add_bot_message, ctx.user_id, ctx.reply)
+
+            from .presence import record_emotional_conversation_end
+            from .proactivity import should_record_emotional_end
+
+            if should_record_emotional_end(
+                ctx.emotion_state,
+                getattr(ctx.route, "route", None) if ctx.route else None,
+            ):
+                record_emotional_conversation_end(ctx.uid_str)
         else:
             trace.add("post", 0, "skipped", "no reply")
 
@@ -733,5 +766,14 @@ class AgentLoop:
             web_search=bool(ctx.web_context),
             gif=bool(ctx.gif_url),
             trace=trace.summary(),
+        )
+        from .traces import store_agent_trace
+
+        store_agent_trace(
+            ctx.user_id,
+            ctx.guild_id,
+            trace.summary(),
+            trace.total_ms,
+            getattr(ctx.route, "route", "") if ctx.route else "",
         )
         return ctx, trace

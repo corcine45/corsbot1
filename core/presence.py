@@ -365,6 +365,11 @@ def record_emotional_conversation_end(user_id: str):
     _emotional_convo_end[str(user_id)] = time.time()
 
 
+def iter_emotional_watch_user_ids() -> list[str]:
+    """User IDs with a recent emotional conversation marker."""
+    return list(_emotional_convo_end.keys())
+
+
 def get_proactive_context(user_id: str) -> dict:
     """
     Build the context dict needed for proactivity checks.

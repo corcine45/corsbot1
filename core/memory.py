@@ -1700,6 +1700,49 @@ def get_memory_prioritized(
     return result
 
 
+def _extract_keys_from_prioritized(buckets: dict) -> list[str]:
+    keys = []
+    for level in ("high", "medium", "low"):
+        for line in buckets.get(level, "").split("\n"):
+            line = line.strip()
+            if not line or line.startswith(("topic:", "emotion:")):
+                continue
+            if ":" in line:
+                key = line.split(":", 1)[0].strip()
+            elif "=" in line:
+                key = line.split("=", 1)[0].strip()
+            else:
+                continue
+            if key:
+                keys.append(key)
+    return list(dict.fromkeys(keys))
+
+
+def format_prioritized_memory(buckets: dict) -> str:
+    parts = []
+    for level in ("critical", "high", "medium", "low"):
+        content = buckets.get(level, "")
+        if content:
+            parts.append(f"[{level.upper()}]\n{content}")
+    return "\n\n".join(parts)
+
+
+def get_memory_prioritized_with_keys(
+    user_id,
+    query: str = "",
+    topic: str = "",
+    emotion: str = "",
+    max_tokens: int = 1200,
+) -> tuple[str, list]:
+    """Prioritized memory retrieval with active keys for feedback learning."""
+    buckets = get_memory_prioritized(
+        user_id, query=query, topic=topic, emotion=emotion, max_tokens=max_tokens
+    )
+    memory = format_prioritized_memory(buckets)
+    keys = _extract_keys_from_prioritized(buckets)
+    return memory, keys
+
+
 def get_memory_with_keys(user_id, query: str = "", top_k: int = 8) -> tuple:
     """Same as get_memory but also returns the list of active keys (for feedback boosting)."""
     conn, cursor = get_db()
@@ -2365,7 +2408,7 @@ def get_social_awareness_context(user_id: str) -> str:
     if not summary:
         return ""
 
-    return f"Social context for {user_id}:\n{summary}"
+    return f"People in this user's life:\n{summary}"
 
 
 def extract_relationship_categories_from_message(user_id: str, message: str):

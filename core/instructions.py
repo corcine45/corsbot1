@@ -122,3 +122,55 @@ def mark_instruction_fired(instruction_id: int):
         (instruction_id,),
     )
     conn.commit()
+
+
+def craft_online_message(
+    target_name: str,
+    target_id: int,
+    action: str,
+    requester_id: int,
+) -> str:
+    """
+    Turn a raw deferred action into a natural Corsbot ping.
+    Falls back to the raw action on failure.
+    """
+    from core.ai import groq_call
+
+    mention = f"<@{target_id}>"
+    fallback = f"{mention} {action}".strip()
+    try:
+        content, _ = groq_call(
+            "llama-3.1-8b-instant",
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Corsbot, a chill Discord bot. "
+                        "Write ONE short casual sentence to ping someone who just came online. "
+                        "Sound like a friend, not a notification bot. "
+                        "Must start with the target mention provided. "
+                        "No quotes. No explanation. 1 sentence max."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Target mention: {mention} ({target_name})\n"
+                        f"Requested by user id: {requester_id}\n"
+                        f"What to convey: {action}"
+                    ),
+                },
+            ],
+            max_tokens=80,
+            retries=1,
+            timeout=8,
+        )
+        text = (content or "").strip()
+        if not text:
+            return fallback
+        if mention not in text:
+            text = f"{mention} {text}"
+        return text
+    except Exception as e:
+        log.warning("craft_online_message_failed", error=str(e))
+        return fallback

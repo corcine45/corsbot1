@@ -16,7 +16,7 @@ DATA_DIR = (
 DB_PATH = DATA_DIR / "brain.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_RETENTION = 5
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
 
 IDENTITY_KEYS = {
     "name",
@@ -197,6 +197,57 @@ def initialize_schema(cursor):
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            guild_id TEXT,
+            channel_id TEXT,
+            message TEXT,
+            fire_at REAL,
+            created_at REAL,
+            fired INTEGER DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id TEXT PRIMARY KEY,
+            last_digest_at REAL DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_traces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            guild_id TEXT,
+            trace_summary TEXT,
+            latency_ms REAL,
+            route TEXT,
+            created_at REAL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id TEXT PRIMARY KEY,
+            personality TEXT DEFAULT '',
+            memory_isolated INTEGER DEFAULT 0,
+            opt_out_channels TEXT DEFAULT '[]',
+            updated_at REAL DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS music_queues (
+            guild_id TEXT PRIMARY KEY,
+            now_playing TEXT,
+            queue TEXT,
+            updated_at REAL DEFAULT 0
+        )
+    """)
+
     cols = [row[1] for row in cursor.execute("PRAGMA table_info(memory)").fetchall()]
     if "key" not in cols and "fact" in cols:
         cursor.execute("ALTER TABLE memory RENAME TO memory_old")
@@ -267,6 +318,16 @@ def initialize_schema(cursor):
     if version < SCHEMA_VERSION:
         cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
+    settings_cols = [
+        row[1] for row in cursor.execute("PRAGMA table_info(user_settings)").fetchall()
+    ]
+    if "last_channel_id" not in settings_cols:
+        cursor.execute("ALTER TABLE user_settings ADD COLUMN last_channel_id TEXT")
+    if "last_guild_id" not in settings_cols:
+        cursor.execute("ALTER TABLE user_settings ADD COLUMN last_guild_id TEXT")
+    if "last_message_at" not in settings_cols:
+        cursor.execute("ALTER TABLE user_settings ADD COLUMN last_message_at REAL DEFAULT 0")
+
     # Indexes for performance
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, timestamp)"
@@ -284,6 +345,12 @@ def initialize_schema(cursor):
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_deferred_instructions_target_id ON deferred_instructions(guild_id, trigger_type, trigger_target_id, fired)"
     )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(fired, fire_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_traces_guild ON agent_traces(guild_id, created_at)"
+    )
 
 
 def get_db():
@@ -296,16 +363,99 @@ def get_db():
     return _local.conn, _local.cursor
 
 
-def get_thread_id(user_id, guild_id=None, channel_id=None, is_dm=False):
-    return (
-        f"dm:{user_id}"
-        if is_dm
-        else f"guild:{guild_id}:channel:{channel_id}:user:{user_id}"
+def get_thread_id(
+    user_id, guild_id=None, channel_id=None, is_dm=False, discord_thread_id=None
+):
+    if is_dm:
+        return f"dm:{user_id}"
+    base = f"guild:{guild_id}:channel:{channel_id}"
+    if discord_thread_id:
+        base += f":thread:{discord_thread_id}"
+    return f"{base}:user:{user_id}"
+
+
+def get_conversation_thread_id(
+    user_id, guild_id=None, channel_id=None, is_dm=False, discord_thread_id=None
+):
+    if is_dm:
+        return f"dm:{user_id}"
+    base = f"guild:{guild_id}:channel:{channel_id}"
+    if discord_thread_id:
+        base += f":thread:{discord_thread_id}"
+    return base
+
+
+def get_guild_token_stats(guild_id: int, member_ids: list[int]) -> dict:
+    """Approximate guild-wide token usage for known member IDs."""
+    if not member_ids:
+        return {"total": 0, "today": 0, "requests": 0}
+    _, cursor = get_db()
+    placeholders = ",".join("?" for _ in member_ids)
+    ids = [str(mid) for mid in member_ids]
+    cursor.execute(
+        f"SELECT COALESCE(SUM(tokens_used), 0) FROM tokens_usage WHERE user_id IN ({placeholders})",
+        ids,
     )
+    total = cursor.fetchone()[0]
+    today_start = time.time() - (24 * 3600)
+    cursor.execute(
+        f"SELECT COALESCE(SUM(tokens_used), 0) FROM tokens_usage WHERE user_id IN ({placeholders}) AND timestamp > ?",
+        ids + [today_start],
+    )
+    today = cursor.fetchone()[0]
+    cursor.execute(
+        f"SELECT COUNT(*) FROM tokens_usage WHERE user_id IN ({placeholders})",
+        ids,
+    )
+    requests = cursor.fetchone()[0]
+    return {"total": total, "today": today, "requests": requests}
 
 
-def get_conversation_thread_id(user_id, guild_id=None, channel_id=None, is_dm=False):
-    return f"dm:{user_id}" if is_dm else f"guild:{guild_id}:channel:{channel_id}"
+def touch_user_channel(user_id: int, channel_id: int, guild_id: int | None = None):
+    conn, cursor = get_db()
+    now = time.time()
+    cursor.execute(
+        """INSERT INTO user_settings (user_id, last_channel_id, last_guild_id, last_message_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               last_channel_id=excluded.last_channel_id,
+               last_guild_id=excluded.last_guild_id,
+               last_message_at=excluded.last_message_at""",
+        (str(user_id), str(channel_id), str(guild_id) if guild_id else None, now),
+    )
+    conn.commit()
+
+
+def get_user_last_channel(user_id: int) -> tuple[str | None, str | None]:
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT last_channel_id, last_guild_id FROM user_settings WHERE user_id=?",
+        (str(user_id),),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def get_last_message_age(user_id: int) -> float:
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT last_message_at FROM user_settings WHERE user_id=?",
+        (str(user_id),),
+    )
+    row = cursor.fetchone()
+    if row and row[0]:
+        return max(0.0, time.time() - row[0])
+
+    cursor.execute(
+        "SELECT MAX(timestamp) FROM messages WHERE thread_id LIKE ?",
+        (f"%user:{user_id}",),
+    )
+    ts_row = cursor.fetchone()
+    if ts_row and ts_row[0]:
+        return max(0.0, time.time() - ts_row[0])
+    return 999999.0
 
 
 def store_message(thread_id, role, content):

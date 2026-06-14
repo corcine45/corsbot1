@@ -366,6 +366,13 @@ def get_context(user_id: int) -> str:
     return get_state_prompt(user_id)
 
 
+def get_current_topic(user_id: int) -> str:
+    sess = _sessions.get(user_id)
+    if not sess or not sess.conv.topic.value:
+        return ""
+    return sess.conv.topic.value
+
+
 # ── Analyzer ─────────────────────────────────────────────────────────────── #
 
 _ANALYZER_PROMPT = """\

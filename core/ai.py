@@ -2354,6 +2354,7 @@ def ai_chat(
     response_plan: str = "",
     conversation_summary: str = "",
     server_members: str = "",
+    guild_id: int | None = None,
 ):
     history = trim_history(history)
     memory = truncate_text(memory, MAX_MEMORY_CHARS)
@@ -2377,17 +2378,24 @@ def ai_chat(
         f"[router] route={route.route} model={primary_provider} tokens={route.max_tokens}"
     )
 
-    # Personality mode
-    personality_hint = get_personality_mode_hint(
-        last_user_msg,
-        emotion_state,
-        user_id,
-        channel_name,
-        session_context,
-        relationships,
-        user_activity,
-        user_status,
-    )
+    # Personality mode — guild override wins when set
+    from .guild_settings import get_guild_personality_mode
+
+    guild_mode = get_guild_personality_mode(guild_id)
+    if guild_mode and guild_mode in _PERSONALITY_MODES:
+        personality_hint = _PERSONALITY_MODES[guild_mode]
+        log.debug(f"[personality] guild override mode={guild_mode} guild={guild_id}")
+    else:
+        personality_hint = get_personality_mode_hint(
+            last_user_msg,
+            emotion_state,
+            user_id,
+            channel_name,
+            session_context,
+            relationships,
+            user_activity,
+            user_status,
+        )
 
     system = _build_system_prompt(
         username,

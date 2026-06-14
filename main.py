@@ -14,9 +14,16 @@ import discord
 from discord import app_commands
 
 import config
-from core.instructions import get_pending_online_instructions, mark_instruction_fired
+from core.instructions import (
+    craft_online_message,
+    get_pending_online_instructions,
+    mark_instruction_fired,
+)
 from core.memory import start_faiss_rebuild_background
 from core.presence import describe_activity, record_presence_pattern
+from core.proactivity import maybe_proactive
+from core.reminders import get_due_reminders, mark_reminder_fired
+from core.weekly_dm import send_weekly_digests
 from handlers import MessageHandler
 from handlers.commands import CommandsHandler
 from utils import ResponseCache
@@ -70,6 +77,7 @@ class CorsBot(discord.Client):
         self.response_cache = response_cache
         self.message_handler = None
         self.commands_handler = None
+        self._background_tasks: list[asyncio.Task] = []
 
     async def setup_hook(self):
         """Called before the bot connects."""
@@ -83,6 +91,10 @@ class CorsBot(discord.Client):
             traceback.print_exc()
             raise
 
+        self._background_tasks.append(asyncio.create_task(self._reminder_loop()))
+        self._background_tasks.append(asyncio.create_task(self._weekly_digest_loop()))
+        self._background_tasks.append(asyncio.create_task(self._proactivity_loop()))
+
     async def on_ready(self):
         """Called when the bot has connected."""
         try:
@@ -93,7 +105,6 @@ class CorsBot(discord.Client):
 
             print(f"FATAL: on_ready failed: {e}")
             traceback.print_exc()
-        start_faiss_rebuild_background()
 
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
         """Track presence changes (activity/status)."""
@@ -117,6 +128,13 @@ class CorsBot(discord.Client):
                     ),
                 )
                 log.debug(f"{after.name} presence pattern updated: {activity_str}")
+
+            if not after.bot:
+                await maybe_proactive(
+                    self,
+                    after,
+                    activity=activity_str or describe_activity(after.activity),
+                )
 
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         """Track status changes and fire deferred instructions."""
@@ -165,6 +183,16 @@ class CorsBot(discord.Client):
             ),
         )
 
+        if not member.bot and after.channel:
+            humans = [m for m in after.channel.members if not m.bot]
+            voice_status = "alone" if len(humans) == 1 else "with_friends"
+            await maybe_proactive(
+                self,
+                member,
+                activity=describe_activity(member.activity),
+                voice_status=voice_status,
+            )
+
     async def on_message(self, message: discord.Message):
         """Handle incoming messages."""
         if self.message_handler:
@@ -182,10 +210,19 @@ class CorsBot(discord.Client):
                 try:
                     channel = self.get_channel(int(inst["channel_id"]))
                     if channel:
-                        await channel.send(f"<@{member.id}> {inst['action']}")
+                        loop = asyncio.get_running_loop()
+                        message = await loop.run_in_executor(
+                            self.executor,
+                            craft_online_message,
+                            member.display_name,
+                            member.id,
+                            inst["action"],
+                            int(inst["requester_id"]),
+                        )
+                        await channel.send(message)
                         mark_instruction_fired(inst["id"])
                         log.info(
-                            f"[instructions] fired for {member.display_name}: {inst['action'][:60]}"
+                            f"[instructions] fired for {member.display_name}: {message[:60]}"
                         )
                 except Exception as e:
                     log.warning(
@@ -193,6 +230,59 @@ class CorsBot(discord.Client):
                     )
         except Exception as e:
             log.warning(f"[instructions] error checking for {member.display_name}: {e}")
+
+    async def _reminder_loop(self):
+        """Fire due reminders every 30 seconds."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                for rem in get_due_reminders():
+                    try:
+                        channel = self.get_channel(int(rem["channel_id"]))
+                        if channel:
+                            await channel.send(
+                                f"<@{rem['user_id']}> ⏰ {rem['message']}"
+                            )
+                        mark_reminder_fired(rem["id"])
+                        log.info(
+                            "reminder_fired",
+                            user_id=rem["user_id"],
+                            message=rem["message"][:60],
+                        )
+                    except Exception as e:
+                        log.warning("reminder_fire_failed", error=str(e))
+            except Exception as e:
+                log.warning("reminder_loop_error", error=str(e))
+            await asyncio.sleep(30)
+
+    async def _weekly_digest_loop(self):
+        """Send weekly memory DMs once per hour check."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await send_weekly_digests(self)
+            except Exception as e:
+                log.warning("weekly_digest_loop_error", error=str(e))
+            await asyncio.sleep(3600)
+
+    async def _proactivity_loop(self):
+        """Periodic checks for post-emotional silence and pattern breaks."""
+        await self.wait_until_ready()
+        from core.presence import iter_emotional_watch_user_ids
+
+        while not self.is_closed():
+            try:
+                for uid in iter_emotional_watch_user_ids():
+                    member = None
+                    for guild in self.guilds:
+                        member = guild.get_member(int(uid))
+                        if member:
+                            break
+                    if member:
+                        await maybe_proactive(self, member)
+            except Exception as e:
+                log.warning("proactivity_loop_error", error=str(e))
+            await asyncio.sleep(300)
 
 
 # ────────────────────────────────────────────────────────────────────────────────
