@@ -2318,20 +2318,39 @@ def _enforce_brevity(text: str, max_sentences: int = 4) -> str:
     Only trims on complete sentences — never cuts mid-sentence.
     """
     text = text.strip()
+    if not text:
+        return text
+
     sentences = re.split(r"(?<=[.!?])\s+", text)
 
-    # If the text doesn't end with punctuation, the last chunk is incomplete —
-    # the model ran out of tokens mid-sentence. Drop it.
-    if text and text[-1] not in ".!?":
-        sentences = sentences[:-1]
+    # Check if the last chunk is an incomplete sentence (no ending punctuation)
+    has_incomplete_tail = text and text[-1] not in ".!?"
 
-    if not sentences:
-        return text  # nothing to trim, return as-is
+    if has_incomplete_tail and len(sentences) > 1:
+        # The last chunk is incomplete — separate it from the complete sentences
+        incomplete = sentences[-1]
+        complete_sentences = sentences[:-1]
+    else:
+        incomplete = ""
+        complete_sentences = sentences
 
-    if len(sentences) <= max_sentences:
-        return " ".join(sentences)
+    # If we have complete sentences, limit them
+    if complete_sentences:
+        if len(complete_sentences) > max_sentences:
+            complete_sentences = complete_sentences[:max_sentences]
+        result = " ".join(complete_sentences)
+        # If we had an incomplete tail, append it (the model may have been cut off)
+        if incomplete:
+            # Only add the incomplete part if we haven't hit the sentence limit
+            # or if the complete sentences are fewer than max
+            if len(sentences) <= max_sentences:
+                result += " " + incomplete
+            elif not result:
+                result = incomplete
+        return result
 
-    return " ".join(sentences[:max_sentences])
+    # No complete sentences — return the incomplete text as-is
+    return text
 
 
 def ai_chat(
