@@ -35,11 +35,9 @@ log = logging.getLogger("corsbot")
 def _load_opus():
     if discord.opus.is_loaded():
         return
-    # Common paths on Nix/Railway
     candidates = [
         "libopus.so.0",
         "libopus.so",
-        "/nix/store/libopus/lib/libopus.so.0",  # nixpacks path pattern
         ctypes.util.find_library("opus"),
     ]
     for path in candidates:
