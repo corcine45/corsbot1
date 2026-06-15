@@ -215,7 +215,11 @@ class MessageHandler:
 
     async def handle(self, message: discord.Message):
         """Main message handler."""
+        # Ignore messages from ourselves
         if message.author == self.client.user:
+            return
+        # Completely ignore direct messages (DMs) – only process guild messages
+        if message.guild is None:
             return
 
         ch = resolve_message_channel(message.channel)
