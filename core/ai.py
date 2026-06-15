@@ -2385,6 +2385,22 @@ def ai_chat(
     last_user_msg = next(
         (e["content"] for e in reversed(history) if e["role"] == "user"), ""
     )
+    # -------------------------------------------------
+    # Detect a TikTok (or generic video) link and generate a summary
+    # -------------------------------------------------
+    import re
+    video_url_match = re.search(r"https?://(?:www\.)?(?:tiktok\.com|youtu\.be|youtube\.com)/[^\s]+", last_user_msg)
+    video_summary = ""
+    if video_url_match:
+        from utils.video_observer import VideoObserver
+        try:
+            observer = VideoObserver(url=video_url_match.group(0))
+            video_summary = observer.summarise()
+        except Exception as e:
+            log.warning(f"[video] failed to summarise video {video_url_match.group(0)}: {e}")
+            video_summary = "I couldn't extract info from the video link."
+    # -------------------------------------------------
+
     route = route_message(
         last_user_msg, emotion_state, bool(web_context), history_len=len(history)
     )
@@ -2420,7 +2436,7 @@ def ai_chat(
         username,
         memory,
         relationships,
-        web_context,
+        video_summary if video_summary else web_context,
         impersonation_context,
         feedback_context,
         channel_name,
