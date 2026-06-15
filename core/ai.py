@@ -17,7 +17,7 @@ AI_MODEL = settings.ai_model
 GEMINI_MODEL = settings.gemini_model
 client_ai = Groq(api_key=settings.groq_api_key)
 
-MAX_HISTORY_MESSAGES = 30
+MAX_HISTORY_MESSAGES = 20
 MAX_MESSAGE_CHARS = 900
 MAX_MEMORY_CHARS = 2000
 MAX_WEB_CONTEXT_CHARS = 1000
@@ -831,7 +831,7 @@ def route_message(
     has_deep = any(t in lower for t in _DEEP_THINK_TRIGGERS)
 
     if (
-        word_count <= 8
+        word_count <= 5
         and has_casual
         and not has_deep
         and not is_question
@@ -842,7 +842,7 @@ def route_message(
     # 5. Light route — quick banter mid-conversation (8b + history, no planning)
     if (
         history_len > 0
-        and word_count <= 6
+        and word_count <= 4
         and has_casual
         and not has_deep
         and not is_question
@@ -1153,7 +1153,7 @@ def _should_plan(
     word_count = len(lower.split())
 
     # Long messages likely need careful handling
-    if word_count >= 15:
+    if word_count >= 20:
         return True
 
     # Explicit advice/explanation requests and direct identity/AI questions
