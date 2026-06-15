@@ -23,6 +23,11 @@ MAX_MEMORY_CHARS = 2000
 MAX_WEB_CONTEXT_CHARS = 1000
 MAX_FEEDBACK_CHARS = 400
 
+VIDEO_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:tiktok\.com|youtu\.be|youtube\.com|vimeo\.com|reddit\.com|x\.com|twitter\.com|instagram\.com|facebook\.com|fb\.watch)/[^\s]+",
+    re.IGNORECASE,
+)
+
 # ── Priority-based context trimming ────────────────────────────────────────── #
 PRIORITY_MAX_TOKENS = 1800  # total context budget (excluding system prompt & history)
 
@@ -2386,29 +2391,37 @@ def ai_chat(
         (e["content"] for e in reversed(history) if e["role"] == "user"), ""
     )
     # -------------------------------------------------
-    # Detect a TikTok (or generic video) link and generate a summary
+    # Detect a video link and generate a summary + reaction
     # -------------------------------------------------
-    import re
-    video_url_match = re.search(r"https?://(?:www\.)?(?:tiktok\.com|youtu\.be|youtube\.com)/[^\s]+", last_user_msg)
-    video_summary = ""
+    video_summary = None
+    video_url_match = VIDEO_URL_RE.search(last_user_msg)
     if video_url_match:
-        from utils.video_observer import VideoObserver
         try:
+            from utils.video_observer import VideoObserver
+
             observer = VideoObserver(url=video_url_match.group(0))
-            video_summary = observer.summarise()
+            summary = observer.summarise().strip()
+            if summary and "couldn't extract" not in summary.lower():
+                video_summary = summary
+            else:
+                log.warning(
+                    f"[video] summarise returned no usable info for {video_url_match.group(0)}: {summary}"
+                )
         except Exception as e:
             log.warning(f"[video] failed to summarise video {video_url_match.group(0)}: {e}")
-            video_summary = "I couldn't extract info from the video link."
+
     # -------------------------------------------------
     # If we successfully got a summary, reply immediately (skip LLM routing)
     if video_summary:
         # Generate a short, friendly reaction to the video instead of a full summary
         try:
-            # Use the fast model for a quick response
             reaction, _ = groq_call(
                 _MODEL_FAST,
                 [
-                    {"role": "system", "content": "You are a chill Discord bot. Given a brief description of a video, respond with a short, friendly reaction (1‑2 sentences, no emojis unless appropriate)."},
+                    {
+                        "role": "system",
+                        "content": "You are a chill Discord bot. Given a brief description of a video, respond with a short, friendly reaction (1-2 sentences, no emojis unless appropriate).",
+                    },
                     {"role": "user", "content": video_summary},
                 ],
                 max_tokens=60,
@@ -2418,7 +2431,6 @@ def ai_chat(
             return reaction.strip()
         except Exception as e:
             log.warning(f"[video] reaction generation failed: {e}")
-            # Fallback generic reaction
             return "Nice video!"
 
 
