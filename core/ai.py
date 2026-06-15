@@ -2400,6 +2400,27 @@ def ai_chat(
             log.warning(f"[video] failed to summarise video {video_url_match.group(0)}: {e}")
             video_summary = "I couldn't extract info from the video link."
     # -------------------------------------------------
+    # If we successfully got a summary, reply immediately (skip LLM routing)
+    if video_summary:
+        # Generate a short, friendly reaction to the video instead of a full summary
+        try:
+            # Use the fast model for a quick response
+            reaction, _ = groq_call(
+                _MODEL_FAST,
+                [
+                    {"role": "system", "content": "You are a chill Discord bot. Given a brief description of a video, respond with a short, friendly reaction (1‑2 sentences, no emojis unless appropriate)."},
+                    {"role": "user", "content": video_summary},
+                ],
+                max_tokens=60,
+                retries=1,
+                timeout=8,
+            )
+            return reaction.strip()
+        except Exception as e:
+            log.warning(f"[video] reaction generation failed: {e}")
+            # Fallback generic reaction
+            return "Nice video!"
+
 
     route = route_message(
         last_user_msg, emotion_state, bool(web_context), history_len=len(history)
