@@ -223,7 +223,7 @@ class MessageHandler:
         discord_thread_id = ch["discord_thread_id"]
         channel_id = ch["channel_id"]
         guild_id = ch["guild_id"]
-        should_reply = is_dm or (self.client.user in message.mentions)
+        should_reply = (self.client.user in message.mentions) and not is_dm
 
         # Extract content and OCR text early so mambo GIFs can auto-trigger in public chat.
         content = message.content.strip()
