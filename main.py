@@ -90,7 +90,7 @@ class CorsBot(discord.Client):
             raise
 
         self._background_tasks.append(asyncio.create_task(self._reminder_loop()))
-        self._background_tasks.append(asyncio.create_task(self._weekly_digest_loop()))
+        # self._background_tasks.append(asyncio.create_task(self._weekly_digest_loop()))
         self._background_tasks.append(asyncio.create_task(self._proactivity_loop()))
 
     async def on_ready(self):
