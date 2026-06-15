@@ -4,5 +4,3 @@ nixPkgs = ["ffmpeg", "libopus", "libsodium", "pkg-config"]
 [phases.build]
 cmds = ["pip install -r requirements.txt"]
 
-[variables]
-LD_LIBRARY_PATH = "/nix/var/nix/profiles/default/lib"
